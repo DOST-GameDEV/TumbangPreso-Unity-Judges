@@ -17,7 +17,9 @@ The project uses Unity **6000.5.8f1**, URP, uGUI, Input System, and Netcode for 
 
 The entry point is [SplashScreen.unity](../Assets/TumbangPreso/Scenes/Ui/SplashScreen.unity). The current Home and Gamemode screens lead to practice and custom rooms. [Play from source](PLAY.md) covers the entry routes.
 
-## Tests
+## Validation and tests
+
+Unity 6000.5.8f1 compiled the gameplay and test assemblies on a fresh checkout. The asset importer reported an error on the inherited [duskline model](../Assets/TumbangPreso/Resources/Models/UltimateProps/duskline.glb).
 
 Run the engine-free suite with the .NET 9 SDK from the repository root.
 
