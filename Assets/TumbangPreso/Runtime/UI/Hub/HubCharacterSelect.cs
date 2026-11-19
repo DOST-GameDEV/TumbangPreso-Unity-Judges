@@ -1,0 +1,834 @@
+using System.Collections.Generic;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI.Hub
+{
+    /// <summary>
+    /// CHARACTER SELECT, for everyone after MATCH FOUND: who you are on the left, the hero standing
+    /// in the chalk circle in the middle, the faces and SELECT on the right, the four seats along
+    /// the bottom. The owner's reference is Valorant's agent select.
+    ///
+    /// ⚠️⚠️ ONE HERO PER SEAT (owner, October 22: *"no one can pick same character kasi ang weird nun"*).
+    /// A pick is `SelectLobbyPickServerRpc`; a hero another seat holds is drawn taken and refused here,
+    /// the host refuses it too (`LobbySession.SetPicks`), and the match installs unique characters
+    /// (`EconomyRules.UniqueSeatPicks`, the lower seat keeping a shared one). A Classic pick is a cosmetic
+    /// with neutral stats (`VISION.md` § 1). SELECT locks in with the lobby's own ready message
+    /// (`DeclareReadyServerRpc`), whose tally every peer already receives, and the HOST starts when
+    /// every human is locked or the clock runs out. No new message, no protocol bump.
+    ///
+    /// ⚠️⚠️ THE LAYOUT, AND WHY (2026-10-19 rework, `docs/reports/character-select-2026-10-19/`).
+    /// The 2026-09 screen put the hero in the left 46 per cent, a dark ability box in the middle
+    /// and the grid on the right, so the one big thing shared the screen with a box of the same
+    /// weight and stood over a chalk ring drawn for somebody else's feet. Every reference read
+    /// for this pass (Valorant, Overwatch, Apex, Marvel Rivals, League) does the opposite: the
+    /// pick stands in the MIDDLE, what it does is one column of text beside it with no box, and
+    /// the commit button sits directly under the choices. Read left to right it is one sentence:
+    /// who this is and what they do, here they are, pick someone else or lock them in.
+    ///
+    /// THE FOUR ANSWERS:
+    ///   the one thing   the hero you are choosing, standing in the chalk circle, centre
+    ///   first press     a face in the grid (it picks at once, like the reference); SELECT locks in
+    ///   not needed now  the loadout, which is its own screen from HOME
+    ///   out             none while timed: a found match is not left from here. Untimed (from a
+    ///                   custom lobby) BACK returns to the lobby with the pick kept.
+    ///
+    /// ⚠️ OUR OWN DNA, NOT A COPY. The stage is the street at night and the hero steps into the
+    /// can's chalk circle; locking in puts your tsinelas down on your seat card, the way a player
+    /// leaves a slipper on the line to say they are in; and your card says when you are TAYA,
+    /// which `MatchRules.DefenderSlotFor` already decides from your seat before the match starts.
+    /// </summary>
+    public sealed class HubCharacterSelect : HubScreen
+    {
+        public override bool WearsBoard => true;
+        public override float CourtShade => 0.78f;
+        public override bool ShowsQueuePlate => false;
+
+        /// <summary>A queue match: the clock runs and SELECT locks in. False from a custom lobby.</summary>
+        public bool Timed;
+        public const float Seconds = 30.0f;
+
+        /// <summary>The left column's width: the name, the kit row and the ability's sentence.</summary>
+        private const float ColumnWidth = 640;
+
+        /// <summary>
+        /// The role line's box, wider than the column. ⚠️ "//  THE FOREST OF MOUNT MAKILING" is about
+        /// 670 units at Label and 770 with Larger text, and in a 640-unit box it wrapped to 104
+        /// units inside 59 (`MatchArrivalFlowTests`, Paete, 960x540). Nothing stands to its right
+        /// at the top of the screen until the clock, which only a timed screen draws, at the middle.
+        /// </summary>
+        private const float RoleWidth = ColumnWidth + 200;
+
+        /// <summary>One grid cell and the gap between cells, in canvas units.</summary>
+        private const float Cell = 166, Gap = 16;
+
+        /// <summary>The seat strip's height, and the band the stage leaves above it for the chalked
+        /// TAYA tag over your own card.</summary>
+        private const float SeatWidth = 284, SeatHeight = 108;
+        private static readonly Color PanelInk = new Color32(65, 25, 37, 245);
+        private static readonly Color SelectedInk = new Color32(98, 42, 47, 255);
+        private static readonly Color PanelEdge = new Color32(152, 81, 91, 255);
+
+        private float _endsAt;
+        private bool _locked, _started;
+        private ModelPreview _preview;
+        // The hero and flash mark the instant of confirmation. The button carries the
+        // persistent confirmation so the center of the stage stays clear.
+        private RectTransform _modelRect;
+        private Image _lockFlash;
+        private float _lockAt = -100f;
+        private readonly bool[] _seatWasLocked = new bool[4];
+        private const float LockPunchSeconds = .36f, LockFlashSeconds = .3f;
+        private RectTransform _stage, _light;
+        private HubChalk _ring;
+        private HubGlow _shadow;
+        private Text _name, _role, _tagline, _clock, _hint;
+        private float _taglineScale;
+        private HubButton _select;
+        private readonly List<HubButton> _cells = new List<HubButton>();
+        private readonly List<Image> _portraitFaces = new List<Image>();
+        private readonly List<Color> _portraitColors = new List<Color>();
+        private RectTransform _seats;
+        private int _pick;
+        private string _shownSeats = "";
+        private HubButton[] _abilityButtons;
+        private TumpAbilitySymbol[] _abilitySymbols;
+        private Text[] _abilityLabels;
+        private Image[] _abilityUnderlines;
+        private Text _abilityName, _abilityMeta, _abilityCost, _abilitySummary;
+        private RectTransform _abilityFacts;
+        private Image _abilityKeyGlyph;
+        private Text _abilityKeyText, _abilityHold;
+        private RectTransform _abilityColumn;
+        private HeroKit _shownKit;
+        private HeroAbility[] _shownAbilities;
+        private HeroKit.ScreenSlot[] _shownSlots;
+        private string _shownHero;
+        private string _framedHero;
+        private int _inspectedAbility;
+
+        private GameMode Mode => SceneFlow.SelectedMode;
+        private IReadOnlyList<RosterEntry> People => Roster.GetPeople(Mode);
+
+        /// <summary>A pad or keyboard starts ON the hero already picked, so the one ringed tile and
+        /// the one persimmon tile are the same tile (the first capture ringed Dante under NEMU).</summary>
+        public override Selectable FirstFocus => _pick >= 0 && _pick < _cells.Count ? _cells[_pick] : null;
+
+        public override void Build()
+        {
+            // The hero on a lit stage (owner, 2026-10-30): the weave, one soft light on the chalk circle.
+            HubKnit.Ground(Root);
+            var light = HubKit.Rect(Root, "Light").gameObject.AddComponent<HubGlow>();
+            light.color = new Color(.76f, .29f, .35f, .75f);
+            light.raycastTarget = false;
+            _light = light.rectTransform;
+            _light.anchorMin = _light.anchorMax = new Vector2(.47f, .5f);
+            _light.sizeDelta = new Vector2(1240, 1000);
+            _pick = Mathf.Clamp(Settings.SettingsStore.Current.CharacterPick, 0, People.Count - 1);
+
+            BuildStage();
+            BuildIdentity();
+            BuildClock();
+            var grid = BuildGrid();
+
+            _select = HubKnit.Button(Root, "SelectButton", "SELECT", Knit.Go, Select, 60, HubGlyph.Mark.None, primary: true);
+            HubKnit.At((RectTransform)_select.transform, 1330, 920, 530, 128);
+
+            // The hint answers the button, so it sits between the grid and the button.
+            _hint = HubKnit.Words(Root, "Hint", "", HubStyle.Floor, HubKnit.KitWhite, TextAnchor.LowerRight, true, 3);
+            HubKnit.At(_hint.rectTransform, 1330, 830, 530, 84);
+
+            if (Mode == GameMode.HeroStrike) BuildAbilityReadout();
+
+            // Everyone in the match along the bottom left, with their pick and whether they locked.
+            _seats = HubKnit.At(HubKit.Rect(Root, "Seats"), 60, 932, 4 * 300, SeatHeight);
+
+            if (!Timed)
+            {
+                HubKnit.Back(Root, Hub);
+                HubKnit.At(_role.rectTransform, 200, 46, RoleWidth, 44);
+                HubKnit.At(_name.rectTransform, 200, 82, 440, 170);
+            }
+
+            _endsAt = Time.unscaledTime + Seconds;
+            Show();
+            HubSlap.On(grid, 0.04f, 2);
+            HubSlap.On(_select.transform, 0.1f, -2);
+            if (_abilityColumn != null) HubSlap.On(_abilityColumn, 0.06f, -1);
+        }
+
+        /// <summary>
+        /// The middle of the screen: the live model, its contact shadow and the chalk circle.
+        ///
+        /// ⚠️⚠️ THE RING AND THE SHADOW ARE PLACED WHERE THE FEET ARE DRAWN, EVERY FRAME, NOT AT A
+        /// FIXED OFFSET. The 2026-09 screen placed both 40 units off the stage's bottom edge, which
+        /// is only under the feet of a hero of the reference height at one window shape: Nemu stood
+        /// a head above her own ring at every shape (`CharSelect-v1-*.png`). `StandOnFloor` puts
+        /// every hero on one floor line, and `TryGroundViewport` reports where that floor is drawn.
+        ///
+        /// ⚠️ A SOFT INK POOL, NOT A PILL. The shadow used to be a 420 by 46 rounded sticker at 55
+        /// per cent ink, which read as an empty text field inside the ring.
+        /// </summary>
+        private void BuildStage()
+        {
+            // Centred on x 900, between the hero's text and the roster, standing above the seats.
+            _stage = HubKnit.At(HubKit.Rect(Root, "Stage"), 560, 40, 680, 815);
+            _shadow = HubKit.Rect(_stage, "ContactShadow").gameObject.AddComponent<HubGlow>();
+            _shadow.color = new Color(HubStyle.Ink.r, HubStyle.Ink.g, HubStyle.Ink.b, 0.72f);
+            _shadow.raycastTarget = false;
+            _ring = HubScenery.ChalkRing(_stage, "ChalkCircle", 0.2f);
+            _ring.Width = 7;
+            foreach (var mark in new Graphic[] { _shadow, _ring })
+                mark.rectTransform.anchorMin = mark.rectTransform.anchorMax = mark.rectTransform.pivot = Vector2.zero;
+            PlaceFloor(new Vector2(0.5f, 0.18f));
+
+            var model = HubKit.Stretch(HubKit.Rect(_stage, "Model"));
+            _modelRect = model;
+            _preview = model.gameObject.AddComponent<ModelPreview>();
+            _preview.Attach(model);
+            _preview.CentreSubject();
+            _preview.StandOnFloor();
+        }
+
+        /// <summary>Put the ring, the shadow and the street light's pool at <paramref name="viewport"/>
+        /// of the stage, sized from the stage's height so they scale with the hero.</summary>
+        private void PlaceFloor(Vector2 viewport)
+        {
+            var size = _stage.rect.size;
+            if (size.y < 1) return;
+            float width = Mathf.Clamp(size.y * 0.55f, 260, 600), height = width * 0.3f;
+            // The floor point is under the body's middle and the toes point at the camera, so the
+            // ring is drawn forward of it: the feet stand inside the circle, not on its front edge.
+            // Measured: Dante's toes are drawn 0.06 of the stage below his floor point and Nemu's
+            // 0.04 (`CharSelect-v4-*.png`), and the earlier, smaller ring had Dante on the line.
+            var at = new Vector2(size.x * viewport.x, size.y * viewport.y - height * 0.3f);
+            Set(_ring.rectTransform, at - new Vector2(width, height) * 0.5f, new Vector2(width, height));
+            Set(_shadow.rectTransform, at - new Vector2(width * 0.36f, height * 0.42f), new Vector2(width * 0.72f, height * 0.84f));
+            if (_light != null)
+            {
+                // The street light's pool follows the circle across the root, not the other way round.
+                Vector3 world = _stage.TransformPoint((Vector3)(at + _stage.rect.min));
+                Vector2 local = Root.InverseTransformPoint(world);
+                var anchor = new Vector2((local.x - Root.rect.xMin) / Mathf.Max(1, Root.rect.width),
+                                         (local.y - Root.rect.yMin + size.y * 0.16f) / Mathf.Max(1, Root.rect.height));
+                if ((_light.anchorMin - anchor).sqrMagnitude > 1e-6f) _light.anchorMin = _light.anchorMax = anchor;
+            }
+        }
+
+        private static void Set(RectTransform rect, Vector2 position, Vector2 size)
+        {
+            if ((rect.anchoredPosition - position).sqrMagnitude > 0.25f) rect.anchoredPosition = position;
+            if ((rect.sizeDelta - size).sqrMagnitude > 0.25f) rect.sizeDelta = size;
+        }
+
+        private void BuildIdentity()
+        {
+            _role = HubKnit.Words(Root, "Role", "", 30, HubKnit.KitWhite, TextAnchor.MiddleLeft, true, 3);
+            HubKnit.At(_role.rectTransform, 60, 46, RoleWidth, 44);
+            _name = HubKnit.Display(Root, "Heading", "", 140, HubKnit.KitWhite, TextAnchor.MiddleLeft, 9);
+            HubKnit.At(_name.rectTransform, 54, 82, 640, 170);
+            // Classic has no kit to show, so its column carries the person's one-line story instead.
+            _tagline = HubKnit.Words(Root, "Tagline", "", 32, HubKnit.KitWhite, TextAnchor.UpperLeft, true, 3);
+            HubKnit.At(_tagline.rectTransform, 62, 280, 480, 160);
+        }
+
+        private void BuildClock()
+        {
+            // ⚠️ THE CLOCK IS A NUMBER ON A PLATE WITH ITS JOB BESIDE IT. Valorant draws a big bare
+            // number and Overwatch writes "ASSEMBLE YOUR TEAM: 19" (both inspected 2026-09-23,
+            // `docs/reports/ui-hud-review-2026-09-23/research.md` finding 4), so the number stays a
+            // number; an earlier plan's draining ring had no precedent in either. What it lacked was
+            // a job: a bare "28" floating over the court could be a score. The plate and the PICK
+            // caption say it is the time left to choose, and it still turns persimmon under six.
+            var clockPlate = HubKnit.At(HubKit.Rect(Root, "ClockPlate"), 770, 44, 260, 160);
+            var clockCaption = HubKnit.Words(clockPlate, "ClockCaption", "PICK", 34, HubKnit.KitWhite, TextAnchor.MiddleCenter, true, 3);
+            HubKnit.In(clockCaption.rectTransform, 0, 4, 260, 44);
+            _clock = HubKnit.Display(clockPlate, "Clock", "", 96, HubKnit.KitWhite, TextAnchor.MiddleCenter, 4);
+            HubKnit.In(_clock.rectTransform, 0, 44, 260, 116);
+            clockPlate.gameObject.SetActive(Timed);
+        }
+
+        /// <summary>
+        /// The faces, right side, sitting directly on SELECT.
+        ///
+        /// ⚠️ ONE CELL PER PERSON AND NO MORE. The grid was a fixed 3 by 4, so Hero Strike's nine
+        /// heroes left three hatched cells that looked like locked heroes and were nothing at all; a
+        /// door that leads nowhere is § 6.3's dead end. The grid is as tall as the roster, and a
+        /// thirteenth person widens it to four columns rather than falling off the bottom.
+        ///
+        /// ⚠️ ANCHORED TO THE BOTTOM, ON THE BUTTON IT FEEDS. The choices and the commit are one
+        /// block in every reference (Valorant's LOCK IN sits under its grid), so the eye goes
+        /// face, then SELECT, without crossing the screen.
+        /// </summary>
+        private RectTransform BuildGrid()
+        {
+            int count = People.Count;
+            int columns = count > 12 ? 4 : 3;
+            int rows = Mathf.Max(1, Mathf.CeilToInt(count / (float)columns));
+            float cell = columns == 3 ? Cell : (3 * Cell + 2 * Gap - 3 * Gap) / 4f;
+            float width = columns * cell + (columns - 1) * Gap, height = rows * cell + (rows - 1) * Gap;
+            var grid = HubKnit.At(HubKit.Rect(Root, "Grid"), 1330, 160, width, height);
+            for (int i = 0; i < count; i++)
+            {
+                int index = i;
+                var tile = HubKnit.Button(grid, "Portrait" + i, null, Knit.DarkCard, () => Pick(index));
+                HubKnit.In((RectTransform)tile.transform, (i % columns) * (cell + Gap), (i / columns) * (cell + Gap), cell, cell + 14);
+                var face = FramedFace(tile.Body, People[i].Id);
+                var window = (RectTransform)face.rectTransform.parent;
+                HubKit.Stretch(window, 12); window.offsetMin = new Vector2(12, 26);
+                _portraitFaces.Add(face);
+                _portraitColors.Add(face.color);
+                _cells.Add(tile);
+            }
+            return grid;
+        }
+
+        /// <summary>
+        /// A hero's figure with no background, on the approved framing and lighting, kept inside the rounded well (owner, 2026-11-03). Returns the picture; its parent is the well.
+        /// </summary>
+        private static Image FramedFace(RectTransform parent, string id)
+        {
+            var well = HubKit.Rect(parent, "Well");
+            var wellImage = well.gameObject.AddComponent<Image>();
+            wellImage.sprite = HubBoard.Art("avatar_well");
+            wellImage.raycastTarget = false;
+            well.gameObject.AddComponent<Mask>().showMaskGraphic = false;
+            var face = HubKit.Picture(well, "Face", Avatars.CutPortrait(id) ?? HubKit.Portrait(id));
+            HubKit.Stretch(face.rectTransform);
+            face.preserveAspect = true;
+            return face;
+        }
+
+        private bool Usable(int index)
+        {
+            var person = Roster.At(People, index);
+            if (person == null) return false;
+            // Every route, offline included (`EconomyRules.UnlockedHeroes`, owner 2026-10-20).
+            return HubOwnership.OwnsHeroInRoom(person.Id);
+        }
+
+        /// <summary>
+        /// Another seated player holds this hero. Switching to one somebody holds is refused; a hero two
+        /// people already share (saved picks) belongs to the lower seat, as the installer decides.
+        /// </summary>
+        private bool TakenByOther(int index)
+        {
+            if (Net.NetSession.Instance == null || !Net.NetSession.Instance.IsNetworked) return false;
+            var seats = Hub.Host.Seats();
+            int mine = -1;
+            foreach (var s in seats) if (s.Mine) mine = s.Slot;
+            foreach (var s in seats)
+            {
+                if (s.Mine || !s.Occupied || s.Bot || s.CharacterPick != index) continue;
+                if (index != _pick || mine < 0 || s.Slot < mine) return true;
+            }
+            return false;
+        }
+
+        private void Pick(int index)
+        {
+            if (_locked) return;
+            if (index != _pick && TakenByOther(index))
+            {
+                MenuSfx.Error();
+                Hub.Toast("Another player already has this hero.");
+                return;
+            }
+            _pick = index;
+            var settings = Settings.SettingsStore.Current;
+            settings.CharacterPick = index;
+            var person = Roster.At(People, index);
+            if (person != null)
+            {
+                settings.SlipperPick = Settings.SettingsStore.SlipperPickFor(person.Id);
+                settings.CanPick = Settings.SettingsStore.CanPickFor(person.Id);
+            }
+            Settings.SettingsStore.Save();
+            if (Usable(index)) Hub.Host.PublishPicks();
+            Show();
+            // The focus ring goes with the pick, so the ringed tile and the persimmon tile are one
+            // tile however the pick arrived (a pad's A, a click, or a test invoking the button).
+            var events = UnityEngine.EventSystems.EventSystem.current;
+            if (events != null && index < _cells.Count) events.SetSelectedGameObject(_cells[index].gameObject);
+        }
+
+        private void Select()
+        {
+            if (!Usable(_pick)) { MenuSfx.Error(); Hub.Toast("This hero is locked. Pick a hero without stripes."); return; }
+            if (TakenByOther(_pick)) { MenuSfx.Error(); Hub.Toast("Another player already has this hero. Pick someone else."); return; }
+            Hub.Host.PublishPicks();
+            if (!Timed) { Close(); return; }
+            _locked = true;
+            Hub.Host.LockIn();
+            MenuSfx.Valid();
+            CelebrateLock();
+            // The circle is chalked again, gold: this spot on the court is taken.
+            _ring.color = HubStyle.Golden;
+            _ring.DrawIn(0);
+            Show();
+            var events = UnityEngine.EventSystems.EventSystem.current;
+            if (events != null && _pick < _cells.Count) events.SetSelectedGameObject(_cells[_pick].gameObject);
+        }
+
+        private void Show()
+        {
+            var person = Roster.At(People, _pick);
+            if (person == null) return;
+            string tagline = ConvertedCharacterSelect.TaglineFor(person.Id) ?? "";
+            string[] parts = tagline.Split('\n');
+            bool hero = Mode == GameMode.HeroStrike;
+            _role.text = hero && parts.Length > 1 ? "//  " + parts[0] : "//  CLASSIC";
+            _role.fontSize = HubStyle.Size(30);
+            HubKit.Fit(_role, RoleWidth);
+            _name.text = person.Name;
+            _name.fontSize = HubStyle.Size(140);
+            HubKit.Fit(_name, _name.rectTransform.sizeDelta.x);
+            _tagline.gameObject.SetActive(!hero);
+            _tagline.text = hero ? "" : parts.Length > 1 ? parts[1] : tagline;
+            if (!hero) FitTagline();
+
+            var art = RosterBook.Load().PersonArt(_pick, Mode);
+            if (art != null) _preview.Show(art.Model, art.Clips, art.Palette, art.PetModel);
+            // ⚠️ ABOUT 12 PER CENT CLOSER THAN THE 2026-09 SCREEN (0.95, Paete 0.89), with Paete's
+            // ratio to the cast kept, so `HubFlowTests`' measured shares keep their order. The hero
+            // is the one thing on this screen and a standard hero was drawn at 40 per cent of a
+            // 16:9 screen's height; the stage now has the middle of the screen to fill.
+            // Framed once per hero: LOCK IN and a re-pick of the same face redraw the screen but
+            // must not move the camera under the player's eyes.
+            if (_framedHero != person.Id) _preview.SetTileFraming(person.Id == "paete" ? 0.79f : 0.84f);
+            _framedHero = person.Id;
+            if (_abilityButtons != null)
+            {
+                _shownHero = person.Id;
+                _shownKit = HeroAbilitySystem.CreateKitFor(person.Id);
+                // A role kit shows four powers (signature, attacking, defending, ultimate); the
+                // tiles keep their size and the row grows, inside the column's width.
+                _shownSlots = _shownKit.ScreenSlots;
+                _shownAbilities = System.Array.ConvertAll(_shownSlots, slot => slot.Ability);
+                int count = _shownAbilities.Length;
+                for (int i = 0; i < _abilityButtons.Length; i++)
+                {
+                    bool on = i < count;
+                    _abilityButtons[i].gameObject.SetActive(on);
+                    if (!on) continue;
+                    _abilitySymbols[i].Glyph = _shownAbilities[i].Glyph;
+                    _abilityLabels[i].text = _shownSlots[i].Label switch
+                    {
+                        "SIGNATURE" => "SIGN.",
+                        "ATTACKING" => "ATTACK",
+                        "DEFENDING" => "DEFEND",
+                        "ULTIMATE" => "ULT",
+                        _ => _shownSlots[i].Label
+                    };
+                    _abilityLabels[i].fontSize = HubStyle.Size(HubStyle.Floor);
+                    HubKit.Fit(_abilityLabels[i], 108);
+                }
+                InspectAbility(Mathf.Min(_inspectedAbility, count - 1));
+            }
+
+            PaintCells();
+            _shownSeats = "";
+        }
+
+        /// <summary>The grid, SELECT and the hint, repainted when a pick changes here or at another seat.</summary>
+        private void PaintCells()
+        {
+            for (int i = 0; i < _cells.Count; i++)
+            {
+                bool usable = Usable(i) && !TakenByOther(i);
+                bool picked = i == _pick;
+                HubKnit.Recolour(_cells[i].transform, picked ? Knit.DarkCardOn : usable ? Knit.DarkCard : Knit.Well);
+                var original = _portraitColors[i];
+                _portraitFaces[i].color = usable ? original
+                    : new Color(original.r * 0.62f, original.g * 0.62f, original.b * 0.62f, original.a);
+                // ⚠️ LOCKED IN, THE OTHER FACES STEP BACK AND YOURS STAYS LIT. Disabling every tile
+                // hatched the whole grid, the picked one included, so the screen read as broken at
+                // the one moment it should read as settled (`CharSelect-v1-locked-1600x680.png`).
+                // The picked tile stays enabled and does nothing (`Pick` returns while locked).
+                _cells[i].interactable = !_locked || picked;
+                HubKit.Ensure<CanvasGroup>(_cells[i].gameObject).alpha = _locked && !picked ? 0.42f : 1.0f;
+            }
+
+            bool taken = TakenByOther(_pick);
+            bool can = Usable(_pick) && !taken;
+            HubKnit.Say(_select, _locked ? "LOCKED IN" : Timed ? "SELECT" : "DONE");
+            _select.interactable = !_locked;
+            HubKnit.Recolour(_select.transform, can ? Knit.Go : Knit.Plain);
+            _hint.text = !Usable(_pick) ? "This hero is locked."
+                       : taken ? "Another player has this hero. Pick someone else."
+                       : _locked ? "Waiting for everyone to lock in." : "";
+        }
+
+        /// <summary>
+        /// The hero's kit under the name: ability choices, a category and effect, then a small
+        /// row for the binding and resource. The timed picker keeps the details inline.
+        ///
+        /// ⚠️ NO PLATE. The kit used to be a 380 by 610 dark box between the hero and the grid, as
+        /// heavy as the hero and mostly empty below a three-line sentence. Valorant and Apex both
+        /// set this text straight on the dark scene beside the pick; honey on the night road already
+        /// clears every contrast floor.
+        ///
+        /// VISION 3's Learn layer stays on the timed selector. A popup would make TumpHub stop
+        /// ticking this screen and could suspend the host's deadline.
+        /// </summary>
+        private void BuildAbilityReadout()
+        {
+            _abilityColumn = HubKit.Place(HubKit.Rect(Root, "SelectionAbilities"), HubKit.TopLeft,
+                Vector2.zero, new Vector2(ColumnWidth, 620));
+            HubKnit.At(_abilityColumn, 72, 280, ColumnWidth, 620);
+            _abilityButtons = new HubButton[4];
+            _abilitySymbols = new TumpAbilitySymbol[4];
+            _abilityLabels = new Text[4];
+            _abilityUnderlines = new Image[4];
+            for (int i = 0; i < 4; i++)
+            {
+                int slot = i;
+                var rect = HubKnit.In(HubKit.Rect(_abilityColumn, "SelectionAbility" + i), -10 + i * 124, 0, 114, 106);
+                var hit = rect.gameObject.AddComponent<Image>();
+                hit.color = Color.clear;
+                var button = rect.gameObject.AddComponent<HubButton>();
+                button.targetGraphic = hit;
+                button.RequireUserAttention = true;
+                button.onClick.AddListener(() => InspectAbility(slot));
+                button.Body = HubKit.Stretch(HubKit.Rect(rect, "Body"));
+                button.Shape = HubKit.Shape(button.Body, "Sticker", PanelInk, true, 746 + i, 2, 12, dress: false);
+                HubKit.Stretch(button.Shape.rectTransform);
+                button.Shape.Outline = PanelEdge;
+                button.Shape.ShadowOffset = new Vector2(0, -3);
+                button.Shape.ShadowColor = new Color32(32, 10, 21, 160);
+                var glyph = HubKit.Rect(button.Body, "Glyph").gameObject.AddComponent<TumpAbilitySymbol>();
+                HubKnit.In(glyph.rectTransform, 23, 5, 68, 63);
+                glyph.color = HubStyle.Ink; glyph.raycastTarget = false;
+                var label = HubKnit.Words(button.Body, "SlotLabel", "", HubStyle.Floor, HubKnit.KitCream, TextAnchor.MiddleCenter);
+                HubKnit.In(label.rectTransform, 2, 65, 110, 38);
+                var underline = HubKit.Rect(button.Body, "InspectedMark").gameObject.AddComponent<Image>();
+                HubKnit.In(underline.rectTransform, 38, 102, 38, 4);
+                underline.color = HubStyle.Golden;
+                underline.raycastTarget = false;
+                _abilityButtons[i] = button; _abilitySymbols[i] = glyph;
+                _abilityLabels[i] = label; _abilityUnderlines[i] = underline;
+            }
+            _abilityMeta = HubKnit.Words(_abilityColumn, "AbilityMeta", "", 28, HubKnit.KitTan, TextAnchor.MiddleLeft);
+            _abilityName = HubKnit.Display(_abilityColumn, "AbilityName", "", 50, HubKnit.KitWhite, TextAnchor.MiddleLeft, 3);
+            _abilitySummary = HubKnit.Words(_abilityColumn, "AbilitySummary", "", 33, HubKnit.KitCream, TextAnchor.MiddleLeft, false);
+            var facts = HubKit.Rect(_abilityColumn, "SkillFacts").gameObject.AddComponent<HudCard>();
+            facts.Glass(PanelInk, slant: 0, radius: 10, shadow: .2f);
+            facts.Border = PanelEdge;
+            facts.raycastTarget = false;
+            _abilityFacts = facts.rectTransform;
+            _abilityKeyGlyph = HubKit.Rect(_abilityFacts, "KeyGlyph").gameObject.AddComponent<Image>();
+            _abilityKeyGlyph.preserveAspect = true;
+            _abilityKeyGlyph.raycastTarget = false;
+            _abilityKeyText = HubKnit.Words(_abilityFacts, "KeyText", "", 28, HubKnit.KitCream, TextAnchor.MiddleCenter);
+            _abilityKeyText.horizontalOverflow = HorizontalWrapMode.Overflow;
+            _abilityHold = HubKnit.Words(_abilityFacts, "HoldPrompt", "HOLD", 28, HubKnit.KitTan);
+            _abilityCost = HubKnit.Words(_abilityColumn, "AbilityCost", "", 28, HubKnit.KitCream, TextAnchor.MiddleLeft);
+            _abilityCost.horizontalOverflow = HorizontalWrapMode.Overflow;
+        }
+
+        private void InspectAbility(int slot)
+        {
+            if (_shownAbilities == null) return;
+            _inspectedAbility = Mathf.Clamp(slot, 0, _shownAbilities.Length - 1);
+            var ability = _shownAbilities[_inspectedAbility];
+            var shown = _shownSlots[_inspectedAbility];
+            AbilityVariant variant = null;
+            if (HeroLoadoutRules.SidegradesOpen && shown.LoadoutSlot > 0)
+            {
+                var settings = Settings.SettingsStore.Current;
+                var build = HeroBuildRules.RowFor(settings.HeroBuilds, _shownHero);
+                variant = HeroBuildRules.Equipped(build, _shownHero, shown.LoadoutSlot, settings.AbilityChallenges);
+            }
+            bool alternate = variant != null && !variant.IsDefault;
+            _abilityName.text = (alternate ? variant.Name : ability.Name).ToUpperInvariant();
+            _abilitySummary.text = alternate ? variant.Description : ability.Summary;
+            // The selected tab already names the role.
+            _abilityMeta.text = AbilityIcons.LabelFor(ability.Glyph);
+            string resource = shown.IsUltimate ? _shownKit.UltimateCost.ToString("0") + " charge"
+                : ability.UsesCharges ? ability.MaxCharges + (ability.MaxCharges == 1 ? " use" : " uses")
+                : ability.Cooldown.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " s cooldown";
+            // ⚠️ THE KEY IS THE LIVE BINDING FOR THE DEVICE IN HAND (`Hud.KeyLabelFor`), never a
+            // literal, and a phone is told no key at all (`docs/VISION.md` § 3).
+            string key = InputLayer.LastInputDevice.Current == InputLayer.InputDeviceKind.Touch ? "" : Hud.KeyLabelFor(shown.Action);
+            _abilityKeyGlyph.sprite = InputGlyphs.For(key, true);
+            _abilityKeyGlyph.enabled = _abilityKeyGlyph.sprite != null;
+            _abilityKeyText.text = key;
+            _abilityKeyText.enabled = !_abilityKeyGlyph.enabled && !string.IsNullOrEmpty(key);
+            _abilityHold.enabled = ability.HoldToAim && !string.IsNullOrEmpty(key);
+            _abilityCost.text = resource;
+            StackAbilityText();
+            for (int i = 0; i < _abilityButtons.Length; i++)
+            {
+                bool inspected = i == _inspectedAbility;
+                var shape = _abilityButtons[i].Shape;
+                shape.Fill = inspected ? SelectedInk : PanelInk;
+                shape.Outline = inspected ? HubStyle.Golden : PanelEdge;
+                shape.Redraw();
+                _abilityLabels[i].color = inspected ? HubStyle.Honey : HubKnit.KitCream;
+                _abilityUnderlines[i].enabled = inspected;
+            }
+        }
+
+        /// <summary>Measure the effect as it wraps. The input and resource sit below it.</summary>
+        private void StackAbilityText()
+        {
+            const float width = ColumnWidth - 150;
+            const float left = -10, factsHeight = 55;
+            _abilityName.fontSize = HubStyle.Size(50);
+            _abilityMeta.fontSize = _abilityCost.fontSize = _abilityKeyText.fontSize = _abilityHold.fontSize = HubStyle.Size(28);
+            _abilitySummary.fontSize = HubStyle.Size(33);
+            float y = Line(_abilityMeta, 128, 6) + 2;
+            y = Line(_abilityName, y, 12) + 8;
+            y = Line(_abilitySummary, y, 8) + 14;
+
+            float x = 16;
+            if (_abilityHold.enabled)
+            {
+                float holdWidth = Mathf.Ceil(_abilityHold.preferredWidth);
+                HubKnit.In(_abilityHold.rectTransform, x, 0, holdWidth + 4, factsHeight);
+                x += holdWidth + 14;
+            }
+            if (_abilityKeyGlyph.enabled)
+            {
+                HubKnit.In(_abilityKeyGlyph.rectTransform, x, 8, 48, 39);
+                x += 60;
+            }
+            else if (_abilityKeyText.enabled)
+            {
+                float keyWidth = Mathf.Max(38, Mathf.Ceil(_abilityKeyText.preferredWidth) + 14);
+                HubKnit.In(_abilityKeyText.rectTransform, x, 0, keyWidth, factsHeight);
+                x += keyWidth + 14;
+            }
+            float costWidth = Mathf.Ceil(_abilityCost.preferredWidth) + 4;
+            HubKnit.In(_abilityFacts, left, y, x + costWidth + 16, factsHeight);
+            HubKnit.In(_abilityCost.rectTransform, left + x, y, costWidth, factsHeight);
+
+            float Line(Text text, float top, float padding)
+            {
+                text.rectTransform.sizeDelta = new Vector2(width, text.rectTransform.sizeDelta.y);
+                float height = Mathf.Ceil(text.preferredHeight) + padding;
+                HubKnit.In(text.rectTransform, left, top, width, height);
+                return top + height;
+            }
+        }
+
+        public override bool Back()
+        {
+            if (Timed) return true;   // a found match is not left from the pick screen
+            Hub.Host.PublishPicks();
+            return false;
+        }
+
+        private void FitTagline()
+        {
+            _tagline.fontSize = HubStyle.Size(32);
+            _tagline.rectTransform.sizeDelta = new Vector2(480, Mathf.Ceil(_tagline.preferredHeight) + 12);
+            _taglineScale = _tagline.canvas != null ? _tagline.canvas.scaleFactor : 0f;
+        }
+
+        public override void Tick()
+        {
+            if (_lockAt > -50f) AnimateLock();
+            DrawSeats();
+            if (_preview.TryGroundViewport(out var floor)) PlaceFloor(floor);
+            // ⚠️ RE-STACK WHEN ANY LINE OUTGROWS ITS BOX. The stack is measured when an ability is
+            // inspected, so turning Larger text on while this screen is open wrapped a one-line
+            // name onto two lines inside a one-line box: `MatchArrivalFlowTests` measured 111 units
+            // of name in 52 (red since 2026-09-23 23:53, before this date's scenery pass).
+            if (_abilityName != null)
+                foreach (var text in new[] { _abilityName, _abilityMeta, _abilityCost, _abilitySummary })
+                    if (text.preferredHeight > text.rectTransform.rect.height + 2) { StackAbilityText(); break; }
+            if (_tagline.isActiveAndEnabled && _tagline.canvas != null
+                && (!Mathf.Approximately(_taglineScale, _tagline.canvas.scaleFactor) || _tagline.fontSize != HubStyle.Size(32)))
+                FitTagline();
+            if (!Timed) return;
+
+            float left = Net.MatchRpc.Instance != null && Net.MatchRpc.Instance.CharacterSelecting
+                ? Net.MatchRpc.Instance.CharacterSelectSecondsLeft : Mathf.Max(0, _endsAt - Time.unscaledTime);
+            _clock.text = Mathf.CeilToInt(left).ToString();
+            _clock.color = left < 6 ? HubKnit.KitLime : HubKnit.KitWhite;
+
+            if (left <= 0 && !_locked && Usable(_pick)) Select();
+            if (_started || !Hub.Host.IsHost) return;
+
+            // ⚠️ THE HOST STARTS, NOBODY ELSE CAN (`MatchRpc.HostStartMatch` is host-only). Everyone
+            // locked, or the clock out: a pick left unlocked at zero is the pick the player is on.
+            bool everyone = _locked;
+            foreach (var seat in Hub.Host.Seats())
+                if (seat.Occupied && !seat.Bot && !seat.Mine && !seat.Ready) everyone = false;
+            if (everyone || left <= 0)
+            {
+                _started = true;
+                // Completion belongs to this locked selection screen. Repeated START GAME
+                // clicks in the lobby can only open the stage, never skip its lock-in.
+                if (Net.MatchRpc.Instance != null && Net.MatchRpc.Instance.CharacterSelecting)
+                    Net.MatchRpc.Instance.HostCompleteCharacterSelection();
+                else Hub.Host.StartGame();
+            }
+        }
+
+        private void CelebrateLock()
+        {
+            _lockAt = Time.unscaledTime;
+            MenuSfx.Start();
+            if (_lockFlash == null)
+            {
+                _lockFlash = HubKit.Stretch(HubKit.Rect(Root, "LockFlash")).gameObject.AddComponent<Image>();
+                _lockFlash.raycastTarget = false;
+            }
+            _lockFlash.transform.SetAsLastSibling();
+            AnimateLock();
+        }
+
+        /// <summary>The hero's punch, the name's pop and the flash, each a fraction of a second after SELECT.</summary>
+        private void AnimateLock()
+        {
+            float t = Time.unscaledTime - _lockAt;
+            bool still = Settings.SettingsStore.Current.ReducedUiMotion;
+            float u = Mathf.Clamp01(t / LockPunchSeconds);
+            float punch = still || t > LockPunchSeconds ? 1 : 1 + .1f * Mathf.Sin(u * Mathf.PI) * (1 - .4f * u);
+            if (_modelRect != null) _modelRect.localScale = Vector3.one * punch;
+            if (_name != null) _name.rectTransform.localScale = Vector3.one * (1 + (punch - 1) * .8f);
+            if (_lockFlash != null)
+            {
+                float f = still ? 0 : .45f * Mathf.Clamp01(1 - t / LockFlashSeconds);
+                _lockFlash.color = new Color(HubStyle.Golden.r, HubStyle.Golden.g, HubStyle.Golden.b, f);
+                _lockFlash.enabled = f > .001f;
+            }
+        }
+
+        /// <summary>The first round this seat is the taya in, or 0 when the match is too short.</summary>
+        private static int FirstTayaRound(int slot)
+        {
+            int rounds = SceneFlow.SelectedRules != null ? SceneFlow.SelectedRules.Rounds : MatchRules.RoundCountFor(SceneFlow.SelectedMode);
+            for (int round = 1; round <= rounds; round++)
+                if (MatchRules.IsDefenderSlot(slot, round)) return round;
+            return 0;
+        }
+
+        /// <summary>
+        /// The four seats, as Valorant's team column shows them: whose seat, the face they are on,
+        /// and whether they have committed to it.
+        ///
+        /// ⚠️ A TEAMMATE'S FACE STILL BEING CHOSEN IS DRAWN FAINT AND A LOCKED ONE SOLID, and your
+        /// own card gets your tsinelas when you lock: the state reads without reading the word. A bot's hero is
+        /// decided when the match installs (`MatchInstaller.AiCharacterIndex`), so a bot seat shows
+        /// the bot mark rather than a face it might not play. An empty seat with no bot reads OPEN;
+        /// it used to read BOT, which is what a host who left that seat empty did not choose.
+        /// </summary>
+        private void DrawSeats()
+        {
+            var seats = Hub.Host.Seats();
+            string key = _locked + ":" + Timed + "|";
+            foreach (var s in seats) key += s.Occupied + ":" + s.Bot + ":" + s.CharacterPick + ":" + s.Ready + ":" + s.Name + "|";
+            if (key == _shownSeats) return;
+            bool first = _shownSeats.Length == 0 && _seats.childCount == 0;
+            _shownSeats = key;
+            // Another seat's pick changes which faces are taken here.
+            if (_cells.Count > 0 && _select != null) PaintCells();
+
+            for (int i = _seats.childCount - 1; i >= 0; i--) Destroy(_seats.GetChild(i).gameObject);
+            for (int i = 0; i < seats.Length; i++)
+            {
+                var seat = seats[i];
+                bool open = !seat.Occupied && !seat.Bot;
+                // ⚠️ ON A TIMED SCREEN YOUR OWN LOCK IS THIS SCREEN'S, NOT THE LOBBY'S READY FLAG. The
+                // flag outlives the screen that set it, so a second pick screen in one session
+                // opened with your card reading LOCKED beside a SELECT you had not pressed
+                // (`CharSelect-v7-larger-1280x720.png`). `Tick`'s start test already reads `_locked`.
+                bool locked = seat.Mine && Timed ? _locked : seat.Ready;
+                // Another player just locked: their card pops and the room hears it.
+                bool justLocked = !first && locked && i < _seatWasLocked.Length && !_seatWasLocked[i] && !seat.Mine;
+                if (i < _seatWasLocked.Length) _seatWasLocked[i] = locked;
+                var card = HubKnit.In(HubKit.Rect(_seats, "Seat" + i), i * 300, 0, SeatWidth, SeatHeight);
+                var surface = card.gameObject.AddComponent<HudCard>();
+                surface.Glass(PanelInk, slant: 0, radius: 16, shadow: .24f);
+                surface.Style(seat.Mine ? SelectedInk : PanelInk,
+                    seat.Mine ? HubStyle.Golden : PanelEdge, seat.Mine ? 2.5f : 1.5f, Color.clear, 0);
+                surface.raycastTarget = false;
+                var person = seat.Occupied ? Roster.At(People, seat.CharacterPick) : null;
+                string title = seat.Mine ? "YOU" : seat.Occupied ? seat.Name : seat.Bot ? "BOT" : "+ OPEN";
+                string state = seat.Bot ? (Timed ? "READY" : "")
+                             : !seat.Occupied ? ""
+                             : Timed ? (locked ? "LOCKED" : "PICKING")
+                             : seat.Ready ? "READY" : "";
+                if (open)
+                {
+                    var word = HubKnit.Display(card, "Name", title, 34, HubKnit.KitCream, TextAnchor.MiddleCenter);
+                    HubKnit.In(word.rectTransform, 0, 19, SeatWidth, 70);
+                }
+                else
+                {
+                    var badge = HubKnit.In(HubKit.Rect(card, "SeatBadge"), 14, 14, 80, 80).gameObject.AddComponent<HudCard>();
+                    badge.Glass(new Color32(46, 18, 29, 255), slant: 0, radius: 12, shadow: 0);
+                    badge.Border = PanelEdge;
+                    badge.raycastTarget = false;
+                    if (person != null)
+                    {
+                        var face = FramedFace(badge.rectTransform, person.Id);
+                        HubKit.Stretch((RectTransform)face.rectTransform.parent, 3);
+                        // Everyone else's pick is faint until they lock it; your own face stays whole.
+                        if (Timed && !locked && !seat.Mine)
+                        {
+                            face.color = new Color(1, 1, 1, 0.5f);
+                            face.rectTransform.parent.GetComponent<Image>().color = new Color(1, 1, 1, 0.5f);
+                        }
+                    }
+                    else
+                    {
+                        Graphic mark = seat.Occupied
+                            ? HubKit.Glyph(badge.rectTransform, "Person", HubGlyph.Mark.Person, HubKnit.KitTan)
+                            : HubKnit.BotFace(badge.rectTransform, "Bot");
+                        HubKnit.In(mark.rectTransform, 19, 19, 42, 42);
+                    }
+                    var name = HubKnit.Display(card, "Name", title, 35, HubKnit.KitCream);
+                    HubKnit.In(name.rectTransform, 108, state.Length > 0 ? 12 : 28, 160, 49);
+                    HubKit.Fit(name, 160);
+                    if (state.Length > 0)
+                    {
+                        Color status = locked || seat.Bot ? HubStyle.Honey : HubKnit.KitTan;
+                        var stateText = HubKnit.Words(card, "State", state, HubStyle.Floor, status);
+                        HubKnit.In(stateText.rectTransform, 109, 56, 158, 38);
+                        HubKit.Fit(stateText, 158);
+                    }
+                }
+                int taya = seat.Mine ? FirstTayaRound(seat.Slot) : 0;
+                if (taya > 0)
+                {
+                    // ⚠️ THE GAME'S OWN WORD AND ITS OWN RULE, OVER YOUR SEAT: seat N is the taya in round
+                    // N + 1 (`MatchRules.DefenderSlotFor`), fixed before the match, and a role kit's
+                    // defending power is the one you need first if this says round 1.
+                    var tag = HubKnit.Tag(_seats, "Taya", "TAYA IN ROUND " + taya, Knit.PillYellow, 56);
+                    HubKnit.In(tag, i * 300 + (SeatWidth - tag.sizeDelta.x) * .5f, -60, tag.sizeDelta.x, 56);
+                }
+                var slipper = seat.Mine && locked && Timed ? Resources.Load<Texture2D>("UI/brand/tsinelas_mark") : null;
+                if (slipper != null)
+                {
+                    // ⚠️ YOUR TSINELAS, PUT DOWN ON THE LINE: THIS SEAT IS IN. It is the brand's own
+                    // slipper (`Resources/UI/brand/tsinelas_mark.png`), drawn as delivered, and it
+                    // is on YOUR card only: `BrandMarks.Mark` records that the tsinelas means "this
+                    // one" and stops meaning anything the moment it repeats. A teammate's lock
+                    // reads from their face turning solid and the word under their name. The first
+                    // pass used the thin `HubGlyph` slipper, which read as a paperclip at 64 units.
+                    // A RawImage, because the file imports as a texture and not a sprite (see
+                    // `BrandMarks.Mark`'s remarks: a null sprite draws a white box).
+                    // Over the portrait's outer corner, hanging off the card like a slapped-on
+                    // sticker. Every other place collides with words: the portrait's inner corner
+                    // covered the L of LOCKED (`CharSelect-v7-locked-1600x680.png`), the right edge
+                    // meets LOCKED at Larger text, and above the card is the TAYA tag.
+                    var holder = HubKit.Place(HubKit.Rect(card, "LockedSlipper"), HubKit.BottomLeft, new Vector2(-12, -10), new Vector2(54, 70));
+                    holder.localRotation = Quaternion.Euler(0, 0, 14);
+                    var stamp = HubKit.Stretch(HubKit.Rect(holder, "Slipper")).gameObject.AddComponent<RawImage>();
+                    stamp.texture = slipper;
+                    stamp.raycastTarget = false;
+                    // The holder carries the tilt; `HubSlap` settles its own target back to upright.
+                    HubSlap.On(stamp, 0, -18);
+                }
+                if (first) HubSlap.On(card, 0.05f + i * 0.04f, i % 2 == 0 ? 1.5f : -1.5f);
+                else if (justLocked) { HubSlap.On(card, 0, i % 2 == 0 ? 3f : -3f); MenuSfx.Tick(); }
+            }
+        }
+    }
+}

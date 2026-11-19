@@ -1,0 +1,275 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using NUnit.Framework;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using TumbangPreso.UI;
+using UnityEngine;
+using UnityEngine.TestTools;
+using Object=UnityEngine.Object;
+
+namespace TumbangPreso.PlayTests
+{
+    public sealed class ThrowAimIntegrationProbe
+    {
+        private bool _bots,_spectator,_pinned;
+        private int _seat;
+        private CustomRules _rules;
+        private INetProvider _net;
+        private const BindingFlags Private=BindingFlags.Instance|BindingFlags.NonPublic;
+        [UnitySetUp] public IEnumerator Before()
+        {
+            _bots=GameLaunch.AllBots;_spectator=GameLaunch.Spectator;_seat=GameLaunch.SoloSeat;
+            _pinned=SceneFlow.RulesPinned;_rules=SceneFlow.SelectedRules.Clone();_net=NetAuthority.Provider;
+            yield return PlayModeWorld.Reset();
+        }
+        [UnityTearDown] public IEnumerator After()
+        {
+            yield return PlayModeWorld.Reset();NetAuthority.Provider=_net;
+            GameLaunch.AllBots=_bots;GameLaunch.Spectator=_spectator;GameLaunch.SoloSeat=_seat;
+            SceneFlow.AdoptRemoteRules(_rules);if(_pinned)SceneFlow.PinSelectedRules(_rules);else SceneFlow.UnpinSelectedRules();
+        }
+
+        [UnityTest]
+        public IEnumerator RealMovementIncreasesDriftAndTheAirborneReleaseUsesTheGuide()
+        {
+            yield return MapRetrievalProbe.Load(SceneFlow.Eskinita, skipReadyArrival: true);
+            NetAuthority.Provider = new SoloProvider();
+            var actor = GameServices.Round.PlayerAt(1);
+            var carrier = actor.GetComponent<Carrier>();
+            var shoe = carrier.Held;
+            Assert.IsNotNull(shoe);
+            actor.Teleport(new Vector3(-3, .12f, -9.5f));
+            actor.transform.rotation = Quaternion.identity;
+            actor.Intent.Parked = false;
+            actor.Intent.AimPoint = GameServices.Round.Lata.Mark + Vector3.up * .2f;
+            for (int i = 0; i < 12; i++) yield return new WaitForFixedUpdate();
+            Assert.IsTrue(actor.IsGrounded);
+            Assert.IsTrue(GameServices.Round.CanThrow(actor));
+
+            var load = typeof(Carrier).GetField("_aimMovement", Private);
+            actor.Intent.Set(Verb.SpecialAbility, true);
+            yield return new WaitForSeconds(1.65f);
+            Assert.IsTrue(carrier.IsCharging);
+            float planted = (float)load.GetValue(carrier);
+
+            actor.Intent.Move = Vector2.right;
+            yield return new WaitForSeconds(.45f);
+            float walking = (float)load.GetValue(carrier);
+            Assert.Greater(walking, planted + .7f);
+
+            actor.Intent.Set(Verb.Sprint, true);
+            yield return new WaitForSeconds(.45f);
+            Assert.IsTrue(actor.Stamina.IsSprinting);
+            float sprinting = (float)load.GetValue(carrier);
+            Assert.Greater(sprinting, walking + .3f);
+
+            actor.Intent.Set(Verb.Jump, true);
+            actor.Intent.BufferPress(Verb.Jump);
+            float until = Time.time + .25f;
+            while (actor.IsGrounded && Time.time < until) yield return new WaitForFixedUpdate();
+            actor.Intent.Set(Verb.Jump, false);
+            yield return new WaitForSeconds(.2f);
+            Assert.IsFalse(actor.IsGrounded);
+            float airborne = (float)load.GetValue(carrier);
+            Assert.Greater(airborne, sprinting + .15f);
+            Assert.IsTrue(carrier.IsCharging);
+            var expected = carrier.AimGuideVelocityNow();
+            actor.Intent.Set(Verb.SpecialAbility, false);
+            Step(carrier, 0f);
+            Assert.AreEqual(SlipperState.InFlight, shoe.State);
+            Assert.Less(Vector3.Distance(expected, shoe.Velocity), .001f);
+            Debug.Log(FormattableString.Invariant(
+                $"[ThrowAimContext] planted={planted:F3} walk={walking:F3} sprint={sprinting:F3} airborne={airborne:F3}"));
+        }
+
+        [UnityTest]
+        public IEnumerator PreviewAndReleasedThrowRetainTheSameAimInBothModes()
+        {
+            const string output="Logs/throw-aim-integration-v1";Directory.CreateDirectory(output);
+            var rows=new System.Collections.Generic.List<string>{"mode,aim_offset_degrees,velocity_error,point_shift_metres"};
+            foreach(var mode in new[]{GameMode.Classic,GameMode.HeroStrike})
+            {
+                yield return MapRetrievalProbe.Load(SceneFlow.Eskinita,mode);
+                NetAuthority.Provider=new SoloProvider();GameServices.Round.BeginRound();
+                var who=GameServices.Round.PlayerAt(1);var carrier=who.GetComponent<Carrier>();
+                var shoe=carrier.Held;Assert.IsNotNull(shoe);
+                who.Teleport(new Vector3(0,.12f,-10));who.Intent.Clear();who.Intent.Parked=false;
+                who.Intent.AimPoint=new Vector3(0,.18f,0);
+                Assert.False(who.IsDefender);Assert.True(GameServices.Round.CanThrow(who));
+                var rig=Object.FindFirstObjectByType<CameraSystem.CameraRig>();rig.Follow(who);
+                who.transform.rotation=Quaternion.identity;rig.SetAimSource(CameraSystem.AimSource.Movement);
+                yield return null;
+                var toTarget=who.Intent.AimPoint-rig.transform.position;
+                typeof(CameraSystem.CameraRig).GetField("_pitchDeg",Private).SetValue(rig,
+                    Mathf.Atan2(-toTarget.y,new Vector2(toTarget.x,toTarget.z).magnitude)*Mathf.Rad2Deg);
+                carrier.enabled=false;
+                who.Intent.Set(Verb.SpecialAbility,true);
+                Step(carrier,.016f);Assert.True(carrier.IsCharging);
+                Set(carrier,"_charge",.35f);Set(carrier,"_aimHeldSeconds",.35f);Set(carrier,"_aimMovement",.8f);
+                carrier.ApplyObservedCharge(true,.35f,0);
+                if(mode==GameMode.HeroStrike)
+                {
+                    // A hero aim with no throw buff (Zack's Overcharge Throw was retired on 2026-10-25).
+                    who.AbilitySystem.BindHero("zack");
+                }
+                yield return GameplayShots.Render(rig.Camera,mode+"-steady-aim",true,output);
+                var aim=carrier.AimPoint();var expected=carrier.LaunchVelocityNow();
+                var viewPoint=rig.Camera.WorldToViewportPoint(carrier.AimGuidePoint());
+                Assert.Greater(viewPoint.z,0,"Aim review camera must face the actual target.");
+                Assert.Less(Vector2.Distance(new Vector2(viewPoint.x,viewPoint.y),new Vector2(.5f,.5f)),.05f);
+                var readout=Object.FindFirstObjectByType<TumpMatchReadout>();
+                typeof(TumpMatchReadout).GetMethod("LateUpdate",Private).Invoke(readout,null);
+                var reticle=(UnityEngine.UI.Text)typeof(TumpMatchReadout).GetField("_crosshair",Private).GetValue(readout);
+                Assert.Less(Vector2.Distance(reticle.rectTransform.anchorMin,new Vector2(viewPoint.x,viewPoint.y)),.001f,
+                    "The general-direction reticle must not reveal the exact accuracy error.");
+                float shift=Vector3.Distance(aim,who.Intent.AimPoint);
+                Assert.Greater(shift,.001f,"Fixture must release a visibly offset aim, not a zero crossing.");
+                float angle=carrier.AimAngularOffset.magnitude;
+                who.Intent.Set(Verb.SpecialAbility,false);
+                Step(carrier,.016f);
+                Assert.False(carrier.IsCharging);Assert.IsNull(carrier.Held);
+                float error=Vector3.Distance(expected,shoe.Velocity);
+                Assert.Less(error,.001f,"Clearing charge or consuming the infusion changed the visible launch solution.");
+                rows.Add(FormattableString.Invariant($"{mode},{angle:F5},{error:F6},{shift:F5}"));
+                carrier.enabled=true;
+                yield return PlayModeWorld.Reset();
+            }
+            File.WriteAllLines(Path.Combine(output,"release.csv"),rows);
+        }
+
+        [UnityTest]
+        public IEnumerator FlightGuideStaysVisibleOnRealSurfacesAndReleaseHidesIt()
+        {
+            string output=Environment.GetEnvironmentVariable("TUMP_AIM_GUIDE_REVIEW")??"Logs/aim-guide-surfaces-v2";Directory.CreateDirectory(output);
+            foreach(string map in new[]{SceneFlow.BayanPlaza,SceneFlow.IlalimNgTulay,SceneFlow.SaBubong})
+            {
+                yield return MapRetrievalProbe.Load(map);
+                var ready=Object.FindFirstObjectByType<ReadyGate>();
+                Assert.IsNotNull(ready);ready.StartLocalCountdown();
+                yield return new WaitForSeconds(ReadyGate.HudRevealSeconds + 3.6f);
+                Assert.False(ready.AwaitingReady||ready.CountingDown,"Review must enter the active game through its ready countdown.");
+                NetAuthority.Provider=new SoloProvider();GameServices.Round.BeginRound();
+                var who=GameServices.Round.PlayerAt(1);var carrier=who.GetComponent<Carrier>();
+                var can=GameServices.Round.Lata;
+                who.Teleport(can.transform.position+new Vector3(0,.12f,-10));
+                who.transform.rotation=Quaternion.identity;who.Intent.Clear();who.Intent.Parked=false;
+                who.Intent.AimPoint=can.transform.position+Vector3.up*.18f;
+                var brain=who.GetComponent<AIController>();if(brain==null)brain=who.gameObject.AddComponent<AIController>();
+                brain.enabled=false;
+                var rig=Object.FindFirstObjectByType<CameraSystem.CameraRig>();rig.Follow(who);
+                rig.SetAimSource(CameraSystem.AimSource.Movement);yield return null;
+                var direction=who.Intent.AimPoint-rig.transform.position;
+                typeof(CameraSystem.CameraRig).GetField("_pitchDeg",Private).SetValue(rig,
+                    Mathf.Atan2(-direction.y,new Vector2(direction.x,direction.z).magnitude)*Mathf.Rad2Deg);
+                carrier.enabled=false;who.Intent.Set(Verb.SpecialAbility,true);Step(carrier,.016f);
+                Assert.True(carrier.IsCharging);
+                Set(carrier,"_charge",Balance.ChargeFullTime);Set(carrier,"_aimHeldSeconds",2.5f);Set(carrier,"_aimMovement",1f);
+                var guide=GameObject.Find($"~AimArc{who.PlayerSlot}")?.GetComponent<TrajectoryPreview>();
+                Assert.IsNotNull(guide,"The real match must install the local aiming guide.");
+                typeof(TrajectoryPreview).GetMethod("LateUpdate",Private).Invoke(guide,null);
+                Assert.True(guide.FlightVisible,"A disabled old bot component hid the local direction guide.");
+                var path=(List<Vector3>)typeof(TrajectoryPreview).GetField("_path",Private).GetValue(guide);
+                Assert.Greater(path.Count,3);
+                Assert.That(guide.LandingPoint.y, Is.GreaterThan(-1f));
+                Assert.IsNull(guide.GetComponent<MeshRenderer>(), "The flight guide should have no ground circle.");
+                foreach(var vertex in guide.GetComponentInChildren<MeshFilter>().sharedMesh.vertices)
+                    Assert.False(float.IsNaN(vertex.x)||float.IsNaN(vertex.y)||float.IsNaN(vertex.z));
+                yield return GameplayShots.Render(rig.Camera,map+"-moving-guide",true,output);
+                Assert.True(guide.FlightVisible,"The guide disappeared during actual camera frames.");
+                CaptureGuideDifference(rig.Camera,guide,output,map+"-moving");
+                Set(carrier,"_aimMovement",0f);
+                typeof(TrajectoryPreview).GetMethod("LateUpdate",Private).Invoke(guide,null);
+                Assert.True(guide.FlightVisible, "Settled aim must retain its flight path.");
+                yield return GameplayShots.Render(rig.Camera,map+"-settled-guide",true,output);
+                CaptureGuideDifference(rig.Camera,guide,output,map+"-settled");
+                who.Intent.Set(Verb.SpecialAbility,false);Step(carrier,.016f);
+                typeof(TrajectoryPreview).GetMethod("LateUpdate",Private).Invoke(guide,null);
+                Assert.False(guide.FlightVisible,"The guide survived an accepted release.");
+                Object.Destroy(guide.gameObject);yield return PlayModeWorld.Reset();
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator MovingNemuGuideContributesVisiblePixelsDuringARealHeldThrow()
+        {
+            string output=Environment.GetEnvironmentVariable("TUMP_AIM_GUIDE_REVIEW")??"Logs/aim-guide-motion-v1";
+            Directory.CreateDirectory(output);
+            yield return MapRetrievalProbe.Load(SceneFlow.BayanPlaza,GameMode.HeroStrike);
+            NetAuthority.Provider=new SoloProvider();GameServices.Round.BeginRound();
+            var who=GameServices.Round.PlayerAt(1);var carrier=who.GetComponent<Carrier>();
+            who.CharacterIndex=Roster.IndexIn(Roster.HeroPeople,"nemu");
+            var art=RosterBook.Load().PersonArt(who.CharacterIndex,GameMode.HeroStrike);
+            who.GetComponent<Visual.CharacterVisual>().ApplyModel(art.Model,art.Tint,art.Clips,art.Palette,art.PetModel);
+            who.AbilitySystem.BindHero("nemu");who.Teleport(new Vector3(0,.12f,-10));who.transform.rotation=Quaternion.identity;
+            who.Intent.Clear();who.Intent.Parked=false;
+            var rig=Object.FindFirstObjectByType<CameraSystem.CameraRig>();rig.Follow(who);rig.SetAimSource(CameraSystem.AimSource.Movement);
+            var guide=GameObject.Find($"~AimArc{who.PlayerSlot}").GetComponent<TrajectoryPreview>();
+            var notes=new List<string>();var sampleTimes=new[]{1.4f,2.1f,2.8f,3.15f};
+            float start=Time.realtimeSinceStartup;int sample=0;
+            try
+            {
+                while(Time.realtimeSinceStartup-start<3.6f)
+                {
+                    float t=Time.realtimeSinceStartup-start;
+                    who.Intent.Move=new Vector2(.6f,0);who.Intent.AimPoint=new Vector3(2,.18f,0);who.Intent.FaceAimPoint=true;
+                    who.Intent.SpinInput=.75f;who.Intent.Set(Verb.SpecialAbility,t>=.5f);
+                    yield return null;
+                    if(sample>=sampleTimes.Length || t<sampleTimes[sample])continue;
+                    yield return GameplayShots.Render(rig.Camera,"motion-"+sample,false,output);
+                    var path=(List<Vector3>)typeof(TrajectoryPreview).GetField("_path",Private).GetValue(guide);
+                    var renderer=guide.GetComponentInChildren<MeshRenderer>();var mesh=guide.GetComponentInChildren<MeshFilter>().sharedMesh;
+                    var tail=path.Count>1?path[path.Count-1]:Vector3.zero;string blocker="none";
+                    if(path.Count>1)
+                    {
+                        var delta=tail-path[path.Count-2];
+                        if(Physics.Linecast(path[path.Count-2],tail+delta.normalized*.06f,out var hit,~0,QueryTriggerInteraction.Ignore))blocker=hit.collider.name;
+                    }
+                    notes.Add($"sample={sample} t={t:F3} skin={carrier.Held?.SkinIndex} charge={carrier.IsCharging} power={carrier.ChargeRatio:F3} guide={renderer.enabled} vertices={mesh.vertexCount} points={path.Count} confidence={carrier.AimGuideConfidence:F3} horizon={carrier.AimGuideHorizon:F3} origin={carrier.AimGuideOrigin()} tail={tail} blocker={blocker}");
+                    File.WriteAllLines(Path.Combine(output,"state.txt"),notes);
+                    Assert.True(carrier.IsCharging);Assert.True(renderer.enabled);
+                    CaptureGuideDifference(rig.Camera,guide,output,"motion-"+sample);sample++;
+                }
+                Assert.AreEqual(sampleTimes.Length,sample);
+            }
+            finally{who.Intent.Clear();File.WriteAllLines(Path.Combine(output,"state.txt"),notes);}
+        }
+
+        private static void CaptureGuideDifference(Camera camera,TrajectoryPreview guide,string folder,string name)
+        {
+            const int width=1280,height=720;
+            var renderer=guide.GetComponentInChildren<MeshRenderer>();bool wasEnabled=renderer.enabled;
+            var prior=camera.targetTexture;var active=RenderTexture.active;
+            var hdr=RenderTexture.GetTemporary(width,height,24,RenderTextureFormat.DefaultHDR,RenderTextureReadWrite.Linear);
+            var resolved=RenderTexture.GetTemporary(width,height,0,RenderTextureFormat.ARGB32,RenderTextureReadWrite.sRGB);
+            var pixels=new Texture2D(width,height,TextureFormat.RGB24,false);
+            try
+            {
+                camera.targetTexture=hdr;
+                Color32[] Capture(bool shown)
+                {
+                    renderer.enabled=shown;camera.Render();Graphics.Blit(hdr,resolved);RenderTexture.active=resolved;
+                    pixels.ReadPixels(new Rect(0,0,width,height),0,0);pixels.Apply();
+                    File.WriteAllBytes(Path.Combine(folder,name+(shown?"-on.png":"-off.png")),pixels.EncodeToPNG());
+                    return pixels.GetPixels32();
+                }
+                var on=Capture(true);var off=Capture(false);int changed=0;
+                for(int i=0;i<on.Length;i++)
+                    if(Mathf.Abs(on[i].r-off[i].r)+Mathf.Abs(on[i].g-off[i].g)+Mathf.Abs(on[i].b-off[i].b)>24)changed++;
+                File.WriteAllText(Path.Combine(folder,name+"-visibility.txt"),"Guide contributes "+changed+" visible pixels at 1280x720.\n");
+                Assert.Greater(changed,100,"A populated guide mesh must contribute a readable stroke to the actual camera image.");
+            }
+            finally
+            {
+                renderer.enabled=wasEnabled;camera.targetTexture=prior;RenderTexture.active=active;
+                RenderTexture.ReleaseTemporary(hdr);RenderTexture.ReleaseTemporary(resolved);Object.DestroyImmediate(pixels);
+            }
+        }
+
+        private static void Set(Carrier carrier,string name,float value)=>typeof(Carrier).GetField(name,Private).SetValue(carrier,value);
+        private static void Step(Carrier carrier,float dt)=>typeof(Carrier).GetMethod("StepAttacker",Private).Invoke(carrier,new object[]{dt});
+    }
+}

@@ -1,0 +1,263 @@
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.UI;
+
+namespace TumbangPreso.InputLayer
+{
+    /// <summary>
+    /// The one place that answers "has the player just asked to back out of this screen?".
+    ///
+    /// ⚠️⚠️ EVERY SCREEN IN THIS GAME BACKED OUT ON `Input.GetKeyDown(KeyCode.Escape)` AND
+    /// NOTHING ELSE, WHICH MEANT A CONTROLLER PLAYER COULD NOT LEAVE A SINGLE ONE OF THEM.
+    /// Eleven call sites: `ConvertedScreen.Update` (which is every converted screen in the
+    /// game), `PlayerHub`, `SignInScreen`, `CustomCharacterScreen`, `CustomGameScreen`,
+    /// `WoodDropdown`, `LobbyChat`, `RoleSwapCard`, `TouchLayoutScreen`,
+    /// `ConvertedSettingsPanel` twice. **A pad could reach every screen in the front end and
+    /// then had to be put down to leave one**, and `docs/TODO.md` § 138.2's table missed this
+    /// because it was auditing `<Gamepad>` binding paths and a legacy keyboard read has none.
+    ///
+    /// ⚠️⚠️ AND IT IS `CLAUDE.md` § 6.3'S RULE FAILING ON A WHOLE DEVICE AT ONCE: *"Escape backs
+    /// out on every screen, always, innermost layer first... A player who learns Escape is
+    /// reliable and then meets one screen where it is not has learned that it is unreliable."*
+    /// A pad player never got to learn it at all. The same section calls a dead end a bug.
+    ///
+    /// ⚠️ B, BECAUSE THAT IS WHAT EVERY CONSOLE HAS DONE FOR THIRTY YEARS. `CLAUDE.md` § 4a
+    /// asks *"how is this reached on a pad?"* of every feature, and for "go back" the answer is
+    /// not a design decision, it is a convention the player already owns.
+    /// `ConvertedSettingsPanel.BeginRebind` had already reached for it once, on its own:
+    /// *"the cancel is the pad's own B on the pad page, because a pad player must be able to
+    /// abort without reaching for a keyboard."* This is that sentence applied everywhere.
+    ///
+    /// ⚠️⚠️ THIS IS NOT A NEW BINDING AND MAY NOT BECOME ONE. B is `ReadyUp` in the PLAYER map,
+    /// and `CLAUDE.md` § 4's rule is one control, one action, PER CONTEXT. Backing out of a
+    /// screen is the UI map's own `Cancel`, which `UiInputModule` deliberately keeps separate:
+    /// *"The UI map is the module's own default set, not `TumbangPreso.inputactions`... Two
+    /// maps, two contexts, exactly as `CLAUDE.md` § 4 describes for the spectator set."* So
+    /// this reads the module's Cancel action where there is one, and nothing here is added to
+    /// `Rebinding.RebindableActions`.
+    /// </summary>
+    public static class MenuNav
+    {
+        /// <summary>
+        /// True on the frame the player asked to leave whatever is in front of them.
+        ///
+        /// ⚠️⚠️ THE LEGACY `Input.GetKeyDown` STAYS AND IS NOT A LEFTOVER. It is what carries
+        /// **Android's hardware BACK button**, which Unity reports as `KeyCode.Escape` through
+        /// the old manager and does not surface as a `Keyboard` key at all. Replacing it with
+        /// `Keyboard.current.escapeKey` would compile, read better, and silently take the back
+        /// button away from every phone player, which is the one platform where there is no
+        /// other way out. `TouchLayoutScreen` had exactly that fault and is fixed here too.
+        ///
+        /// ⚠️ IT IS A FACT ABOUT THE FRAME, NOT A QUEUE, AND EVERY `Update` IN THE PROCESS READS
+        /// IT. `ScreenTakeover.EscapeIsSpoken` is what stops two layers leaving on one press and
+        /// carries the receipt (*"clicking escape from make your own put me here"*); this method
+        /// does not and must not try to consume anything, because the callers are what know
+        /// which of them is innermost.
+        /// </summary>
+        private static int _softKeyboardFrame = -10;
+        public static bool CancelPressed
+        {
+            get
+            {
+                // Android may report Back to Unity on the frame its IME disappears.
+                // Sample while the menu is live so that press belongs to the keyboard.
+                if (Application.isMobilePlatform)
+                {
+                    if (TouchScreenKeyboard.visible) _softKeyboardFrame = Time.frameCount;
+                    if (Time.frameCount - _softKeyboardFrame <= 1) return false;
+                }
+                return UnityEngine.Input.GetKeyDown(KeyCode.Escape) || PadCancelPressed;
+            }
+        }
+
+        /// <summary>
+        /// The pad half, kept separate so a test can drive one side without the other.
+        ///
+        /// ⚠️⚠️ THE MODULE'S OWN ACTION FIRST, AND THE RAW BUTTON ONLY AS A FALLBACK. Reading
+        /// `Gamepad.current.buttonEast` directly would work today and would be wrong the moment
+        /// anybody re-binds the UI map or plugs in a pad whose layout puts cancel elsewhere,
+        /// which is `docs/VISION.md` § 3's rule about literals in a second costume. The module
+        /// exists on every screen: `UiInputModule.Ensure` is called by `MenuKit.BuildCanvas` and
+        /// by `ConvertedScreen`, and its own note says those two *"are every screen in the
+        /// game"*.
+        ///
+        /// ⚠️ THE FALLBACK IS NOT DEAD CODE. `PauseWatcher` and `RoleSwapCard` run in a MATCH,
+        /// where the only canvas may be the HUD, which is built without a raycaster
+        /// (`docs/TODO.md` § 113) and therefore without an EventSystem of its own. There is no
+        /// module to ask on those frames.
+        /// </summary>
+        public static bool PadCancelPressed
+        {
+            get
+            {
+                var module = Module();
+                var action = module != null ? module.cancel : null;
+
+                // An inactive module can retain its actions while a loading or
+                // replacement screen owns input. Use the same fallback as SubmitHeld.
+                if (action != null && action.action != null && action.action.enabled)
+                    return action.action.WasPerformedThisFrame();
+
+                var pad = Gamepad.current;
+                return pad != null && pad.buttonEast.wasPressedThisFrame;
+            }
+        }
+
+        /// <summary>
+        /// True on the frame the player said yes to a card that only wants dismissing.
+        ///
+        /// ⚠️ IT EXISTS FOR THE ONE SCREEN THAT IS NOT A MENU: `RoleSwapCard`'s warmup buffer,
+        /// which taught `[SPACE] / [CLICK] TO DISMISS` and listened for exactly those two and
+        /// Escape. That card is shown DURING a match, so it is not focusable, it has no button
+        /// to move to, and a pad player could only sit and wait the buffer out. A dismissal is
+        /// a Submit rather than a Cancel, so it takes A rather than B.
+        ///
+        /// ⚠️ THE LEGACY KEYS ARE THE CALLER'S BUSINESS, NOT THIS PROPERTY'S. `RoleSwapCard`
+        /// takes Space and a mouse click and a card elsewhere might take Return; folding them in
+        /// here would make a keyboard convention out of one screen's choice.
+        /// </summary>
+        public static bool PadSubmitPressed
+        {
+            get
+            {
+                var module = Module();
+                var action = module != null ? module.submit : null;
+
+                if (action != null && action.action != null && action.action.enabled)
+                    return action.action.WasPerformedThisFrame();
+
+                var pad = Gamepad.current;
+                return pad != null && pad.buttonSouth.wasPressedThisFrame;
+            }
+        }
+
+        /// <summary>
+        /// True on the frame a pad player pressed anything that is not Cancel.
+        ///
+        /// ⚠️⚠️ IT EXISTS SO ONE SENTENCE CAN BE TRUE. The title screen's whole
+        /// content is an instruction, and on a pad the honest version of "click
+        /// anywhere" is "press any button": a pad player has no pointer, so
+        /// "anywhere" names nothing they can aim at. Submit alone would have made
+        /// that sentence a lie for every other button on the pad, and the
+        /// alternative wording is a literal button name, which `docs/VISION.md`
+        /// § 3 bans because it teaches whatever the binding used to be.
+        ///
+        /// ⚠️ CANCEL IS EXCLUDED AND THAT IS THE ONLY EXCLUSION. B leaves the game
+        /// from the title screen (`ConvertedMainMenu.CancelTarget`), so accepting
+        /// it here would make one press both start the game and quit it, and the
+        /// order the two readers happen to run in would decide which.
+        ///
+        /// ⚠️ IT LIVES HERE RATHER THAN ON THE SCREEN, for this file's own reason:
+        /// a screen that reads `Gamepad.current` itself is the fault § 35.3
+        /// records, where nine spectator keys sat outside the input map and
+        /// nothing in the project could see them.
+        /// </summary>
+        public static bool StudioSkipPressed
+        {
+            get
+            {
+                var keys = Keyboard.current;
+                if (keys != null && keys.anyKey.wasPressedThisFrame) return true;
+                var mouse = Mouse.current;
+                if (mouse != null && (mouse.leftButton.wasPressedThisFrame ||
+                    mouse.rightButton.wasPressedThisFrame || mouse.middleButton.wasPressedThisFrame ||
+                    mouse.forwardButton.wasPressedThisFrame || mouse.backButton.wasPressedThisFrame)) return true;
+                var touch = Touchscreen.current;
+                if (touch != null)
+                    foreach (var finger in touch.touches) if (finger.press.wasPressedThisFrame) return true;
+                var pad = Gamepad.current;
+                if (pad != null)
+                    foreach (var control in pad.allControls)
+                        if (control is UnityEngine.InputSystem.Controls.ButtonControl button && button.wasPressedThisFrame) return true;
+                return false;
+            }
+        }
+
+        public static bool PadAnyPressed
+        {
+            get
+            {
+                if (PadCancelPressed) return false;
+                if (PadSubmitPressed) return true;
+
+                var pad = Gamepad.current;
+                if (pad == null) return false;
+                return pad.buttonWest.wasPressedThisFrame
+                       || pad.buttonNorth.wasPressedThisFrame
+                       || pad.startButton.wasPressedThisFrame
+                       || pad.selectButton.wasPressedThisFrame
+                       || pad.leftShoulder.wasPressedThisFrame
+                       || pad.rightShoulder.wasPressedThisFrame;
+            }
+        }
+
+        /// <summary>
+        /// True on the frame a keyboard player pressed any key that is not Escape.
+        ///
+        /// ⚠️ THE KEYBOARD HALF OF <see cref="PadAnyPressed"/>, FOR THE SAME ONE SCREEN. Owner,
+        /// 2026-09-26: the title screen "should also continue when pressing any key". Escape is
+        /// excluded for `PadAnyPressed`'s reason: it leaves the game from the title screen
+        /// (`ConvertedMainMenu.CancelTarget`), and one press must not both start and quit.
+        /// ⚠️ A key held with Alt is excluded too, so the window's Alt+Enter fullscreen chord
+        /// resizes the title screen rather than walking past it.
+        /// </summary>
+        public static bool KeyboardAnyPressed
+        {
+            get
+            {
+                var keys = Keyboard.current;
+                if (keys == null || !keys.anyKey.wasPressedThisFrame) return false;
+                if (keys.escapeKey.isPressed || keys.altKey.isPressed) return false;
+                return true;
+            }
+        }
+
+        /// <summary>The current UI Submit must be released before a title transition.</summary>
+        public static bool SubmitHeld
+        {
+            get
+            {
+                var module = Module();
+                var action = module != null ? module.submit?.action : null;
+                if (action != null && action.enabled) return action.IsPressed();
+                var keys = Keyboard.current;
+                return (keys != null && (keys.enterKey.isPressed || keys.numpadEnterKey.isPressed || keys.spaceKey.isPressed))
+                    || (Gamepad.current != null && Gamepad.current.buttonSouth.isPressed);
+            }
+        }
+
+        private static EventSystem _knownSystem;
+        private static InputSystemUIInputModule _knownModule;
+
+        /// <summary>
+        /// The UI module, cached against the EventSystem it was found on.
+        ///
+        /// ⚠️⚠️ IT IS CACHED BECAUSE THIS IS READ ONCE PER SCREEN PER FRAME AND THERE CAN BE
+        /// SEVERAL SCREENS. `ConvertedScreen.Update` calls `CancelPressed` for every converted
+        /// screen in the scene, the hub and the map add their own, and an uncached
+        /// `GetComponent` on each is a managed-to-native call per screen per frame for a value
+        /// that changes about once a scene. `CLAUDE.md` § 7.1 records what this class of thing
+        /// costs here: *"a HUD string rebuilt every frame cost the 6x probe an eighth of its
+        /// frames and most of its physics steps."*
+        ///
+        /// ⚠️ IT IS KEYED ON THE EVENT SYSTEM RATHER THAN JUST NULL-CHECKED, so a scene change
+        /// that brings a different one re-resolves. Unity's fake-null makes the comparison do the
+        /// right thing when the old system has been destroyed, which is the same trick
+        /// `UI.ScreenTakeover` uses to prune its register.
+        /// </summary>
+        private static InputSystemUIInputModule Module()
+        {
+            var system = EventSystem.current;
+            if (system == null) return null;
+
+            if (!ReferenceEquals(system, _knownSystem) || _knownModule == null)
+            {
+                _knownSystem = system;
+                _knownModule = system.GetComponent<InputSystemUIInputModule>();
+            }
+
+            return _knownModule;
+        }
+    }
+}

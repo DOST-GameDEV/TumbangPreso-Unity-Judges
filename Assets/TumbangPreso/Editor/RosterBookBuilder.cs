@@ -1,0 +1,543 @@
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
+using TumbangPreso;
+using TumbangPreso.Core;
+using UnityEditor;
+using UnityEngine;
+
+namespace TumbangPreso.EditorTools
+{
+    /// <summary>
+    /// Builds the <see cref="RosterBook"/> asset that maps every roster id to its model.
+    ///
+    /// ⚠️⚠️ THE MAPPING IS BY ID, NEVER BY LIST POSITION. `character_index`, `can_index` and
+    /// `slipper_index` all cross the wire as bare ints, so index order is a network contract.
+    /// Resolving art by id means dragging assets around in the Inspector cannot change who is
+    /// sitting in seat 3, and it means adding a model cannot silently repaint the cast.
+    ///
+    /// ⚠️ THE TRAITS ARE NOT COPIED HERE AND MUST NEVER BE. They live in `Roster.cs` where they
+    /// are unit tested. A designer-editable copy on a ScriptableObject is the most tempting
+    /// change in this whole port and it would end the verification strategy, because the tests
+    /// would be asserting something other than what ships.
+    ///
+    /// Run:
+    ///   Unity.exe -batchmode -quit -nographics -projectPath . \
+    ///             -executeMethod TumbangPreso.EditorTools.RosterBookBuilder.Build
+    /// </summary>
+    public static class RosterBookBuilder
+    {
+        private const string ArtRoot = "Assets/TumbangPreso/Art";
+        private const string EntryDir = "Assets/TumbangPreso/Resources/Roster";
+        private const string BookPath = "Assets/TumbangPreso/Resources/RosterBook.asset";
+
+        /// <summary>
+        /// ⚠️ A CHARACTER IS A RIG PLUS A PALETTE, NOT A NEW MODEL. The twelve people wear
+        /// twelve CC0 rigs and differ by their palette, so this table is the id-to-rig pairing
+        /// exactly as the Godot roster declares it. Get one wrong and two characters render as
+        /// the same person, which is invisible on the select screen because the meters still
+        /// look right.
+        /// </summary>
+        /// <remarks>
+        /// Classic and Hero Strike are different casts. The first twelve rows below reproduce
+        /// Godot's `character_roster.gd` exactly; the five `team-*` meshes belong only to the
+        /// Hero Strike ids. Pointing a Classic id at a Hero mesh keeps the name and stats intact
+        /// while silently replacing the character on the select screen and in the match.
+        /// </remarks>
+        private static readonly Dictionary<string, string> PersonModels = new Dictionary<string, string>
+        {
+            // Classic roster. Unity retains the network-stable "bayan" id for BERTO.
+            // ⚠️⚠️ THE TWELVE CLASSIC CHARACTERS ON THEIR REDESIGNS, 2026-10-06. Each was redrawn as if they were one
+            // of the nine heroes (docs/CHARACTER_REDESIGN_DANTE.md section 15.9 D and G), and the owner said of the
+            // twelve together: "they all look good". The old shared rigs (`characters/persons/character-<sex>-<a..f>.glb`,
+            // recoloured by each person's palette) are untouched on disk; putting a row back and rebuilding the
+            // roster book undoes it. DO NOT MERGE THIS BLOCK without the owner's word.
+            { "bayan",       "CharacterRedesign/bayan/bayan-redesign.glb" },
+            { "maring",      "CharacterRedesign/maring/maring-redesign.glb" },
+            { "totoy",       "CharacterRedesign/totoy/totoy-redesign.glb" },
+            { "inday",       "CharacterRedesign/inday/inday-redesign.glb" },
+            { "kuya_boy",    "CharacterRedesign/kuya_boy/kuya_boy-redesign.glb" },
+            { "ate_girlie",  "CharacterRedesign/ate_girlie/ate_girlie-redesign.glb" },
+            { "tikboy",      "CharacterRedesign/tikboy/tikboy-redesign.glb" },
+            { "bebang",      "CharacterRedesign/bebang/bebang-redesign.glb" },
+            { "jun_jun",     "CharacterRedesign/jun_jun/jun_jun-redesign.glb" },
+            { "lola_pacing", "CharacterRedesign/lola_pacing/lola_pacing-redesign.glb" },
+            { "mang_kanor",  "CharacterRedesign/mang_kanor/mang_kanor-redesign.glb" },
+            { "aling_nena",  "CharacterRedesign/aling_nena/aling_nena-redesign.glb" },
+
+            // Hero Strike Roster (6 action heroes)
+            // ⚠️⚠️ PROTOTYPE SWAP, THIS BRANCH ONLY, 2026-10-05. The owner asked to SEE the character
+            // redesign in the game (docs/CHARACTER_REDESIGN_DANTE.md). Seven heroes point at their
+            // redesign prototypes so an internal build can be played. The real `team-<id>.glb`
+            // files are untouched; putting a row back to `characters/persons/team-<id>.glb` and
+            // rebuilding the roster book undoes it. DO NOT MERGE THIS BLOCK without the owner's word.
+            // ⚠️ ALL NINE SINCE LATER THE SAME DAY. Owner: "should probably work on a paete and phaister
+            // rework", then "we'll be using the character redesigns from now on instead of the older
+            // models". Phaister and Paete now point at their redesigns too.
+            { "dante",       "CharacterRedesign/dante/dante-redesign.glb" },
+            { "cheska",      "CharacterRedesign/cheska/cheska-redesign.glb" },
+            { "sean",        "CharacterRedesign/sean/sean-redesign.glb" },
+            { "zack",        "CharacterRedesign/zack/zack-redesign.glb" },
+            { "nemu",        "CharacterRedesign/nemu/nemu-redesign.glb" },
+            { "phaister",    "CharacterRedesign/phaister/phaister-redesign.glb" },
+            { "rafi",        "CharacterRedesign/rafi/rafi-redesign.glb" },
+            { "amihan",      "CharacterRedesign/amihan/amihan-redesign.glb" },
+            { "paete",       "CharacterRedesign/paete/paete-redesign.glb" },
+            { "custom",      "characters/persons/team-custom.glb" },
+
+            // ⚠️⚠️ THE CHARACTER MAKER'S BASE RIG, AND IT IS A NEW ROW RATHER THAN A CHANGE TO
+            // THE ONE ABOVE IT. `team-custom.glb` is a copy of a fully dressed hero: hair, a
+            // sando and shorts are baked into its two meshes, so every wearable had to COVER
+            // what was under it (`docs/TODO.md` § 110.3) and a hairstyle was a lid rather than
+            // hair. `team-custom-base.glb` is bald, bare and faceless, which is what a character
+            // creator's base mesh is in every game that has one.
+            //
+            // ⚠️ THE `custom` ROW IS UNTOUCHED AND SO IS ITS `.glb`. 🧑: *"dont toucht heh
+            // existing onnes, i will be very mad if u break or fuck up any of the existing
+            // ones"*. Adding an id costs nothing; repointing one would have changed what an
+            // existing asset resolves to. `docs/TODO.md` § 112.
+            { "custom_base", "characters/persons/team-custom-base.glb" },
+        };
+
+        /// <summary>
+        /// ⚠️ WHOSE FIRST-PERSON ARMS ARE STILL CUT FROM THE OLD MODEL (owner, 2026-10-05, of Paete's hands in
+        /// first person after his redesign went into the roster: "now paete's hands are weird..", then "for now
+        /// lets just use the old paete model for the fpv"). The arms a player sees are their own meshes
+        /// (`ViewmodelArmAuthor` cuts them from a model by its `arm-<side>` bone) and are not the body others
+        /// see. A redesign has an elbow, so that bone is only the upper arm and the cut left out the forearm
+        /// and the hand. Until the cut follows the elbow, a hero listed here keeps the arms of the old model.
+        /// </summary>
+        private static readonly Dictionary<string, string> FirstPersonArmModels = new Dictionary<string, string>
+        {
+            // (Paete was here, on `characters/persons/team-paete.glb`, from 2026-10-05 to 2026-10-06. The cut follows
+            // the elbow now (`ViewmodelArmAuthor.Extract`), and the owner asked for his new model arms: "we need to
+            // fix paete's new model arms for fpv".)
+        };
+
+        private static readonly Dictionary<string, string> PersonPalettes = new Dictionary<string, string>
+        {
+            // Classic Palettes
+            { "bayan",       "person_a.tres" },
+            { "maring",      "person_b.tres" },
+            { "totoy",       "person_totoy.tres" },
+            { "inday",       "person_inday.tres" },
+            { "kuya_boy",    "person_kuya-boy.tres" },
+            { "ate_girlie",  "person_ate-girlie.tres" },
+            { "tikboy",      "person_tikboy.tres" },
+            { "bebang",      "person_bebang.tres" },
+            { "jun_jun",     "person_jun-jun.tres" },
+            { "lola_pacing", "person_lola-pacing.tres" },
+            { "mang_kanor",  "person_mang-kanor.tres" },
+            { "aling_nena",  "person_aling-nena.tres" },
+
+            // Hero Palettes
+            { "dante",       "person_team-dante.tres" },
+            { "cheska",      "person_team-cheska.tres" },
+            { "sean",        "person_team-sean.tres" },
+            { "zack",        "person_team-zack.tres" },
+            { "nemu",        "person_team-nemu.tres" },
+            { "phaister",    "person_team-phaister.tres" },
+            { "rafi",        "person_team-rafi.tres" },
+            { "amihan",      "person_team-amihan.tres" },
+            { "paete",       "person_team-paete.tres" },
+            { "custom",      "person_team-custom.tres" },
+
+            // ⚠️ WRITTEN BY `tools/build_base_voxel.py`, NOT CARRIED OVER FROM GODOT. The
+            // model does not exist in the Godot build, so its palette is generated by the same
+            // script that lays out the UVs it belongs to. See `write_palette`'s header.
+            { "custom_base", "person_team-custom-base.tres" },
+        };
+
+        private static readonly Dictionary<string, string> PersonPets = new Dictionary<string, string>
+        {
+            { "nemu", "characters/pets/pet-nemu-ghost.glb" },
+        };
+
+        private const string PaletteDir = "MapSource/materials_persons";
+
+        private static readonly Dictionary<string, string> CanModels = new Dictionary<string, string>
+        {
+            { "pasip",   "models/lata_pasip.obj" },
+            { "boyben",  "models/lata_boyben.obj" },
+            { "decades", "models/lata_decades.obj" },
+            { "metal",   "models/lata_metal.obj" },
+            // Built by `tools/build_lata.py`, which is the Godot generator ported into this
+            // repo. See that file's header: the Godot one is frozen and cannot be run.
+            { "piyesta", "models/lata_piyesta.obj" },
+            { "karne",   "models/lata_karne.obj" },
+        };
+
+        private static readonly Dictionary<string, string> SlipperModels = new Dictionary<string, string>
+        {
+            // ⚠️ FOUR OF THESE MOVED FROM .obj TO .glb ON 2026-08-28 AND THE EXTENSION IS
+            // PART OF THE PATH, so a row left pointing at the old file resolves to a mesh
+            // that is still on disk, still imports, and is the model that was replaced.
+            // `tools/build_slipper_models.py` writes the .glb; the .obj it supersedes is
+            // deleted in the same commit so this cannot silently half-apply.
+            { "tsinelas", "models/tsinelas_tsinelas.glb" },
+            { "crocs",    "models/tsinelas_crocs.glb" },
+            { "pantulog", "models/tsinelas_pantulog.glb" },
+            { "sike",     "models/tsinelas_sike.glb" },   // 2026-10-18: the remodelled set (tools/build_slippers.py); the .obj moved out
+            { "spartan",   "models/tsinelas_spartan.glb" },
+            { "alpombra",  "models/tsinelas_alpombra.glb" },
+            { "pambahay",  "models/tsinelas_pambahay.glb" },
+            { "heels",     "models/tsinelas_heels.glb" },
+            { "sandals",   "models/tsinelas_sandals.glb" },
+            { "loafers",   "models/tsinelas_loafers.glb" },
+        };
+
+        [MenuItem("Tumbang Preso/Build Roster Book")]
+        public static void BuildFromMenu() => Execute();
+
+        public static void Build() => EditorApplication.Exit(Execute() ? 0 : 1);
+
+        // Command line: -executeMethod TumbangPreso.EditorTools.RosterBookBuilder.RefreshPersonFromCommandLine -person <id>
+        public static void RefreshPersonFromCommandLine()
+        {
+            var args = System.Environment.GetCommandLineArgs();
+            int at = System.Array.IndexOf(args, "-person");
+            bool ok = at >= 0 && at + 1 < args.Length && RefreshPerson(args[at + 1]);
+            EditorApplication.Exit(ok ? 0 : 1);
+        }
+
+        // Art iteration on one existing hero must not rewrite the rest of the roster.
+        //
+        // ⚠️ A HERO NEW TO THE ROSTER IS INSERTED HERE TOO, at the place a full `Build` would put
+        // it (just after the roster row before it), rather than asking for a full rebuild. The full
+        // rebuild re-bakes every other person's first-person arms and clips, which is exactly the
+        // churn this method exists to avoid. Paete was the first hero added this way (HERO-9).
+        public static bool RefreshPerson(string id)
+        {
+            var book = AssetDatabase.LoadAssetAtPath<RosterBook>(BookPath);
+            int truthIndex = -1;
+            for (int i = 0; i < Roster.People.Count; i++) if (Roster.People[i].Id == id) { truthIndex = i; break; }
+            bool present = book != null && book.People.Find(entry => entry != null && entry.Id == id) != null;
+            if (book == null || !PersonModels.ContainsKey(id) || (!present && truthIndex < 0))
+            {
+                Debug.LogError("[RosterBook] Cannot refresh an unregistered person: " + id);
+                return false;
+            }
+            bool ok = true;
+            var built = BuildSingleEntry(id, PersonModels, "person", ref ok);
+            if (!ok) return false;
+            if (!present)
+            {
+                int at = book.People.Count;
+                for (int i = truthIndex - 1; i >= 0; i--)
+                {
+                    int previous = book.People.FindIndex(entry => entry != null && entry.Id == Roster.People[i].Id);
+                    if (previous >= 0) { at = previous + 1; break; }
+                }
+                book.People.Insert(at, built);
+                EditorUtility.SetDirty(book);
+            }
+            ViewmodelArmAuthor.Bake(book, id);
+            AssetDatabase.SaveAssets();
+            return true;
+        }
+
+        private static bool Execute()
+        {
+            Directory.CreateDirectory(EntryDir);
+
+            var book = AssetDatabase.LoadAssetAtPath<RosterBook>(BookPath);
+            if (book == null)
+            {
+                book = ScriptableObject.CreateInstance<RosterBook>();
+                AssetDatabase.CreateAsset(book, BookPath);
+            }
+
+            book.People.Clear();
+            book.Cans.Clear();
+            book.Slippers.Clear();
+
+            bool ok = true;
+            foreach (string path in Directory.GetFiles(EntryDir,"person_*.asset"))
+            {
+                string id=Path.GetFileNameWithoutExtension(path).Substring("person_".Length);
+                if (PersonModels.ContainsKey(id)) continue;
+                Debug.LogError("[RosterBook] Unregistered person asset: " + path
+                    + ". Register its id or remove the orphan; folder enumeration must not invent a roster.");
+                ok=false;
+            }
+            ok &= Fill(book.People, Roster.People, PersonModels, "person");
+            ok &= Fill(book.Cans, Roster.Cans, CanModels, "can");
+            ok &= Fill(book.Slippers, Roster.Slippers, SlipperModels, "slipper");
+
+            // ⚠️⚠️ THE OFF-ROSTER ENTRIES ARE APPENDED TO `book.People` NOW, AND NOT DOING SO
+            // MEANT `RosterBook.FindPersonArt("custom")` HAD ANSWERED NULL SINCE THE DAY IT WAS
+            // WRITTEN. This loop created `person_custom.asset` on disk and stopped there; the book
+            // is the only thing `FindPersonArt` searches, so the character creator, its probe and
+            // the whole 87-cell wardrobe sheet fell through their "degrade to roster entry 0"
+            // fallbacks and dressed **`bayan`** instead. Every one of them looked like it was
+            // working. `docs/TODO.md` § 112.
+            //
+            // ⚠️ IT CANNOT MOVE AN INDEX. `RosterBook.Resolve` asks `Roster` for the id at an
+            // index and then searches for THAT id, so a row appended past the eighteenth is
+            // reachable by name and by nothing else. `RosterBook.IsOffRoster` is the list of ids
+            // allowed to be here, and `Validate` checks against it rather than being widened.
+            foreach (var kvp in PersonModels)
+            {
+                bool inTruth = false;
+                foreach (var p in Roster.People) { if (p.Id == kvp.Key) { inTruth = true; break; } }
+                if (inTruth) continue;
+
+                var extra = BuildSingleEntry(kvp.Key, PersonModels, "person", ref ok);
+                if (extra != null) book.People.Add(extra);
+            }
+
+            EditorUtility.SetDirty(book);
+            // A model export updates both views in the same authoring transaction.
+            ViewmodelArmAuthor.Bake(book);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+
+            if (book.Validate(out string report))
+            {
+                Debug.Log($"[RosterBook] OK. {book.People.Count} people, {book.Cans.Count} cans, " +
+                          $"{book.Slippers.Count} slippers.\n{report}");
+            }
+            else
+            {
+                Debug.LogError($"[RosterBook] validation failed:\n{report}");
+                ok = false;
+            }
+
+            return ok;
+        }
+
+        /// <summary>
+        /// The sixteen colours out of a Godot `.tres`, or null for anything that has none.
+        ///
+        /// ⚠️⚠️ PARSED FROM THE SOURCE, NOT TRANSCRIBED. Twelve times sixteen is 192 numbers,
+        /// and a table typed by hand is one that silently drifts from the build it is meant to
+        /// match. The `.tres` files are copied into `MapSource/` for the same reason the maps
+        /// are: this repo converts the Godot output rather than reimplementing it.
+        ///
+        /// ⚠️ AND A SHORT ARRAY IS A FAILURE, NOT A PARTIAL SUCCESS. The shader indexes sixteen
+        /// slots; fifteen colours would read whatever is past the end for one of them, and the
+        /// slot most likely to be missing is 15, which is the lit skin tone on every Person.
+        /// </summary>
+        private static Color[] ReadPalette(string id, ref bool ok)
+        {
+            if (!PersonPalettes.TryGetValue(id, out var file)) return null;
+
+            string path = Path.Combine(PaletteDir, file);
+
+            if (!File.Exists(path))
+            {
+                Debug.LogError($"[RosterBook] no palette at {path} for '{id}'. Copy the .tres " +
+                               "out of the Godot repo; that character will wear stock colours.");
+                ok = false;
+                return null;
+            }
+
+            var match = Regex.Match(File.ReadAllText(path),
+                                    @"shader_parameter/palette\s*=\s*PackedColorArray\(([^)]*)\)");
+
+            if (!match.Success)
+            {
+                Debug.LogError($"[RosterBook] {file} carries no palette array.");
+                ok = false;
+                return null;
+            }
+
+            var parts = match.Groups[1].Value.Split(',');
+            var colours = new List<Color>();
+
+            for (int i = 0; i + 3 < parts.Length; i += 4)
+            {
+                colours.Add(new Color(F(parts[i]), F(parts[i + 1]), F(parts[i + 2]), F(parts[i + 3])));
+            }
+
+            if (colours.Count != 16)
+            {
+                Debug.LogError($"[RosterBook] {file} has {colours.Count} palette entries, not 16.");
+                ok = false;
+                return null;
+            }
+
+            return colours.ToArray();
+        }
+
+        private static float F(string s) =>
+            float.TryParse(s.Trim(), System.Globalization.NumberStyles.Float,
+                           System.Globalization.CultureInfo.InvariantCulture, out float v) ? v : 0.0f;
+
+        private static bool Fill(List<RosterEntryAsset> into,
+                                 IReadOnlyList<RosterEntry> truth,
+                                 Dictionary<string, string> models,
+                                 string kind)
+        {
+            bool ok = true;
+
+            foreach (var entry in truth)
+            {
+                string assetPath = $"{EntryDir}/{kind}_{entry.Id}.asset";
+
+                var asset = AssetDatabase.LoadAssetAtPath<RosterEntryAsset>(assetPath);
+                if (asset == null)
+                {
+                    asset = ScriptableObject.CreateInstance<RosterEntryAsset>();
+                    AssetDatabase.CreateAsset(asset, assetPath);
+                }
+
+                asset.Id = entry.Id;
+                asset.Tint = Color.white;
+                asset.Palette = ReadPalette(entry.Id, ref ok);
+
+                // The first-person arms' own model, where a hero has one (`FirstPersonArmModels`).
+                asset.ArmModel = FirstPersonArmModels.TryGetValue(entry.Id, out var armRel)
+                    ? AssetDatabase.LoadAssetAtPath<GameObject>($"{ArtRoot}/{armRel}") : null;
+
+                if (models.TryGetValue(entry.Id, out var rel))
+                {
+                    string full = $"{ArtRoot}/{rel}";
+                    asset.Model = AssetDatabase.LoadAssetAtPath<GameObject>(full);
+
+                    if (asset.Model == null)
+                    {
+                        Debug.LogError($"[RosterBook] no model at {full} for '{entry.Id}'.");
+                        ok = false;
+                    }
+
+                    // ⚠️⚠️ THE CLIPS ARE REFERENCED HERE OR THEY DO NOT SHIP. They are
+                    // sub-assets of the `.glb`, and an asset nothing points at is stripped from
+                    // the player. Nothing pointed at them: the animator looked them up through
+                    // the AssetDatabase, which does not exist in a build, so every character in
+                    // every build stood still. See RosterEntryAsset.Clips.
+                    var clips = new System.Collections.Generic.List<AnimationClip>();
+
+                    foreach (var sub in AssetDatabase.LoadAllAssetsAtPath(full))
+                    {
+                        if (sub is AnimationClip clip && !clip.name.StartsWith("__preview"))
+                            clips.Add(clip);
+                    }
+
+                    if(kind=="person"&&entry.Id=="rafi"&&asset.Model!=null)
+                        clips.AddRange(RafiMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="amihan"&&asset.Model!=null)
+                        clips.AddRange(AmihanMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="paete"&&asset.Model!=null)
+                        clips.AddRange(PaeteMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="phaister"&&asset.Model!=null)
+                        clips.AddRange(PhaisterMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="nemu"&&asset.Model!=null)
+                        clips.AddRange(NemuMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="sean"&&asset.Model!=null)
+                        clips.AddRange(SeanMotionAuthor.Bake(asset.Model));
+                    if(kind=="person"&&entry.Id=="zack"&&asset.Model!=null)
+                        clips.AddRange(ZackMotionAuthor.Bake(asset.Model));
+                    // The emote wheel's authored clips on the playable heroes (`EmoteMotionAuthor`).
+                    if(kind=="person"&&EmoteMotionAuthor.Covers(entry.Id)&&asset.Model!=null)
+                        clips.AddRange(EmoteMotionAuthor.Bake(entry.Id, asset.Model));
+                    asset.Clips = clips.ToArray();
+
+                    if (clips.Count == 0 && kind == "person")
+                    {
+                        Debug.LogError($"[RosterBook] '{entry.Id}' has a model with no clips. " +
+                                       "That character will not animate.");
+                        ok = false;
+                    }
+                }
+                else
+                {
+                    Debug.LogError($"[RosterBook] no model mapped for {kind} '{entry.Id}'.");
+                    ok = false;
+                }
+
+                if (PersonPets.TryGetValue(entry.Id, out var petRel))
+                {
+                    string petFull = $"{ArtRoot}/{petRel}";
+                    asset.PetModel = AssetDatabase.LoadAssetAtPath<GameObject>(petFull);
+                }
+                else
+                {
+                    asset.PetModel = null;
+                }
+
+                EditorUtility.SetDirty(asset);
+                into.Add(asset);
+            }
+
+            return ok;
+        }
+
+        /// <summary>
+        /// One entry for an id that is deliberately not a row in <see cref="Roster"/>.
+        ///
+        /// ⚠️ IT RETURNS THE ASSET NOW AND USED TO RETURN A BOOL THAT NOBODY READ. The caller has
+        /// to put it in `book.People` or `FindPersonArt` cannot see it, which is the whole of
+        /// § 112's `bayan` fault; returning the thing the caller needs is what makes forgetting
+        /// hard rather than silent.
+        /// </summary>
+        private static RosterEntryAsset BuildSingleEntry(string id,
+                                                         Dictionary<string, string> models,
+                                                         string kind,
+                                                         ref bool ok)
+        {
+            string assetPath = $"{EntryDir}/{kind}_{id}.asset";
+
+            var asset = AssetDatabase.LoadAssetAtPath<RosterEntryAsset>(assetPath);
+            if (asset == null)
+            {
+                asset = ScriptableObject.CreateInstance<RosterEntryAsset>();
+                AssetDatabase.CreateAsset(asset, assetPath);
+            }
+
+            asset.Id = id;
+            asset.Tint = Color.white;
+            asset.Palette = ReadPalette(id, ref ok);
+
+            if (models.TryGetValue(id, out var rel))
+            {
+                string full = $"{ArtRoot}/{rel}";
+                asset.Model = AssetDatabase.LoadAssetAtPath<GameObject>(full);
+
+                if (asset.Model == null)
+                {
+                    Debug.LogError($"[RosterBook] no model at {full} for '{id}'.");
+                    ok = false;
+                }
+
+                var clips = new System.Collections.Generic.List<AnimationClip>();
+                foreach (var sub in AssetDatabase.LoadAllAssetsAtPath(full))
+                {
+                    if (sub is AnimationClip clip && !clip.name.StartsWith("__preview"))
+                        clips.Add(clip);
+                }
+
+                if(kind=="person"&&id=="rafi"&&asset.Model!=null)
+                    clips.AddRange(RafiMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&id=="amihan"&&asset.Model!=null)
+                    clips.AddRange(AmihanMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&id=="paete"&&asset.Model!=null)
+                    clips.AddRange(PaeteMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&id=="phaister"&&asset.Model!=null)
+                    clips.AddRange(PhaisterMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&id=="nemu"&&asset.Model!=null)
+                    clips.AddRange(NemuMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&id=="sean"&&asset.Model!=null)
+                    clips.AddRange(SeanMotionAuthor.Bake(asset.Model));
+                if(kind=="person"&&EmoteMotionAuthor.Covers(id)&&asset.Model!=null)
+                    clips.AddRange(EmoteMotionAuthor.Bake(id, asset.Model));
+                asset.Clips = clips.ToArray();
+
+                if (clips.Count == 0 && kind == "person")
+                {
+                    Debug.LogError($"[RosterBook] '{id}' has a model with no clips. " +
+                                   "That character will not animate.");
+                    ok = false;
+                }
+            }
+            else
+            {
+                Debug.LogError($"[RosterBook] no model mapped for {kind} '{id}'.");
+                ok = false;
+            }
+
+            EditorUtility.SetDirty(asset);
+            return asset;
+        }
+    }
+}

@@ -1,0 +1,212 @@
+using System.Collections.Generic;
+using TumbangPreso.Core;
+using UnityEngine;
+
+namespace TumbangPreso
+{
+    /// <summary>
+    /// The three pick lists, resolved from id to art.
+    ///
+    /// ⚠️ INDEX ORDER IS A NETWORK CONTRACT. character_index, can_index and slipper_index all
+    /// cross the wire as bare ints, so every peer must resolve the same index to the same
+    /// entry. The ORDER is owned by Roster.cs; this asset only supplies the art for an id.
+    /// Resolving by id rather than by position is what makes that safe: dragging these assets
+    /// around in the Inspector cannot change who is in seat 3.
+    ///
+    /// ⚠️ AND A MISSING ENTRY RENDERS SOMEBODY RATHER THAN NOTHING. A peer on an older build
+    /// can send an index this build has no art for, and an AI seat has no pick at all. Both
+    /// must produce a visible unit, because an invisible player is unplayable in a way a
+    /// slightly wrong-looking one is not.
+    ///
+    /// ⚠️ THE FILE NAME MUST MATCH THE CLASS NAME, or the asset deserialises with a null script
+    /// and every list reads as empty, which looks exactly like nobody built the book.
+    /// </summary>
+    [CreateAssetMenu(menuName = "Tumbang Preso/Roster Book", fileName = "RosterBook")]
+    public sealed class RosterBook : ScriptableObject
+    {
+        /// <summary>Where <see cref="Load"/> finds it. Must stay under a Resources folder.</summary>
+        public const string ResourcePath = "RosterBook";
+
+        public List<RosterEntryAsset> People = new List<RosterEntryAsset>();
+        public List<RosterEntryAsset> Cans = new List<RosterEntryAsset>();
+        public List<RosterEntryAsset> Slippers = new List<RosterEntryAsset>();
+
+        private static RosterBook _cached;
+        private static bool _tried;
+        private static ResourceRequest _pending;
+
+        public static System.Collections.IEnumerator Warmup()
+        {
+            if (_cached != null || _tried) yield break;
+            var request = _pending ??= Resources.LoadAsync<RosterBook>(ResourcePath);
+            yield return request;
+            if (_pending == request)
+            {
+                if (!_tried) CompleteLoad(request.asset as RosterBook);
+                _pending = null;
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ NULL IS SURVIVABLE. If the book is missing the game falls back to primitives
+        /// rather than refusing to start, because a build that will not boot is worse than one
+        /// that boots looking wrong, and the second failure is far easier to diagnose.
+        /// </summary>
+        public static RosterBook Load()
+        {
+            if (_cached != null) return _cached;
+            if (_tried) return null;
+
+            // A cancelled preload may still have completed its native request.
+            // Adopt it without issuing another read; direct callers retain fallback.
+            if (_pending != null && _pending.isDone)
+            {
+                CompleteLoad(_pending.asset as RosterBook);
+            }
+            else CompleteLoad(Resources.Load<RosterBook>(ResourcePath));
+            _pending = null;
+
+            return _cached;
+        }
+
+        private static void CompleteLoad(RosterBook book)
+        {
+            _tried = true;
+            _cached = book;
+            if (_cached == null)
+                Debug.LogWarning($"[Roster] no book at Resources/{ResourcePath}. " +
+                                 "Run Tumbang Preso > Build Roster Book. Falling back to primitives.");
+        }
+
+        public RosterEntryAsset PersonArt(int index) => Resolve(People, Roster.People, index);
+        public RosterEntryAsset PersonArt(int index, GameMode mode) => Resolve(People, Roster.GetPeople(mode), index);
+        public RosterEntryAsset CanArt(int index) => Resolve(Cans, Roster.Cans, index);
+        public RosterEntryAsset SlipperArt(int index) => Resolve(Slippers, Roster.Slippers, index);
+
+        /// <summary>
+        /// Art by id, including the ids that are deliberately NOT roster rows.
+        ///
+        /// ⚠️⚠️ THIS ANSWERED NULL FOR `custom` FROM THE DAY IT WAS FIRST CALLED, AND NOTHING
+        /// ANYWHERE SAID SO. `RosterBookBuilder` created `person_custom.asset` on disk through
+        /// `BuildSingleEntry` and **never added it to `People`**, which is the only list this
+        /// searches. Every caller has a "degrade to roster entry 0" fallback, correctly, so the
+        /// character creator, its probe and the 87-cell wardrobe contact sheet were all silently
+        /// dressing **`bayan`** — `character-male-f.glb`, a Kenney rig with its own hair and its
+        /// own painted face — while `docs/TODO.md` § 110.9's frame table describes measurements
+        /// taken off `team-custom.glb`, a file that was never on screen. That is why three
+        /// successive passes at those frames each looked wrong in the render.
+        ///
+        /// ⚠️ APPENDING AN OFF-ROSTER ENTRY TO `People` IS SAFE **BECAUSE `Resolve` MATCHES BY
+        /// ID AND NEVER BY POSITION**, which is this class's own opening rule. An index is
+        /// resolved by asking `Roster` for the id at that index and then searching for it, so an
+        /// extra row at the end cannot change what any index means on any peer.
+        /// `docs/TODO.md` § 112.
+        /// </summary>
+        public RosterEntryAsset FindPersonArt(string id)
+        {
+            if (People == null) return null;
+            for (int i = 0; i < People.Count; i++)
+                if (People[i] != null && People[i].Id == id) return People[i];
+            return null;
+        }
+
+        /// <summary>
+        /// The ids allowed to carry art without being a row in <see cref="Roster"/>.
+        ///
+        /// ⚠️⚠️ `ValidateList` REFUSES ART FOR AN UNKNOWN ID ON PURPOSE — *"art cannot introduce
+        /// a roster entry; the list order is a network contract"* — AND THESE TWO ARE THE EXACT
+        /// CASE THAT RULE WAS NOT WRITTEN FOR. `custom` is the player's own character and
+        /// `custom_base` is the naked rig the wardrobe dresses; **both are deliberately not rows
+        /// in `Roster.AllPeople`** for the same reason the guard exists, and neither is reachable
+        /// by index. They are named here rather than the guard being widened, so a third id
+        /// cannot arrive by accident.
+        /// </summary>
+        private static bool IsOffRoster(string id)
+            => id == CustomCharacterRules.CustomCharacterId
+               || id == CustomCharacterRules.BaseRigId;
+
+        private static RosterEntryAsset Resolve(List<RosterEntryAsset> art,
+                                                IReadOnlyList<RosterEntry> truth,
+                                                int index)
+        {
+            if (art == null || art.Count == 0) return null;
+
+            var entry = Roster.At(truth, index);
+            if (entry == null) return art[0];
+
+            for (int i = 0; i < art.Count; i++)
+                if (art[i] != null && art[i].Id == entry.Id) return art[i];
+
+            Debug.LogWarning($"[Roster] no art asset for id '{entry.Id}'; falling back to " +
+                             $"'{art[0]?.Id}'. A unit with no model is unplayable in a way a " +
+                             "wrong-looking one is not.");
+            return art[0];
+        }
+
+        /// <summary>
+        /// ⚠️ RUN THIS FROM A PROBE. It catches the case where an artist adds a mesh and nobody
+        /// wires the id, which is invisible until that character is picked in a real match.
+        /// </summary>
+        public bool Validate(out string report)
+        {
+            var sb = new System.Text.StringBuilder();
+            bool ok = true;
+
+            ok &= ValidateList(sb, "PERSON", People, Roster.People);
+            ok &= ValidateList(sb, "LATA", Cans, Roster.Cans);
+            ok &= ValidateList(sb, "TSINELAS", Slippers, Roster.Slippers);
+
+            report = sb.ToString();
+            return ok;
+        }
+
+        private static bool ValidateList(System.Text.StringBuilder sb, string label,
+                                         List<RosterEntryAsset> art,
+                                         IReadOnlyList<RosterEntry> truth)
+        {
+            bool ok = true;
+
+            foreach (var entry in truth)
+            {
+                bool found = false;
+                foreach (var a in art)
+                {
+                    if (a == null || a.Id != entry.Id) continue;
+                    found = true;
+
+                    if (a.Model == null)
+                    {
+                        sb.AppendLine($"FAIL {label}: '{entry.Id}' has an asset but no Model.");
+                        ok = false;
+                    }
+                    break;
+                }
+
+                if (!found)
+                {
+                    sb.AppendLine($"FAIL {label}: no art asset carries id '{entry.Id}'.");
+                    ok = false;
+                }
+            }
+
+            foreach (var a in art)
+            {
+                if (a == null) continue;
+
+                bool known = IsOffRoster(a.Id);
+                foreach (var entry in truth)
+                    if (entry.Id == a.Id) { known = true; break; }
+
+                if (!known)
+                {
+                    sb.AppendLine($"FAIL {label}: art id '{a.Id}' is not in Roster.cs. Art cannot " +
+                                  "introduce a roster entry; the list order is a network contract.");
+                    ok = false;
+                }
+            }
+
+            if (ok) sb.AppendLine($"ok {label}: {truth.Count} entries, all with models.");
+            return ok;
+        }
+    }
+}

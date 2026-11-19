@@ -1,0 +1,263 @@
+namespace TumbangPreso.Core
+{
+    /// <summary>The two distinct match play modes.</summary>
+    public enum GameMode
+    {
+        /// <summary>Classic Tumbang Preso with traditional 12-character Kenney street roster.</summary>
+        Classic,
+
+        /// <summary>Action-packed Hero Strike mode with the 5 superpowered heroes and abilities.</summary>
+        HeroStrike
+    }
+
+    /// <summary>The four ways a point can be created. There are no others.</summary>
+    public enum ScoreEvent
+    {
+        /// <summary>Knock the lata down. To the thrower.</summary>
+        LataKnocked,
+
+        /// <summary>Tag a vulnerable Attacker. To the Defender.</summary>
+        Tag,
+
+        /// <summary>Shove an Attacker who is tagged within SabotageWindow. To the shover.</summary>
+        Sabotage,
+
+        /// <summary>Per second the lata is upright. To the Defender.</summary>
+        DefenseTick,
+
+        /// <summary>Penalty for Taya camping inside can ring without engaging.</summary>
+        TayaCampPenalty,
+
+        /// <summary>Penalty for Attacker failing to retrieve loose slipper.</summary>
+        UnretrievedSlipperPenalty,
+
+        /// <summary>
+        /// PHASE 12, LAST TSINELAS STANDING: the last attacker still holding a tsinelas takes
+        /// the round. To that attacker, once, at the moment the round is decided.
+        ///
+        /// ⚠️⚠️ IT IS APPENDED AND NOT INSERTED, AND THE REASON IS THE WIRE RATHER THAN TASTE.
+        /// `MatchRpc.BroadcastScore` writes `(int)e` and `OnScoreMsg` reads it back as an int, so
+        /// every value above is a number two builds have agreed on. Inserting anything ahead of
+        /// this line renumbers `Tag`, `Sabotage` and both penalties, and two peers would then
+        /// disagree about which award produced which toast **while still agreeing on the total**,
+        /// which is the quietest possible way to be wrong. `docs/TODO.md` § 70.7's rule about a
+        /// roster that only grows, applied to an enum that travels.
+        ///
+        /// ⚠️⚠️ AND ADDING IT AT ALL IS WHY `NetSession.ProtocolVersion` MOVED TO 22. A peer on
+        /// 21 reaches `OnScoreMsg`, fails `Enum.IsDefined`, and DROPS the award: the round would
+        /// end early on every screen, the winner's total would rise by 100 on the host and by
+        /// nothing anywhere else, and the scoreboard a client showed at the end of the match
+        /// would be a different match's. `docs/TODO.md` § 130.13.
+        /// </summary>
+        LastTsinelasStanding,
+        AccuracyChainTwo,
+        AccuracyChainThree,
+        AccuracyChainLong,
+        DoubleCatch,
+        TripleCatch,
+
+        /// <summary>
+        /// A wooden slipper from Paete's plant knocked the lata (2026-09-25). To Paete. Owner:
+        /// *"maybe lessened plus"*: half a knockdown. ⚠️ APPENDED for the wire, like every value
+        /// above, and the reason the protocol moved when it arrived.
+        /// </summary>
+        SproutKnock,
+        FirstKnockdownBonus,
+        LateKnockdownBonus,
+        MultiKnockdownBonus,
+        MultiCatch,
+
+        /// <summary>Owner, October 22: the taya left the can down past the grace period. Appended for the wire.</summary>
+        CanDownPenalty,
+    }
+
+    /// <summary>
+    /// Match structure and scoring.
+    ///
+    /// ⚠️⚠️ ROLE IS DERIVED, NEVER ACCUMULATED, AND THAT IS THE WHOLE FAIRNESS ARGUMENT.
+    /// DefenderSlotFor is a pure function of the round number. A schedule expressed as a
+    /// mutating counter has no way to state the invariant it is supposed to keep, and it
+    /// desyncs the moment one peer misses one call. "Everyone defends exactly once,
+    /// clockwise" is true here BY CONSTRUCTION. The 2v2 format this replaced needed a
+    /// whole paired-set system to reach the same property. Both default modes now get
+    /// one complete rotation in four rounds.
+    /// </summary>
+    public static class MatchRules
+    {
+        /// <summary>The shipped match length for the selected first-class mode.</summary>
+        public static int RoundCountFor(GameMode mode)
+            => mode == GameMode.HeroStrike ? Balance.HeroStrikeRounds : Balance.Rounds;
+
+        /// <summary>
+        /// Which slot is the taya in a given round. Rounds are 1-based.
+        ///
+        /// | round | 1 | 2 | 3 | 4 |
+        /// | taya  | 0 | 1 | 2 | 3 |
+        /// </summary>
+        public static int DefenderSlotFor(int round)
+        {
+            int r = round < 1 ? 1 : round;
+            return (r - 1) % Balance.PlayerCount;
+        }
+
+        public static bool IsDefenderSlot(int slot, int round) => slot == DefenderSlotFor(round);
+
+        public static int PointsFor(ScoreEvent e)
+        {
+            switch (e)
+            {
+                case ScoreEvent.LataKnocked: return Balance.ScoreLataKnocked;
+                case ScoreEvent.Tag: return Balance.ScoreTag;
+                case ScoreEvent.Sabotage: return Balance.ScoreSabotage;
+                case ScoreEvent.DefenseTick: return Balance.ScoreDefensePerTick;
+                case ScoreEvent.TayaCampPenalty: return Balance.ScoreTayaCampPenalty;
+                case ScoreEvent.UnretrievedSlipperPenalty: return Balance.ScoreUnretrievedPenalty;
+                case ScoreEvent.CanDownPenalty: return Balance.ScoreCanDownPenalty;
+
+                // ⚠️ IT IS A KNOCKDOWN'S WORTH AND IT IS READ FROM `CustomGameRules`, NOT
+                // COPIED. That file's own note is the argument: a format that pays in its own
+                // currency is a format whose scores cannot be read beside anybody else's, and a
+                // second literal 100 in this switch is the first step towards the two drifting.
+                case ScoreEvent.LastTsinelasStanding: return CustomGameRules.LastStandingPoints;
+                case ScoreEvent.AccuracyChainTwo: return 10;
+                case ScoreEvent.DoubleCatch:
+                case ScoreEvent.MultiCatch: return 25;
+                case ScoreEvent.FirstKnockdownBonus:
+                case ScoreEvent.LateKnockdownBonus:
+                case ScoreEvent.MultiKnockdownBonus: return 50;
+                case ScoreEvent.AccuracyChainThree: return 20;
+                case ScoreEvent.AccuracyChainLong:
+                case ScoreEvent.TripleCatch: return 25;
+                case ScoreEvent.SproutKnock: return PaeteRules.SproutKnockPoints;
+
+                default: return 0;
+            }
+        }
+
+        public static bool IsChainBonus(ScoreEvent e) => (e >= ScoreEvent.AccuracyChainTwo && e <= ScoreEvent.TripleCatch)
+            || (e >= ScoreEvent.FirstKnockdownBonus && e <= ScoreEvent.MultiCatch);
+    }
+
+    /// <summary>
+    /// Pure tournament anti-stall rules shared by runtime code, bots, HUD, and tests.
+    /// The separate clear radius gives the can ring hysteresis so stepping across one
+    /// razor-thin boundary cannot flicker or erase a nearly-earned warning.
+    /// </summary>
+    public static class TournamentRules
+    {
+        public static bool IsTayaCamping(bool wasInsideCampZone, float distanceFromCan)
+        {
+            float radius = wasInsideCampZone
+                ? Balance.TayaCampClearRadius
+                : Balance.TayaCampRadius;
+            return distanceFromCan <= radius;
+        }
+
+        public static float StepViolationTimer(float current, bool violating, float dt)
+        {
+            if (!violating) return 0.0f;
+            return System.Math.Max(0.0f, current) + System.Math.Max(0.0f, dt);
+        }
+
+        public static bool IsCampWarning(float seconds)
+            => seconds >= Balance.TayaCampWarningTime;
+
+        public static bool IsCampPenalty(float seconds)
+            => seconds >= Balance.TayaCampGracePeriod;
+
+        public static bool IsSlipperWarning(float seconds)
+            => seconds >= Balance.SlipperUnretrievedWarningTime;
+
+        public static bool IsSlipperPenalty(float seconds)
+            => seconds >= Balance.SlipperUnretrievedGracePeriod;
+
+        public static bool IsCanDownWarning(float seconds)
+            => seconds >= Balance.CanDownWarningTime;
+
+        public static bool IsCanDownPenalty(float seconds)
+            => seconds >= Balance.CanDownGracePeriod;
+    }
+
+    /// <summary>
+    /// Cumulative per-player score across the whole match.
+    ///
+    /// ⚠️ EVERY POINT IN THE GAME IS AWARDED THROUGH Add(), host-side. The predecessor
+    /// spread its win conditions across four files and the recurring bug class was a rule
+    /// that fired on the wrong peer. A point that can only be created in one function
+    /// cannot be created on a client at all. Keep it that way through the netcode port:
+    /// this type must never be mutated from a client path.
+    ///
+    /// ⚠️ THERE IS NO PER-ROUND WINNER. Scores persist across the round boundary; only
+    /// the taya role rotates.
+    /// </summary>
+    public sealed class Scoreboard
+    {
+        private readonly int[] _scores = new int[Balance.PlayerCount];
+
+        public int this[int slot] => (slot < 0 || slot >= _scores.Length) ? 0 : _scores[slot];
+
+        public void Add(int slot, ScoreEvent e)
+        {
+            if (slot < 0 || slot >= _scores.Length) return;
+            _scores[slot] = System.Math.Max(0, _scores[slot] + MatchRules.PointsFor(e));
+        }
+
+        public void Set(int slot, int score)
+        {
+            if (slot < 0 || slot >= _scores.Length) return;
+            _scores[slot] = score;
+        }
+
+        public void SetAll(int[] scores)
+        {
+            if (scores == null) return;
+            for (int i = 0; i < _scores.Length && i < scores.Length; i++)
+                _scores[i] = scores[i];
+        }
+
+        public void Reset()
+        {
+            for (int i = 0; i < _scores.Length; i++) _scores[i] = 0;
+        }
+
+        public int Total
+        {
+            get
+            {
+                int sum = 0;
+                for (int i = 0; i < _scores.Length; i++) sum += _scores[i];
+                return sum;
+            }
+        }
+
+        /// <summary>
+        /// The winning slot, or -1.
+        ///
+        /// ⚠️ A TIE AT THE TOP RETURNS -1 AND IS AN HONEST DRAW. It is not broken by seat
+        /// order, which would hand round 1's taya a structural advantage in a game whose
+        /// entire fairness argument is that the seats are symmetric.
+        /// </summary>
+        public int WinningSlot()
+        {
+            int best = -1;
+            int bestScore = int.MinValue;
+            bool tied = false;
+
+            for (int i = 0; i < _scores.Length; i++)
+            {
+                if (_scores[i] > bestScore)
+                {
+                    bestScore = _scores[i];
+                    best = i;
+                    tied = false;
+                }
+                else if (_scores[i] == bestScore)
+                {
+                    tied = true;
+                }
+            }
+
+            return tied ? -1 : best;
+        }
+    }
+}

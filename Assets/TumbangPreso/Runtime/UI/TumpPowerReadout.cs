@@ -1,0 +1,244 @@
+using TumbangPreso.Abilities;
+using TumbangPreso.InputLayer;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI
+{
+    /// <summary>Compact live power seals and a hold-to-read reference, with no gameplay authority.</summary>
+    public sealed partial class TumpPowerReadout : MonoBehaviour
+    {
+        private readonly TumpAbilityDial[] _dials = new TumpAbilityDial[3];
+        private readonly TumpAbilitySymbol[] _symbols = new TumpAbilitySymbol[3];
+        private readonly Text[] _keys = new Text[3], _states = new Text[3], _names = new Text[3], _bodies = new Text[3], _timings = new Text[3];
+        private readonly Image[] _keyGlyphs = new Image[3];
+        private readonly TumpSurface[] _keycaps = new TumpSurface[3];
+        private readonly TumpAbilitySymbol[] _detailSymbols = new TumpAbilitySymbol[3];
+        private RectTransform _deck, _detail;
+        private Text _hint, _pageTitle;
+        private InlinePromptText _pageHint;
+        private InputAction _inspect, _turnPage;
+        /// <summary>Top of the power cards inside the held reference, under its page header.</summary>
+        private const float PowerTop = 92;
+        /// <summary>The role page the held reference shows: null follows the role you are playing.</summary>
+        private bool? _pageDefending;
+        private bool _wasHeld, _wasDefending;
+        /// <summary>
+        /// True while the held reference is open. Its page key (Interact, F by default) then turns the page instead of
+        /// interacting, so `PlayerInputReader` reads Interact as released.
+        /// </summary>
+        public static bool ReferenceOpen { get; private set; }
+        private void OnDisable() { ReferenceOpen = false; _pageDefending = null; _wasHeld = false; }
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetReference() => ReferenceOpen = false;
+        private HeroKit _shownKit;
+        private string _shownSignature;
+        private bool _ultimateReady;
+        private bool _captureReference;
+        private readonly HeroAbility[] _skills = new HeroAbility[3];
+        private static readonly string[] Actions = { "Skill1", "Skill2", "Ultimate" };
+        /// <summary>
+        /// § WHERE THE DECK SITS, for anything else that draws near the bottom of the match.
+        ///
+        /// ⚠️⚠️ THEY ARE CONSTANTS BECAUSE A SECOND READER ARRIVED AND THE ALTERNATIVE IS A COPY.
+        /// `SlipperRecall` clamps a world-tracking marker to the screen edge and the bottom edge
+        /// is this rectangle, so it has to know where the deck ends. The build call below uses
+        /// these same three numbers, which is what stops the two from drifting: `CLAUDE.md` § 5's
+        /// rule about a number living in two places is not only about balance values, and
+        /// `docs/TODO.md` § 94.1 is what a second answer to one question costs here.
+        ///
+        /// ⚠️ ASK <see cref="DeckVisible"/> BEFORE USING THEM. The deck is switched off for a
+        /// seat with no hero kit, which is every seat in Classic, and a marker that dodges a
+        /// rectangle nobody can see is a marker sitting in the wrong place for half the game.
+        /// </summary>
+        public const float DeckLift = 112.0f;
+        public const float DeckWidth = 470.0f;
+        public const float DeckHeight = 194.0f;
+
+        /// <summary>Canvas units from the BOTTOM of the canvas to the top of the deck.</summary>
+        public const float DeckTop = DeckLift + DeckHeight * 0.5f;
+
+        public const float DeckHalfWidth = DeckWidth * 0.5f;
+
+        /// <summary>True while the deck is actually drawn. See the note on the constants.</summary>
+        public bool DeckVisible => _deck != null && _deck.gameObject.activeInHierarchy;
+
+        private void BuildPreviousDeck(Transform root)
+        {
+            var f = TumpUiTheme.Current;
+            _deck = TumpUiFactory.Rect(root, "PowerSeals");
+            TumpUiFactory.Anchor(_deck, new Vector2(.5f, 0), new Vector2(0, DeckLift),
+                                 new Vector2(DeckWidth, DeckHeight));
+            for (int i = 0; i < 3; i++)
+            {
+                float size = i == 2 ? 114 : 96;
+                _dials[i] = TumpUiFactory.Rect(_deck, "Power" + i).gameObject.AddComponent<TumpAbilityDial>();
+                _dials[i].raycastTarget = false;
+                TumpUiFactory.Place(_dials[i].rectTransform, 30 + i * 144, i == 2 ? 0 : 18, size, size);
+                _symbols[i] = TumpUiFactory.Rect(_dials[i].transform, "PowerIcon").gameObject.AddComponent<TumpAbilitySymbol>();
+                _symbols[i].raycastTarget = false; TumpUiFactory.Stretch(_symbols[i].rectTransform, 19);
+                _keys[i] = TumpUiFactory.Text(_deck, "LiveBinding" + i, "", 28, true);
+                _keys[i].color = f.Cream; _keys[i].alignment = TextAnchor.MiddleCenter;
+                TumpUiFactory.Place(_keys[i].rectTransform, 16 + i * 144, 120, 132, 52);
+                _keys[i].font = InGameTypography.Resolve(f.Bold, true, _keys[i]); _keys[i].fontSize = 30;
+                _keycaps[i] = TumpUiFactory.Surface(_deck, "KeyboardCap" + i, TumpSurface.Form.Ticket, f.Cream);
+                TumpUiFactory.Place(_keycaps[i].rectTransform, 52 + i * 144, 122, 60, 48);
+                _keycaps[i].transform.SetSiblingIndex(_keys[i].transform.GetSiblingIndex());
+                _keyGlyphs[i] = TumpUiFactory.Art(_keys[i].transform, "BindingGlyph", null);
+                TumpUiFactory.Stretch(_keyGlyphs[i].rectTransform, 5);
+                _states[i] = TumpUiFactory.Text(_dials[i].transform, "PowerState", "", 26);
+                _states[i].alignment = TextAnchor.MiddleCenter; _states[i].color = f.Cream;
+                TumpUiFactory.Stretch(_states[i].rectTransform, 8);
+            }
+            _hint = TumpUiFactory.Text(_deck, "PowerInfoBinding", "", 22);
+            _hint.color = f.Cream; _hint.alignment = TextAnchor.MiddleCenter;
+            TumpUiFactory.Place(_hint.rectTransform, -70, 169, 590, 42);
+            BuildDetails(root);
+            var asset = Resources.Load<InputActionAsset>("TumbangPreso");
+            _inspect = asset?.FindActionMap("Player", false)?.FindAction("AbilityInfo", false);
+            _inspect?.Enable();
+            _turnPage = asset?.FindActionMap("Player", false)?.FindAction("Interact", false); _turnPage?.Enable();
+        }
+        private void BuildPreviousDetails(Transform root)
+        {
+            var f = TumpUiTheme.Current;
+            _detail = TumpUiFactory.Rect(root, "HeldPowerReference");
+            TumpUiFactory.Anchor(_detail, new Vector2(.5f, 0), new Vector2(0, 464), new Vector2(1770, 486));
+            // One reading sheet with three editorial columns, not three tiled menu cards.
+            TumpUiFactory.Ground(_detail, f.Cream, false);
+            for (int i = 0; i < 3; i++)
+            {
+                float x = 30 + i * 582;
+                _detailSymbols[i] = TumpUiFactory.Rect(_detail, "DetailIcon" + i).gameObject.AddComponent<TumpAbilitySymbol>();
+                _detailSymbols[i].color = f.Brick; _detailSymbols[i].raycastTarget = false;
+                TumpUiFactory.Place(_detailSymbols[i].rectTransform, x, 28, 86, 86);
+                _names[i] = TumpUiFactory.Text(_detail, "PowerName" + i, "", 36, true);
+                _names[i].color = f.Brick; TumpUiFactory.Place(_names[i].rectTransform, x + 106, 16, 432, 126);
+                _timings[i] = TumpUiFactory.Text(_detail, "PowerTiming" + i, "", 24);
+                TumpUiFactory.Place(_timings[i].rectTransform, x + 2, 148, 532, 62);
+                _bodies[i] = TumpUiFactory.Text(_detail, "PowerDescription" + i, "", 26);
+                _bodies[i].alignment = TextAnchor.UpperLeft;
+                TumpUiFactory.Place(_bodies[i].rectTransform, x + 2, 224, 530, 236);
+                if (i > 0)
+                {
+                    var line = TumpUiFactory.Rect(_detail, "ColumnRule").gameObject.AddComponent<Image>();
+                    line.color = f.OliveSand; line.raycastTarget = false; TumpUiFactory.Place(line.rectTransform, x - 24, 38, 2, 402);
+                }
+            }
+            _detail.gameObject.SetActive(false);
+        }
+        private void TickPreviousDeck(HeroAbilitySystem system, bool visible)
+        {
+            var kit = system != null ? system.Kit : null;
+            visible &= kit != null;
+            _deck.gameObject.SetActive(visible);
+            if (!visible) { _detail.gameObject.SetActive(false); TurnPages(null, false); return; }
+            _skills[0] = kit.Skill1; _skills[1] = kit.Skill2; _skills[2] = kit.Ultimate;
+            var skills = _skills;
+            var f = TumpUiTheme.Current;
+            for (int i = 0; i < 3; i++)
+            {
+                var skill = skills[i]; if (skill == null) continue;
+                _symbols[i].SetCastLocked(system.GetComponent<CharacterMotor>()?.IsZapped == true);
+                if (_symbols[i].Glyph != skill.Glyph) { _symbols[i].Glyph = skill.Glyph; _symbols[i].SetVerticesDirty(); }
+                bool ready = !kit.PracticeMode && !system.GetComponent<CharacterMotor>().IsZapped && (i == 2 ? kit.IsUltimateReady : skill.IsReady);
+                float ratio = skill.IsActive ? skill.DurationRatio : i == 2 ? kit.UltimateRatio : 1 - skill.CooldownRatio;
+                _dials[i].State(ratio, ready, skill.IsActive, i == 2);
+                _symbols[i].color = ready ? f.Lime : f.Cream;
+                if (_symbols[i].Muted == ready) { _symbols[i].Muted = !ready; _symbols[i].SetVerticesDirty(); }
+                string state = kit.PracticeMode ? "Wait" : skill.IsPersistentActive ? "Active" : skill.IsActive ? skill.CanReactivate ? (skill.ReactivateReady ? "Again" : AbilityDeckHud.CooldownLabel(skill.ReactivateReadyIn)) : skill.DurationRemaining.ToString("0.0")
+                    : i == 2 ? ready ? "" : Mathf.FloorToInt(kit.UltimateRatio * 100) + "%"
+                    : skill.UsesCharges ? skill.ChargesRemaining.ToString() : skill.CooldownRemaining > 0 ? AbilityDeckHud.CooldownLabel(skill.CooldownRemaining) : "";
+                var slot = i == 0 ? HeroAbilitySystem.Slot.Skill1 : i == 1 ? HeroAbilitySystem.Slot.Skill2 : HeroAbilitySystem.Slot.Ultimate;
+                if (system.SecondsSinceAnswer(slot) < .8f)
+                {
+                    var answer = system.LastAnswer(slot);
+                    if (answer == HeroKit.CastOutcome.CannotAct) state = "Wait";
+                    else if (answer == HeroKit.CastOutcome.NoCharge) state = "Empty";
+                    else if (answer == HeroKit.CastOutcome.NotYet) state = "Not yet";
+                }
+                _states[i].text = state;
+                _symbols[i].canvasRenderer.SetAlpha(string.IsNullOrEmpty(state) ? 1 : .25f);
+                string binding = Hud.KeyLabelFor(Actions[i]); _keys[i].text = Hud.OnTouch ? "" : binding;
+                bool gamepad = LastInputDevice.Current == InputDeviceKind.Gamepad;
+                _keyGlyphs[i].sprite = gamepad ? InputGlyphs.For(binding.ToUpperInvariant(), true) : null;
+                _keyGlyphs[i].enabled = _keyGlyphs[i].sprite != null;
+                _keycaps[i].gameObject.SetActive(!Hud.OnTouch && !gamepad && binding.Length <= 3);
+                _keys[i].color = _keyGlyphs[i].enabled ? Color.clear : _keycaps[i].gameObject.activeSelf ? f.DeepOlive : f.Cream;
+            }
+            if (kit.IsUltimateReady && !kit.PracticeMode && !_ultimateReady) GameServices.Audio?.PlayUi("sfx_super_ready");
+            _ultimateReady = kit.IsUltimateReady && !kit.PracticeMode;
+            _hint.text = Hud.OnTouch ? "Hold info for skills" : "Hold " + Hud.KeyLabelFor("AbilityInfo") + " for skills";
+            bool held = _captureReference || InputLayer.TouchInput.ScreenHeld("AbilityInfo") || (_inspect != null && _inspect.IsPressed());
+            TurnPages(kit, held);
+            _detail.gameObject.SetActive(held);
+            if (held) Describe(kit, skills);
+        }
+        /// <summary>
+        /// Turns the held reference between its attacking and defending pages (owner, 2026-11-05: "press like F to toggle
+        /// between attacking and defending ability descriptions" instead of both crammed in one card). Opening it, or
+        /// your role changing, shows your own role's page again.
+        /// </summary>
+        private void TurnPages(HeroKit kit, bool held)
+        {
+            bool roles = kit != null && kit.HasRoleAbilities;
+            if (!held || !_wasHeld || !roles || kit.IsDefending != _wasDefending) _pageDefending = null;
+            if (held && roles && _turnPage != null && _turnPage.WasPressedThisFrame())
+                _pageDefending = !(_pageDefending ?? kit.IsDefending);
+            _wasHeld = held; _wasDefending = kit != null && kit.IsDefending;
+            ReferenceOpen = held && !_captureReference;
+        }
+
+        private void Describe(HeroKit kit, HeroAbility[] skills)
+        {
+            bool roles = kit.HasRoleAbilities;
+            bool defending = _pageDefending ?? kit.IsDefending;
+            var shown = (HeroAbility[])skills.Clone();
+            if (roles) shown[1] = defending ? kit.DefendingSkill : kit.AttackingSkill;
+            bool touch = LastInputDevice.Current == InputDeviceKind.Touch;
+            string signature = string.Join("|", System.Array.ConvertAll(shown, a => a == null ? ""
+                : a.Id + a.EffectiveName + a.EffectiveDescription + "/" + a.Cooldown + "/" + a.Duration + "/" + a.MaxCharges + "/" + (int)a.Glyph))
+                + "/" + kit.UltimateCost + "/" + roles + defending + "/" + Hud.KeyLabelFor("Interact") + string.Join("", System.Array.ConvertAll(Actions, Hud.KeyLabelFor));
+            if (_shownKit == kit && _shownSignature == signature) return;
+            _shownKit = kit; _shownSignature = signature;
+            if (_pageTitle != null)
+            {
+                _pageTitle.text = roles ? (defending ? "DEFENDING" : "ATTACKING") : "YOUR POWERS";
+                _pageHint.Show(!roles ? "" : "{Interact} " + (defending ? "ATTACKING POWERS" : "DEFENDING POWERS"), "Interact");
+            }
+            for (int i = 0; i < 3; i++)
+            {
+                var skill = shown[i]; if (skill == null) continue;
+                _detailSymbols[i].Glyph = skill.Glyph; _detailSymbols[i].SetVerticesDirty();
+                _names[i].text = skill.EffectiveName.ToUpperInvariant(); _bodies[i].text = skill.EffectiveDescription;
+                // The chip carries the cost alone (owner, 2026-11-05: no duration, no key; the sentence shows the key).
+                string cost = skill.UsesCharges ? skill.MaxCharges + (skill.MaxCharges == 1 ? " USE" : " USES")
+                    : skill.Cooldown > 0 ? skill.Cooldown.ToString("0.#") + "s COOLDOWN" : "";
+                if (i == 2) cost = kit.UltimateCost.ToString("0.#") + " CHARGE";
+                _timings[i].text = cost;
+                if (_inlineBodies[i] == null) continue;
+                // The sentence with the key's own icon in it (a variant keeps its own words).
+                _inlineCosts[i].Show(cost, Actions[i]);
+                string sentence = string.IsNullOrEmpty(skill.VariantSummary) ? skill.Description : skill.VariantSummary;
+                _inlineBodies[i].Show(sentence, Actions[i]);
+                if (_plates) _plateLines[i].text = string.IsNullOrEmpty(skill.EffectiveSummary) ? FirstSentence(skill.Description).Replace("{KEY}", Hud.KeyLabelFor(Actions[i])) : skill.EffectiveSummary;
+            }
+            LayoutReference();
+        }
+        private static string FirstSentence(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            for (int k = 0; k < text.Length - 1; k++)
+                if ((text[k] == '.' || text[k] == '!') && text[k + 1] == ' ') return text.Substring(0, k + 1);
+            return text;
+        }
+
+        public void OpenForCapture(HeroKit kit)
+        {
+            _captureReference = true;
+            Describe(kit, new[] { kit.Skill1, kit.Skill2, kit.Ultimate }); _detail.gameObject.SetActive(true);
+        }
+        public void CloseCapture() { _captureReference = false; _detail.gameObject.SetActive(false); }
+    }
+}

@@ -1,0 +1,25 @@
+{
+    "name": "TumbangPreso.Editor",
+    "rootNamespace": "TumbangPreso.EditorTools",
+    "references": [
+        "TumbangPreso.Core",
+        "TumbangPreso.Runtime",
+        "Unity.InputSystem",
+        "Unity.Services.Core",
+        "Unity.Services.Authentication",
+        "Unity.Services.Multiplayer",
+        "UnityEditor.TestRunner",
+        "UnityEngine.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

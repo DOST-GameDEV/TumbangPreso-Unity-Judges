@@ -1,0 +1,138 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace TumbangPreso.InputLayer
+{
+    /// <summary>
+    /// What the on-screen thumb layer is currently reporting, for the local seat.
+    /// Recovery retains a brief press edge until consumed, alongside the held
+    /// table. This explicit exception fixes rapid touches lost between physics
+    /// ticks; hold-to-release verbs continue to use their ordinary held state.
+    ///
+    /// ⚠️⚠️ IT IS A HELD TABLE AND NOT AN EVENT STREAM, WHICH IS WHAT MAKES TOUCH TESTABLE
+    /// HEADLESSLY. `InputIntent`'s class note is the rule: *edges are derived, not reported*, and
+    /// a producer that reported its own edges could report an impossible pair. A touch button
+    /// therefore says only "a finger is on me right now"; `PlayerInputReader` folds that into the
+    /// same held set the keyboard writes, and `InputIntent` diffs it. So a probe presses a touch
+    /// button by writing this table, and the whole downstream game cannot tell the difference
+    /// between that, a finger, a pad and a key. That is the same argument that makes a bot press
+    /// the same buttons a human does.
+    ///
+    /// ⚠️⚠️ AND IT IS WHY HOLD-TO-AIM WORKS ON A THUMB WITH NO EXTRA CODE. `docs/TODO.md`
+    /// § 124.1 added five hold-to-aim powers, and `HeroAbility.CastsOnReleaseOnly` decides which
+    /// edge casts. A touch button that is held while the finger is down produces exactly the same
+    /// press-hold-release the keyboard produces, so `HoldAim`, `AimRangeFor` and the release cast
+    /// all work unchanged. Reporting a tap as one frame of "pressed" is the fault that would have
+    /// pinned every held power to `AimRangeFor`'s MINIMUM, which is the bot fault that same entry
+    /// records against `AIController.Consider`.
+    ///
+    /// ⚠️ STATIC, LIKE `LobbyChat.AnyTyping`, BECAUSE THERE IS EXACTLY ONE LOCAL PLAYER. The
+    /// touch layer draws once, over whichever seat the camera is following. A per-seat instance
+    /// would be a table three bots never read.
+    /// </summary>
+    public static class TouchInput
+    {
+        private static readonly HashSet<Verb> Held = new HashSet<Verb>();
+        private static readonly Dictionary<object, string> ScreenHolds = new Dictionary<object, string>();
+        private static bool _curveLeftEdge, _curveRightEdge;
+        public static bool ScreenHeld(string action)
+        {
+            if (!Active) return false;
+            foreach (var held in ScreenHolds.Values) if (held == action) return true;
+            return false;
+        }
+        public static void SetScreenHold(object owner, string action, bool held)
+        {
+            if (owner == null) return;
+            bool wasHeld = ScreenHeld(action);
+            if (held) ScreenHolds[owner] = action; else ScreenHolds.Remove(owner);
+            if (Active && held && !wasHeld)
+            {
+                if (action == "CurveLeft") _curveLeftEdge = true;
+                if (action == "CurveRight") _curveRightEdge = true;
+            }
+        }
+        public static float ReadCurve(float step, float rate, float seconds)
+        {
+            float edge = (_curveRightEdge ? 1 : 0) - (_curveLeftEdge ? 1 : 0);
+            _curveLeftEdge = _curveRightEdge = false;
+            float held = (ScreenHeld("CurveRight") ? 1 : 0) - (ScreenHeld("CurveLeft") ? 1 : 0);
+            return Active ? edge * step + held * rate * seconds : 0;
+        }
+        private static bool _recoveryPressed;
+        public static uint ReleaseVersion { get; private set; }
+        private static object _lookOwner;
+        private static int _lookPointer, _lookButton;
+        public static bool CaptureLook(object owner, int pointer, int button)
+        {
+            if (owner == null) return false;
+            if (_lookOwner != null) return OwnsLook(owner, pointer, button);
+            _lookOwner = owner; _lookPointer = pointer; _lookButton = button; return true;
+        }
+        public static bool OwnsLook(object owner, int pointer, int button)
+            => ReferenceEquals(_lookOwner, owner) && _lookPointer == pointer && _lookButton == button;
+        public static void ReleaseLook(object owner)
+        {
+            if (!ReferenceEquals(_lookOwner, owner)) return;
+            _lookOwner = null; LookDelta = Vector2.zero;
+        }
+
+        /// <summary>
+        /// True while the on-screen layer is drawn. Everything below is inert when it is not, so
+        /// a desktop build cannot pick up a stale press from a probe that forgot to release one.
+        /// </summary>
+        public static bool Active { get; set; }
+
+        /// <summary>The left thumb's stick, already normalised to the -1..1 box Move expects.</summary>
+        public static Vector2 Move { get; set; }
+
+        /// <summary>
+        /// This frame's drag on the look side of the screen, in the units a mouse reports.
+        ///
+        /// ⚠️ THE READER ZEROES IT AFTER READING, because a drag is a delta and a finger that
+        /// stops moving without lifting reports nothing new. Leaving the last value standing
+        /// turns a paused finger into a camera that keeps spinning, which is
+        /// `InputIntent.LookDelta`'s own note.
+        /// </summary>
+        public static Vector2 LookDelta { get; set; }
+
+        public static bool Pressed(Verb verb) => Active && Held.Contains(verb);
+
+        public static void Set(Verb verb, bool pressed)
+        {
+            if (pressed)
+            {
+                if(Held.Add(verb)&&Active&&verb==Verb.Jump)_recoveryPressed=true;
+            }
+            else Held.Remove(verb);
+        }
+
+        // Recovery is a press,not a hold-to-release action. Keep a brief touch
+        // until the same reader that handles keyboard/gamepad can buffer it.
+        public static bool ConsumeRecoveryPress()
+        {
+            bool pressed=Active&&_recoveryPressed;_recoveryPressed=false;return pressed;
+        }
+
+        /// <summary>
+        /// Everything up, and the axes to zero.
+        ///
+        /// ⚠️ CALLED WHEN THE LAYER IS HIDDEN AND WHEN A PROBE FINISHES. A verb left held here
+        /// survives a scene load, because a static does, and the next match would start with the
+        /// player already sprinting. The same fault `PlayerInputReader.OnDisable` guards.
+        /// </summary>
+        public static void ReleaseAll()
+        {
+            unchecked { ReleaseVersion++; }
+            _lookOwner = null;
+            Held.Clear();
+            ScreenHolds.Clear(); _curveLeftEdge = _curveRightEdge = false;
+            _recoveryPressed=false;
+            Move = Vector2.zero;
+            LookDelta = Vector2.zero;
+        }
+
+        /// <summary>Whatever is held right now, for a probe's report.</summary>
+        public static IEnumerable<Verb> HeldVerbs => Held;
+    }
+}

@@ -1,0 +1,235 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace TumbangPreso
+{
+    /// <summary>
+    /// The verbs a unit can press. One name per Godot input action. The keys are the owner's
+    /// default layout, 2026-09-27 (`Settings.Rebinding`'s class note has it in full).
+    /// </summary>
+    public enum Verb
+    {
+        Sprint,
+        Jump,
+        SpecialAbility, // Left click. Throw / Tag: the throw charge for an attacker, the jab tag for the taya.
+        Grab,           // F. Interact / Use: pick up, or the lata reset channel.
+        Lunge,          // Right click. Shove / Lunge: the taya's dash tag; an attacker's shove (or retrieval slide).
+        EmoteWheel,     // T
+        Skill1,         // The signature ability. E
+        Skill2,         // The attacking / defending ability. Q
+        Ultimate,       // X
+
+        // ⚠️ APPENDED (2026-09-25). The general INTERACT: do the thing in front of me that is not a
+        // pickup. Owner, on pulling out Paete's plant: *"dont make the keybind shove maybe make like
+        // a general keybind for interact and remove and shit"*, and on breaking out of his roots:
+        // *"i suggest the general interact button"*. F on a keyboard, beside `Grab`
+        // (`Settings.Rebinding.IsOneUseKey`).
+        Interact,
+
+        // ⚠️ CROUCH, a verb of its own since 2026-10-09 (owner: "add controller and touch support for crouch"). Hold to
+        // crouch; pressed at a sprint it is the slide (`MovementRework`, `CharacterMotor.MovementRework.cs`). Left Ctrl
+        // on a keyboard, B on a pad (shared with Ready Up, which only exists before a round:
+        // `Settings.Rebinding.IsOneUseKey`), a button of its own on a phone. It began as a debug key read.
+        Crouch,
+    }
+
+    /// <summary>
+    /// ONE FRAME OF INTENT, WHOEVER PRODUCED IT.
+    ///
+    /// ⚠️⚠️ THIS INDIRECTION IS THE SINGLE BEST THING IN THE GODOT CODEBASE AND IT IS BEING
+    /// PORTED DELIBERATELY RATHER THAN SIMPLIFIED AWAY. A bot presses the same buttons a
+    /// human does: `ai_set_intent()` writes the same table `input_pressed()` reads, so ONE
+    /// physics step serves both and there is no second code path where a bot can do
+    /// something a player cannot, or obey a rule a player is not held to.
+    ///
+    /// It is also what made the AI rewrite affordable and what makes the whole AI layer a
+    /// transcription in this port rather than a redesign. Every temptation to let a bot
+    /// call a gameplay method directly ("it is simpler, it is only for the AI") reintroduces
+    /// the divergence this prevents. Do not take it.
+    ///
+    /// Held-state edges are derived against the previous physics snapshot. Hardware
+    /// recovery taps additionally buffer a press observed by Input System, because
+    /// a press and release can both occur between physics ticks. The consumer clears
+    /// that observation exactly once; it never turns it into a held button.
+    /// </summary>
+    public sealed class InputIntent
+    {
+        private readonly HashSet<Verb> _held = new HashSet<Verb>();
+        private readonly HashSet<Verb> _heldPrev = new HashSet<Verb>();
+        private readonly HashSet<Verb> _bufferedPresses = new HashSet<Verb>();
+        private readonly HashSet<Verb> _releaseRequired = new HashSet<Verb>();
+
+        public void RequireFreshActions()
+        {
+            foreach (var verb in _held) if (verb != Verb.Sprint) _releaseRequired.Add(verb);
+            _bufferedPresses.Clear(); _held.RemoveWhere(v => v != Verb.Sprint);
+            _heldPrev.RemoveWhere(v => v != Verb.Sprint); LookDelta = Vector2.zero;
+        }
+
+        public Vector2 Move { get; set; }
+
+        /// <summary>
+        /// This frame's look delta, in the same units a mouse reports.
+        ///
+        /// ⚠️⚠️ IT LIVES HERE BECAUSE THE CAMERA WAS THE SECOND PLACE THAT READ HARDWARE, AND
+        /// `PlayerInputReader`'s OWN CLASS NOTE SAYS THERE IS ONLY ONE. `CameraRig.StepLook`,
+        /// `StepCompanionLook` and `StepEmoteLook` each called `Input.GetAxisRaw("Mouse X")`
+        /// directly, which is the exact divergence that note forbids: a pad stick and a phone
+        /// drag had nowhere to arrive, and every fix for them would have been a fourth and fifth
+        /// hardware read inside the camera. One producer writes this; the rig reads it.
+        ///
+        /// ⚠️ A BOT NEVER WRITES IT, AND THAT IS CORRECT RATHER THAN AN OMISSION. Bots steer
+        /// with <see cref="Move"/> and <see cref="AimPoint"/>; they have no camera to turn. The
+        /// field is simply zero for them, which is what the rig already does with no mouse.
+        ///
+        /// ⚠️⚠️ <see cref="Clear"/> ZEROES IT, AND LEAVING IT OUT WOULD SPIN THE CAMERA FOR
+        /// EVER. This is a per-frame quantity its producer overwrites every frame, so a producer
+        /// that STOPS writing (chat opens, the reader is disabled, the unit is parked) leaves the
+        /// last non-zero delta standing and the rig keeps applying it on every frame after. It is
+        /// the same fault `Parked`'s own note records for a held verb, one field along: the exit
+        /// has to publish a release, not merely stop talking.
+        /// </summary>
+        public Vector2 LookDelta { get; set; }
+
+        /// <summary>The look delta, or zero while this unit's input is parked.</summary>
+        public Vector2 LookAxis => Parked ? Vector2.zero : LookDelta;
+
+        /// <summary>Lateral throw spin for Pektus curve shots (-1.0 left to +1.0 right).</summary>
+        public float SpinInput { get; set; }
+
+        /// <summary>Where this unit is aiming, in world space. AI writes it directly;
+        /// a human's comes from the camera ray.</summary>
+        public Vector3 AimPoint
+        {
+            get => _aimPoint;
+            set { _aimPoint = value; HasAimPoint = true; }
+        }
+
+        private Vector3 _aimPoint;
+
+        /// <summary>
+        /// ⚠️⚠️ "NOBODY HAS WRITTEN AN AIM POINT" IS A REAL STATE AND IT IS NOT THE ORIGIN. The
+        /// .gd spells it `ai_aim_point == Vector3.INF` and branches on it, because a default
+        /// Vector3 is a legal position in the arena — the middle of the base circle, which is
+        /// exactly where the lata stands. A human seat that has never had a point written would
+        /// otherwise aim at the can from wherever it stood, which looks like a working aim
+        /// assist right up until the player turns around.
+        /// </summary>
+        public bool HasAimPoint { get; private set; }
+
+        /// <summary>
+        /// Turn the body toward <see cref="AimPoint"/> even when no movement key is held.
+        ///
+        /// Bots use this while charging a throw. The throw solver has always aimed the
+        /// tsinelas at the lata, but a movement-aimed body only changed yaw while walking, so
+        /// a bot that arrived with its back to the can could release a correct backwards shot.
+        /// Keeping the request in the shared intent preserves the one-input-path rule and lets
+        /// the ordinary motor apply the same bounded turn used for movement.
+        /// </summary>
+        public bool FaceAimPoint { get; set; }
+
+        /// <summary>
+        /// ⚠️ PARKED INPUT IS NOT THE SAME AS NO INPUT. A unit whose input is parked (a
+        /// menu is open, the round is over, they are mid-emote) must report everything
+        /// released rather than simply stop updating, or a verb held across the boundary
+        /// stays held forever and the player walks out of the pause menu already sprinting.
+        /// </summary>
+        public bool Parked { get; set; }
+
+        /// <summary>
+        /// Crouch held, for the movement rework (`MovementRework`). It was a debug field of its own, written from two
+        /// keyboard keys; since 2026-10-09 it is `Verb.Crouch`, on all three devices, and this is only its reading.
+        /// </summary>
+        public bool Crouch => Pressed(Verb.Crouch);
+
+        public void Set(Verb v, bool pressed)
+        {
+            if (!pressed) _releaseRequired.Remove(v);
+            else if (PresentationClock.BlocksInput && v != Verb.Sprint) _releaseRequired.Add(v);
+            if (_releaseRequired.Contains(v)) { _held.Remove(v); return; }
+            if (pressed) _held.Add(v);
+            else _held.Remove(v);
+        }
+
+        // Hardware can press and release between physics ticks. Preserve the
+        // observed press without inventing a held state or repeat presses.
+        public void BufferPress(Verb verb)
+        {
+            if (!PresentationClock.BlocksInput && !_releaseRequired.Contains(verb) && !Parked && !Locked(verb)) _bufferedPresses.Add(verb);
+        }
+
+        /// <summary>Called by the motor after the physics consumers have read intent.</summary>
+        public void CommitFrame()
+        {
+            _bufferedPresses.Clear();
+            _heldPrev.Clear();
+            foreach (var v in _held) _heldPrev.Add(v);
+        }
+
+        public void Clear()
+        {
+            _bufferedPresses.Clear();
+            _held.Clear();
+            Move = Vector2.zero;
+            LookDelta = Vector2.zero;
+            SpinInput = 0.0f;
+            HasAimPoint = false;
+            FaceAimPoint = false;
+        }
+
+        /// <summary>Clears producer-owned aiming state without releasing held verbs.</summary>
+        public void ClearAim()
+        {
+            HasAimPoint = false;
+            FaceAimPoint = false;
+        }
+
+        /// <summary>
+        /// The verbs this unit is currently allowed to use, or null for "all of them".
+        ///
+        /// ⚠️⚠️ IT EXISTS FOR THE GUIDED ROUTE AND NOTHING ELSE, AND IT DEFAULTS TO NULL SO
+        /// EVERY MATCH IS UNTOUCHED. 🧑, 2026-08-26: *"i dont want there to be bots and other
+        /// shit like skills or throwing until the tutorial wants u to actually do it bcz its
+        /// confusing that i can do a lot of shit, theres a tendency to not follow and focus on
+        /// tutorial"*. A tutorial that hands a player nine verbs on lesson one is not teaching
+        /// an order, it is presenting a menu.
+        ///
+        /// ⚠️ IT FILTERS HERE RATHER THAN AT THE CONSUMERS, for the same reason `Parked` does:
+        /// there are a dozen readers of this table across the carrier, the verbs, the motor and
+        /// the ability system, and a rule enforced at each of them is a rule that is missing from
+        /// whichever one gets written next. One table, one gate.
+        ///
+        /// ⚠️ AND IT IS A LOCK, NOT A REBIND. The key still exists and still says what it does;
+        /// pressing it simply resolves to nothing until the route has taught it. Rebinding or
+        /// disabling actions would fight `Settings.Rebinding` and would show the player a
+        /// different control scheme from the one they will play with.
+        /// </summary>
+        private HashSet<Verb> _allowed;
+
+        /// <summary>Restricts this unit to the given verbs. Null clears the restriction.</summary>
+        public void AllowOnly(HashSet<Verb> verbs) => _allowed = verbs;
+
+        /// <summary>
+        /// Whether the guided route is currently withholding this verb.
+        ///
+        /// ⚠️ PUBLIC SO A PROBE CAN TELL A LOCK FROM AN UNPRESSED KEY. `Pressed` folds `Parked`,
+        /// `Locked` and "not held" into one false, which is right for the game and useless for a
+        /// diagnosis: *"can hold x to reset here"* has three different causes and they need
+        /// different fixes. `TutorialDefenderProbe` prints all three separately.
+        ///
+        /// ⚠️ IT IS A QUERY AND NOTHING WRITES THROUGH IT. `AllowOnly` remains the only way to
+        /// change the set, and it stays the guided route's to call.
+        /// </summary>
+        public bool Locked(Verb v) => _allowed != null && !_allowed.Contains(v);
+
+        public bool Pressed(Verb v) => !Parked && !Locked(v) && _held.Contains(v);
+
+        public bool JustPressed(Verb v)
+            => !Parked && !Locked(v) && (_bufferedPresses.Contains(v) || (_held.Contains(v) && !_heldPrev.Contains(v)));
+
+        public bool JustReleased(Verb v)
+            => !Parked && !Locked(v) && !_held.Contains(v) && _heldPrev.Contains(v);
+
+        public Vector2 MoveAxis => Parked ? Vector2.zero : Move;
+    }
+}

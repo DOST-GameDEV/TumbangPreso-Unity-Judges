@@ -1,0 +1,1139 @@
+using System;
+using UnityEngine;
+
+namespace TumbangPreso.Abilities
+{
+    /// <summary>
+    /// Base class for hero abilities and ultimates.
+    /// </summary>
+    public abstract class HeroAbility
+    {
+        public string Id { get; }
+        public string Name { get; }
+
+        /// <summary>
+        /// The full tactical sentence, for the hold-to-read tray.
+        ///
+        /// ⚠️ THE TRAY IS THE ONLY PLACE THIS BELONGS. The deck at the bottom of the screen
+        /// carries what is true RIGHT NOW and nothing else; 🧑 2026-08-23 on why:
+        /// *"games like valorant overwatch league etc dont clog their screen with text"*.
+        /// </summary>
+        public string Description { get; }
+
+        /// <summary>
+        /// One short line for anywhere the full sentence does not fit, chiefly the character
+        /// select ribbon's details card.
+        ///
+        /// ⚠️⚠️ IT EXISTS BECAUSE FOUR OF THE FIFTEEN POWERS DESCRIBED THEMSELVES IN A SENTENCE
+        /// THAT STOPPED MID-WORD. The card draws `Description` into a 46 px box at 14 pt with
+        /// `VerticalWrapMode.Truncate`, which is about three lines, and the tactical sentences
+        /// run to four or five. Truncation is silent, so the screen a player uses to CHOOSE a
+        /// hero was the one screen lying to them about what the hero does.
+        ///
+        /// Falls back to the full description, so an ability that has not been given one is
+        /// merely long rather than blank.
+        /// </summary>
+        public string Summary { get; }
+
+        /// <summary>
+        /// What KIND of power this is, drawn as a shape wherever it is shown.
+        ///
+        /// ⚠⚠ IT LIVES ON THE ABILITY, NOT IN A LOOKUP TABLE IN THE HUD. A table keyed by
+        /// ability id is a second place to forget: adding a hero would compile, run, and show
+        /// three blank tiles. Here the compiler cannot let a new ability exist without one.
+        /// </summary>
+        public UI.AbilityGlyph Glyph { get; }
+        public float Cooldown { get; protected set; }
+        public float Duration { get; protected set; }
+
+        // Every new ability must choose its delivery path; no silent client-only default.
+        public abstract AbilityNetworkMode NetworkMode { get; }
+        public bool DefersPredictedEffect => NetworkMode == AbilityNetworkMode.HostConfirmed;
+
+        public void ApplyConfirmedEffect(AbilityContext ctx, float heldSeconds)
+        {
+            if (!DefersPredictedEffect || ctx?.Motor == null || NetAuthority.IsHost
+                || ctx.Motor.PlayerSlot != NetAuthority.LocalSlot) return;
+            float previousHold = HeldSecondsOnCast;
+            HeldSecondsOnCast = Mathf.Max(0, heldSeconds);
+            try { OnActivate(ctx); }
+            finally { HeldSecondsOnCast = previousHold; }
+        }
+
+        public float CooldownRemaining { get; protected set; }
+        public float DurationRemaining { get; protected set; }
+        public virtual bool IsPersistentActive => false;
+        public bool IsActive => DurationRemaining > 0.0f || IsPersistentActive;
+
+        // ------------------------------------------------------------------ wind-up
+        //
+        // ⚠️⚠️ THIS WAS DELIBERATELY REFUSED ONCE AND THE REFUSAL IS WORTH READING BEFORE
+        // TOUCHING IT. `HeroAbilitySystem.PlayUltimatePresentation` carries the note: *"A real
+        // 0.4 s wind-up on the ABILITY would be a fourth thing that can be interrupted, and every
+        // one of the five ultimates would need its own answer to being stunned halfway through;
+        // the buffering rules in `docs/Hero_Strike_UI.md` § 7 have no story for a half-cast
+        // power."* That objection was correct, and it is about INTERRUPTION rather than about
+        // the delay.
+        //
+        // ⚠️⚠️ SO THE WIND-UP IS UNINTERRUPTIBLE, WHICH DISSOLVES THE OBJECTION RATHER THAN
+        // ARGUING WITH IT. Once the press lands the ultimate WILL fire: nothing stuns, trips or
+        // cancels it, so there is no half-cast state for any of the five to have an answer to,
+        // and § 7's buffering never sees one. The meter is spent at the press, exactly as before,
+        // so no refund path exists to get wrong either.
+        //
+        // What the beat buys is what `Hero_Strike_Balance.md` § 4.3 actually asked for: *"The
+        // other three players get a beat to react, which is what makes an ultimate an event
+        // rather than a large skill."* Reacting means running, repositioning or spending a
+        // defensive power, and none of those need the cast to be cancellable.
+        //
+        // ⚠️ THE CASTER ROOTS, AND THAT IS THE COST THE BEAT IS PAID FOR WITH. Standing still
+        // for 0.4 s in a 14 m arena is real, and it is what stops the wind-up from being pure
+        // spectacle. § 4.3 also floats interruptibility as a balance knob; it is NOT taken here,
+        // and taking it later means writing the half-cast story the note above says is missing.
+        //
+        // ⚠️ ULTIMATES ONLY. 🧑, authorising this: *"just dont spam it for everything"*. The five
+        // skills resolve on the frame they are pressed and should keep doing so; a wind-up on a
+        // 6 s cooldown skill is a tax, not an event.
+
+        /// <summary>
+        /// The one wind-up length, shared by all five ultimates.
+        ///
+        /// ⚠️ IT IS A CONSTANT RATHER THAN A PER-HERO NUMBER BECAUSE THE BEAT IS A RULE, NOT A
+        /// BALANCE DIAL. Five different wind-ups would mean five different windows to learn for
+        /// no gain: what a player reads is "somebody is ultimate-ing", and that has to look and
+        /// last the same whoever cast it. 0.4 s is `Hero_Strike_Balance.md` § 4.3's own figure.
+        /// </summary>
+        public const float UltimateWindup = 0.4f;
+
+        /// <summary>Seconds between the press and the effect. 0 on everything but an ultimate.</summary>
+        public float Windup { get; protected set; }
+
+        public float WindupRemaining { get; private set; }
+        public bool IsWindingUp => WindupRemaining > 0.0f;
+
+        /// <summary>⚠️ A TRUE ROOT, and the stack takes the MINIMUM rather than the product, so
+        /// this cannot compound with fatigue or a hazard into something stranger than a stop.</summary>
+        private const float RootSpeed = 0.0f;
+
+        private CharacterMotor _rooted;
+        private AbilityContext _committedContext;
+        private bool _joiningPreparationSettled;
+        public bool SupportsPendingSnapshot { get; protected set; }
+        public bool SupportsPermanentSnapshot { get; protected set; }
+
+        // ------------------------------------------------------------------ charges
+        //
+        // ⚠️⚠️ AN ABILITY IS EITHER ON A COOLDOWN OR ON CHARGES, NEVER ON BOTH, AND WHICH ONE IT
+        // GETS FOLLOWS WHAT IT DOES RATHER THAN WHICH SLOT IT IS IN.
+        //
+        // 🧑 2026-08-25, on a build where four seats cast 44 to 56 times in a 90 s round:
+        // *"game feels awkward when theres 20 abilities at once and i think the fix to this is
+        // making the abilities timers longer? ... maybe make it like valorant wherein they have
+        // charges for their skill that they can use once per round"*, then *"for some skills
+        // they can have a cooldown instead of charges that reset each round, make it long tho
+        // like 30 seconds to 45 seconds"*.
+        //
+        // The rule the split follows, so it is not decided case by case:
+        //
+        //  * An ability that LEAVES AN OBJECT ON THE FLOOR takes CHARGES. A wall or a zone is a
+        //    decision the whole court then plays around, and scarcity is what makes placing it
+        //    interesting. Spending your last one is meant to hurt.
+        //  * An ability that MOVES OR PROTECTS YOUR OWN BODY takes a LONG COOLDOWN. A dash or an
+        //    armour is a reaction, and a reaction you have permanently spent is a character who
+        //    stops being able to play. A player holding their last escape charge does not
+        //    escape, they hoard, and `docs/VISION.md` § 4 forbids anything that rewards waiting.
+        //
+        // `docs/Hero_Strike_Balance.md` § 3.1 has the per-ability table and the reasoning.
+
+        /// <summary>
+        /// How many casts this ability gets per round, or **0 for a cooldown ability**.
+        ///
+        /// ⚠️ ZERO IS THE DEFAULT AND MEANS "NOT A CHARGE ABILITY", not "no casts". Every
+        /// ability shipped before 2026-08-25 is a cooldown ability and none of them had to
+        /// change to keep working.
+        /// </summary>
+        public int MaxCharges { get; protected set; }
+
+        public bool UsesCharges => MaxCharges > 0;
+
+        /// <summary>How many are left this round. Refilled by <see cref="ResetForRound"/>.</summary>
+        public int ChargesRemaining { get; protected set; }
+
+        /// <summary>
+        /// What play, if anything, hands a charge back mid-round.
+        ///
+        /// ⚠️⚠️ IT IS AN EVENT, NEVER A TIMER, AND THAT IS THE WHOLE POINT OF THE SPLIT. A charge
+        /// that comes back on a clock is a cooldown with extra bookkeeping, and it re-creates the
+        /// problem the charges were introduced to solve.
+        /// </summary>
+        public enum Recharge
+        {
+            /// <summary>It runs out. Most charge abilities.</summary>
+            Never,
+
+            /// <summary>
+            /// ⚠️ THE ACT THE WHOLE GAME IS BUILT AROUND, AND IT USED TO PAY NOTHING AT ALL.
+            /// `docs/VISION.md` § 0: *"The tension is the retrieval, not the throw."* Going back
+            /// in for your tsinelas is the only moment you can be caught, and before this the
+            /// game's entire reward for it was the tsinelas.
+            /// </summary>
+            OwnSlipperRetrieved,
+
+            /// <summary>The objective. Closes the loop on a skill that buffs a throw: charge it,
+            /// land it, get the charge back.</summary>
+            LataKnocked,
+        }
+
+        public Recharge RechargedBy { get; protected set; } = Recharge.Never;
+
+        /// <summary>
+        /// ⚠️⚠️ READY MEANS TWO DIFFERENT THINGS AND BOTH CALLERS USED TO ASSUME THE COOLDOWN
+        /// ONE. A charge ability's cooldown is 0 forever, so before this every charge ability
+        /// read as permanently ready and could be cast past empty.
+        /// </summary>
+        private bool _reservedForIntroduction;
+        public bool ReservedForIntroduction => _reservedForIntroduction;
+        protected bool HadSharedIntroduction { get; private set; }
+        /// <summary>
+        /// ⚠️ AN ULTIMATE WHOSE CUTSCENE ALREADY SHOWS IT LAND releases with no wind-up after that cutscene: the cutscene was
+        /// the warning. Cheska's shows every player frozen (owner 2026-10-08: "post-cutscene the players should be frozen";
+        /// asked whether the cutscene counts as her 1.5 s delay, "i pick 1"). False everywhere else, and a cast that did not
+        /// go through an introduction keeps its wind-up whatever this says.
+        /// </summary>
+        protected virtual bool IntroductionIsTheWindup => false;
+        /// <summary>
+        /// ⚠️ THE HERO'S OWN LINE ALREADY PLAYED INSIDE THE INTRODUCTION (REFINE-2.11: Phaister laughs
+        /// while she laughs). The live activation must not say it a second time. Set per peer by
+        /// `SharedUltimatePhase.Complete` from what that peer's view actually played, so a peer whose
+        /// view failed still hears the line from the live cast.
+        /// </summary>
+        internal bool IntroductionVoiced { get; set; }
+        public bool IsReady => !IsPersistentActive && !_reservedForIntroduction && (UsesCharges ? ChargesRemaining > 0 : CooldownRemaining <= 0.0f);
+        internal void ReserveForIntroduction()
+        {
+            if (_reservedForIntroduction) return;
+            _reservedForIntroduction = true;
+            HadSharedIntroduction = false; IntroductionVoiced = false;
+            if (UsesCharges) ChargesRemaining = Mathf.Max(0, ChargesRemaining - 1);
+            else CooldownRemaining = Cooldown;
+        }
+        internal void BeginReservedActivation(AbilityContext context)
+        {
+            if (!_reservedForIntroduction) return;
+            HadSharedIntroduction = true;
+            // Invoke the real override only now. Phaister's override creates the
+            // ritual, so reserving through Activate would start her warning early.
+            Activate(context);
+        }
+        internal void CancelIntroductionReservation() => _reservedForIntroduction = false;
+
+        public float CooldownRatio => Cooldown > 0.0f ? Mathf.Clamp01(CooldownRemaining / Cooldown) : 0.0f;
+        public float DurationRatio => IsPersistentActive ? 1 : Duration > 0.0f ? Mathf.Clamp01(DurationRemaining / Duration) : 0.0f;
+
+        /// <summary>
+        /// How wide the ground telegraph is, in metres, or 0 for a power that puts nothing on
+        /// the ground.
+        ///
+        /// ⚠️⚠️ IT LIVES ON THE ABILITY BECAUSE THE HUD USED TO INVENT IT.
+        /// `HeroAbilitySystem.UpdateReticle` drew 7.5 m for ANY ultimate, 5.0 m for ANY first
+        /// skill and 3.5 m for ANY second, and offset the ring forward only when the kit
+        /// happened to be Cheska's. So Dante's 2.4 m stomp drew a 5.0 m ring, Nemu's 3.2 m void
+        /// drew 7.5 m, and the void landed 3.5 m in front of the ring the player had just been
+        /// shown. **A telegraph that lies is worse than no telegraph**, because a player
+        /// believes it once and then stops believing all of them.
+        ///
+        /// Same reasoning as <see cref="Glyph"/>: a lookup table keyed by ability id is a
+        /// second place to forget, and a new hero would compile, run and draw three wrong
+        /// rings.
+        /// </summary>
+        public float TelegraphRadius { get; protected set; }
+
+        /// <summary>
+        /// How far in front of the caster the telegraph centre sits, in metres. 0 means it goes
+        /// off around the caster.
+        ///
+        /// ⚠️ IT MUST MATCH THE NUMBER THE `OnActivate` ACTUALLY SPAWNS AT. These two are the
+        /// same measurement written twice, which is the shape of drift `Design.md` opens by
+        /// warning about, so `TelegraphsMatchWhatTheAbilityActuallyPlaces` asserts the pair.
+        /// </summary>
+        public float TelegraphRange { get; protected set; }
+
+        public bool HasTelegraph => TelegraphRadius > 0.0f;
+
+        /// <summary>
+        /// Whether the telegraph also stands a mark up at the destination.
+        ///
+        /// ⚠️⚠️ IT IS FOR POWERS THAT PUT **YOU** SOMEWHERE, NOT POWERS THAT LAND SOMEWHERE. 🧑
+        /// 2026-08-27, on Phaister's blink: *"to teleport u have to hold her E skill and all it
+        /// shows is a frigging shadow, it's very easy to miss and not in her theme at all"*. A
+        /// ring on the road is exactly right for a zone: you look down and read whether you are
+        /// inside it. It is exactly wrong for a teleport: the player is looking along the street
+        /// at head height, where a flat decal five metres away is a few pixels of smudge.
+        ///
+        /// ⚠️ IT IS A FLAG RATHER THAN A SECOND TELEGRAPH SYSTEM. `GroundReticle` owns the mark
+        /// and draws it in the hero's own accent, so a future dash or recall gets it by setting
+        /// one bool rather than by writing a second reticle that will drift from this one.
+        /// </summary>
+        public bool AimBeacon { get; protected set; }
+
+        /// <summary>
+        /// Which face the ground telegraph wears for this ability.
+        ///
+        /// ⚠️ IT SITS BESIDE <see cref="AimBeacon"/> BECAUSE IT IS THE SAME KIND OF FACT: what
+        /// the telegraph should LOOK like, declared by the ability that knows, rather than
+        /// guessed at the draw site off the kit's type. `HeroAbilitySystem.UpdateReticle`'s own
+        /// note records what guessing there cost: nine of twelve numbers on screen disagreed
+        /// with the game.
+        ///
+        /// ⚠️ THE DEFAULT IS THE RING AND MOST ABILITIES MUST KEEP IT. A style per hero is a
+        /// second design system; see `GroundReticle.Style`.
+        /// </summary>
+        public Visual.GroundReticle.Style TelegraphStyle { get; protected set; }
+            = Visual.GroundReticle.Style.Ring;
+
+        // ------------------------------------------------------------------ the hero's own aim picture
+        //
+        // ⚠️⚠️ HERO-10 (Phaister, film v7, 2026-09-27): HOLDING HER SKILLS SHOWED NOTHING. On Bayan Plaza the shared ward never
+        // appeared under her 5 m aim, on her screen or the court's, and her body just stood there. Plan 4.1 and 4.5 ask for more
+        // than a ring anyway: her lunar sigil written where she will arrive with three moths circling it, and for OMEN the height
+        // the eye will hang at. These three hooks let a kit draw its own aim and act out its own tell, without a second reticle
+        // system: `HeroAbilitySystem` still decides WHEN something is being aimed and WHERE; the ability decides what it looks like.
+
+        /// <summary>True when this ability's own aim picture replaces the shared ground ring while it is held.</summary>
+        public virtual bool DrawsOwnAim => false;
+
+        /// <summary>
+        /// Called every frame this ability is being aimed on this peer, with where it would land now (a hold-to-aim power's
+        /// destination, its height included for `AimsInTheAir`) and how long it has been held. Private pictures must check that
+        /// the local camera follows <paramref name="caster"/>; a body's tell is for everyone who can see it.
+        /// </summary>
+        public virtual void PresentAim(CharacterMotor caster, Vector3 at, float heldSeconds) { }
+
+        /// <summary>Called once when the aim ends, cast or not (the release, a stun, the kit changing).</summary>
+        public virtual void EndAim() { }
+
+        /// <summary>Shared body props/tells while aiming; no private target point or gameplay mutation.</summary>
+        public virtual void PresentAimBody(CharacterMotor caster, float heldSeconds) { }
+        public virtual void EndAimBody() { }
+
+        /// <summary>
+        /// A clip the caster's body holds while this ability is aimed (her tells), or null for the shared stance. Only used when the
+        /// rig carries a clip of that name (`CharacterAnimator.AimPose`).
+        /// </summary>
+        public string AimPoseAction { get; protected set; }
+
+        // ------------------------------------------------------------------ hold to aim
+        //
+        // ⚠️⚠️ 🧑 2026-08-26, ON THE BLINK: *"let her HOLD e to control where she will go and make
+        // it a teleport abilitiy and make it prettier"*. Everything below is that, and it is
+        // written on the BASE class rather than inside Phaister's kit because the second ability
+        // that wants it must not have to reimplement the release edge, the cap and the auto-fire.
+        //
+        // ⚠️⚠️ AND IT IS THE ONE PLACE `docs/VISION.md` § 4 COULD BE BROKEN BY A FEATURE THAT
+        // SOUNDS HARMLESS. *"Nothing may reward waiting"* is a competitive requirement, not a
+        // mood, and the obvious implementation of hold-to-aim breaks it three separate ways: a
+        // hold that ROOTS you is a stall, a hold that PAUSES the anti-camp clock is a hiding
+        // place, and a hold with no ceiling is a player standing in a corner with an escape
+        // permanently half-pressed. So:
+        //
+        //   * The caster keeps full movement while aiming. There is no root and no slow.
+        //   * Nothing about aiming touches `RoundDirector`'s clocks. Holding E in the taya's
+        //     circle accrues exactly the penalty standing there always did.
+        //   * <see cref="MaxAimSeconds"/> is a hard ceiling: the power FIRES at it rather than
+        //     being cancelled, so the hold cannot be used as a parking brake and a player who
+        //     was genuinely aiming still gets their cast.
+        //   * The reach stops growing well before the ceiling, so the last half second of a hold
+        //     buys nothing at all. That is what actually removes the incentive to wait; the cap
+        //     alone would only bound it.
+
+        /// <summary>
+        /// True when the press begins AIMING and the release is what casts.
+        ///
+        /// ⚠️ IT CHANGES WHICH EDGE FIRES THE ABILITY, so `HeroAbilitySystem` has to know before
+        /// it services the input buffer. Everything else in the game casts on `JustPressed`.
+        /// </summary>
+        public bool HoldToAim { get; protected set; }
+
+        /// <summary>
+        /// ⚠️ A HOLD-TO-AIM CAST PLACED WHERE THE PLAYER LOOKS, NOT BY HOW LONG THEY HOLD (Paete's MAKILING'S EMBRACE, owner,
+        /// 2026-09-27: *"make it so that paete can choose as well where his ult will be cast"*, then *"does the hhold to aim resemble
+        /// the groot reference"*). Groot's walls in Marvel Rivals are placed where the crosshair meets the ground, with the preview
+        /// on it before you commit; the shared hold slides the ring out along the facing by hold time instead. With this set the ring
+        /// sits where the camera's sight line meets the court (`CameraRig.TryLookGround`), kept between `AimMinRange` and
+        /// `AimMaxRange` from the caster, and the release sends that spot as the cast's aim, so every peer lands it in the same place.
+        /// </summary>
+        public bool AimsWhereLooking { get; protected set; }
+
+        /// <summary>
+        /// ⚠️ PLACED IN THE AIR AS WELL AS ON THE COURT (HERO-10, Phaister's OMEN): the aimed spot keeps a HEIGHT, taken from where
+        /// the caster's sight line is at the aimed distance (`CameraRig.TryLookHeight`), clamped to AimMinHeight .. AimMaxHeight
+        /// above the court; a received aim keeps the height it was sent with, so every peer agrees.
+        /// </summary>
+        public bool AimsInTheAir { get; protected set; }
+        public float AimMinHeight { get; protected set; }
+        public float AimMaxHeight { get; protected set; }
+
+        /// <summary>Lets the aim carry a height between <paramref name="min"/> and <paramref name="max"/> metres. Call from a kit.</summary>
+        protected void AimInTheAir(float min, float max)
+        {
+            AimsInTheAir = true; AimMinHeight = min; AimMaxHeight = max;
+        }
+
+        /// <summary>
+        /// How long a hold may last before the ability fires on its own. Seconds.
+        /// <b>Zero means it never fires on its own: only the release casts it.</b>
+        ///
+        /// ⚠️⚠️ IT IS ZERO ON THE ONE ABILITY THAT USES IT, AND THE CEILING IS GONE BECAUSE 🧑
+        /// ASKED FOR IT AFTER PLAYING IT. 2026-08-27: *"u cant control the E of phaister and it
+        /// autocasts after some seconds, i want it to cast only when i let go"*. The old
+        /// derivation for 1.10 s is kept below because the reasoning is still sound about what
+        /// it was solving; it was solving the wrong thing.
+        ///
+        /// ⚠️⚠️ AND REMOVING IT DOES NOT BREAK `docs/VISION.md` § 4's *"nothing may reward
+        /// waiting"*, WHICH IS THE OBJECTION THE CEILING EXISTED TO ANSWER. Read the section
+        /// note above: the ceiling was only ever ONE of four defences, and it is the weakest.
+        /// The load-bearing one is that <see cref="AimRampSeconds"/> stops the reach growing at
+        /// 0.55 s, so every second of hold after the first half second buys the player exactly
+        /// nothing. A hold that pays out nothing is not a reward for waiting, it is a player
+        /// standing still in a 14 m arena with a taya walking toward them.
+        ///
+        /// The other two defences are untouched and are what make that safe: the caster keeps
+        /// full movement while aiming (there is no root and no slow), and nothing about aiming
+        /// touches `RoundDirector`'s anti-camp or anti-stall clocks, so holding E in the taya's
+        /// circle accrues exactly the penalty standing there always did.
+        ///
+        /// ⚠️ THE ORIGINAL DERIVATION, KEPT: 1.10 s was `HeroAbilitySystem.InputBufferWindow`
+        /// (0.30 s) plus twice the ramp, *"long enough that a player turning to look behind them
+        /// is never cut off, short enough that holding it is not a stance"*. What play showed is
+        /// that a player turning to look behind them takes longer than 1.10 s often enough to
+        /// matter, and being cut off mid-turn is indistinguishable from the game misfiring.
+        /// </summary>
+        public float MaxAimSeconds { get; protected set; } = 1.10f;
+
+        /// <summary>True when only the release may cast this, with no ceiling at all.</summary>
+        public bool CastsOnReleaseOnly => HoldToAim && MaxAimSeconds <= 0.0f;
+
+        /// <summary>Nearest the power can be aimed, in metres. The reach at zero hold.</summary>
+        public float AimMinRange { get; protected set; }
+
+        /// <summary>Furthest it can be aimed. Reached at <see cref="AimRampSeconds"/>.</summary>
+        public float AimMaxRange { get; protected set; }
+
+        /// <summary>
+        /// How long the reach takes to run from min to max.
+        ///
+        /// ⚠️ SHORTER THAN THE CEILING BY DESIGN. See the section note: a hold that keeps paying
+        /// out right up to its limit is a hold a player is rewarded for maxing every time, which
+        /// makes the ability one length with extra steps.
+        /// </summary>
+        public float AimRampSeconds { get; protected set; } = 0.55f;
+
+        /// <summary>How far this cast is aimed, for a hold of the given length.</summary>
+        public float AimRangeFor(float heldSeconds)
+        {
+            if (AimMaxRange <= 0.0f) return TelegraphRange;
+
+            float t = AimRampSeconds > 0.0f
+                ? Mathf.Clamp01(heldSeconds / AimRampSeconds)
+                : 1.0f;
+
+            return Mathf.Lerp(AimMinRange, AimMaxRange, t);
+        }
+
+        /// <summary>
+        /// How long the finger was down on the press that produced the cast currently running.
+        ///
+        /// ⚠️ WRITTEN BY `HeroAbilitySystem` IMMEDIATELY BEFORE `Activate`, AND READ INSIDE
+        /// `OnActivate`. It is a field rather than an `Activate` parameter because five kits and
+        /// eighteen abilities override `OnActivate` with the signature it has today, and adding
+        /// an argument that seventeen of them ignore is how a signature becomes noise.
+        /// </summary>
+        public float HeldSecondsOnCast { get; internal set; }
+
+        /// <summary>
+        /// Where this cast was aimed, for an <see cref="OnActivate"/> to spawn its effect at.
+        ///
+        /// ⚠️⚠️ IT IS THE RING THE PLAYER WAS LOOKING AT, NOT `ctx.Forward` RE-READ ON THE
+        /// RELEASE FRAME. Those are different points and the difference is a whole ability: the
+        /// player has been holding a mark on the ground for up to half a second, and a mouse
+        /// moves. `HeroAbilitySystem.AimDestination` reads the same `HeldSecondsOnCast` the
+        /// system wrote immediately before calling `Activate`, and it clamps X and Z
+        /// independently to the playable rectangle, which is `CLAUDE.md` § 4's *"the box is a
+        /// SQUARE, not a circle"*: a radial clamp and a square one disagree by 2.9 m on the
+        /// diagonal, exactly where somebody aims when they are cutting a corner.
+        ///
+        /// ⚠️ THE FALLBACK IS THE AIMED REACH ALONG THE CURRENT FACING, unclamped, and it is
+        /// reached only by a kit with no `HeroAbilitySystem` attached: a `dotnet test` fixture, a
+        /// headless probe, an editor showcase. Returning `Vector3.zero` there would put every
+        /// probe's hazard on the origin, which is the middle of the court.
+        ///
+        /// ⚠️ IT IS ON THE BASE CLASS SO THE FOUR KITS THAT AIM CANNOT WRITE FOUR SLIGHTLY
+        /// DIFFERENT VERSIONS OF IT. Phaister's blink had the only copy for a week; the moment a
+        /// second ability needed it, the choice was one method here or a growing family of
+        /// near-identical three-line reads. Same reasoning as `AimByHolding` itself.
+        /// </summary>
+        protected Vector3 AimedDestination(AbilityContext ctx)
+        {
+            if (ctx == null) return Vector3.zero;
+
+            return HeroAbilitySystem.AimDestination(this, ctx);
+        }
+
+        /// <summary>Turns this ability into a hold-to-aim cast. Call from a kit's constructor.</summary>
+        protected void AimByHolding(float minRange, float maxRange,
+                                    float rampSeconds = 0.55f, float maxHoldSeconds = 1.10f, bool whereLooking = false)
+        {
+            HoldToAim = true;
+            AimsWhereLooking = whereLooking;
+            AimMinRange = minRange;
+            AimMaxRange = maxRange;
+            AimRampSeconds = rampSeconds;
+            MaxAimSeconds = maxHoldSeconds;
+        }
+
+        /// <summary>
+        /// The bespoke 3rd-person body action name (e.g. "hero-sean-dash", "hero-dante-stomp").
+        /// </summary>
+        public string CastAction { get; protected set; }
+
+        /// <summary>
+        /// The bespoke 1st-person viewmodel action name (e.g. "thrust-fire", "stomp-heavy").
+        /// </summary>
+        public string ViewmodelAction { get; protected set; }
+
+        /// <summary>
+        /// The sound this ability makes when it is CAST, as an `AudioCues` id.
+        ///
+        /// ⚠️⚠️ IT EXISTS BECAUSE EIGHTEEN POWERS WERE SPEAKING WITH SIX VOICES. Measured
+        /// 2026-09-02 by reading the six kits: Sean's three all opened on `sfx_fire_whoosh`,
+        /// Zack's three on `sfx_lightning_strike`, two of Cheska's on `sfx_ice_freeze`, two of
+        /// Nemu's on `sfx_ghost_teleport`, two of Dante's on `sfx_explosion_heavy`. So a player
+        /// could hear WHICH HERO had cast something and never WHAT. 🧑: *"as well as add sfx for
+        /// each skill, for all character as well as the ones in loadout"*, *"make sure the sfx
+        /// matches wat the skill really does"*.
+        ///
+        /// ⚠️ IT IS THE VERB'S SOUND, NOT THE ELEMENT'S. A barricade is three things punching up
+        /// out of the road and a magnet is a thing dragged to your hand; neither of those is
+        /// "ice" or "lightning", and playing the element for all three is exactly what made them
+        /// interchangeable. `tools/generate_skill_audio.py` has one synth per ability and its
+        /// header carries the rule that no two of them are the same recipe.
+        ///
+        /// ⚠️⚠️ AND IT IS PLAYED IN ONE PLACE, `HeroAbilitySystem.PlayCastConfirm`, WHICH IS THE
+        /// SAME ARGUMENT `Glyph` AND `TelegraphRadius` WON. A cue played from inside each
+        /// `OnActivate` is eighteen places to forget, and a new hero would compile, run and cast
+        /// in silence. It also means the sound reaches every peer for free: that method is
+        /// already the one both the local cast and `ApplyNetworkCast` come through, and it plays
+        /// through `NetCue`. 🧑: *"make sure sfx can be heard by everyone in all modes / not js
+        /// client sided"*.
+        ///
+        /// ⚠️ EMPTY MEANS SILENT AND IS NOT AN ERROR. `NetCue.Play` is given nothing at all
+        /// rather than a missing id, which `AudioCues`'s own note records as the fault that cost
+        /// two months of silence on `sfx_lrt_pass`.
+        /// </summary>
+        public string CastCue { get; protected set; }
+
+        /// <summary>
+        /// The cue the equipped loadout alternate wants instead, or null for the slot's own.
+        ///
+        /// ⚠️ WRITTEN BY `HeroAbilitySystem.ApplyLoadoutToPresentation` AND BY NOTHING ELSE, in
+        /// the same pass that scales the telegraph. An alternate changes how the power behaves,
+        /// so it changes what the power sounds like doing it; Long Tremor sweeps feet instead of
+        /// throwing bodies, and its cue is a low horizontal sweep rather than a vertical slam.
+        ///
+        /// ⚠️ EXACTLY ONE OF THE TWO EVER PLAYS. It is not layered over `CastCue`, because two
+        /// sounds a frame apart for one press is a flam, which is the fault `sfx_lrt_rumble`'s
+        /// deletion records.
+        /// </summary>
+        public string VariantCastCue { get; internal set; }
+
+        /// <summary>The cue this cast should actually play.</summary>
+        public string EffectiveCastCue =>
+            string.IsNullOrEmpty(VariantCastCue) ? CastCue : VariantCastCue;
+
+        /// <summary>
+        /// What the equipped reading of this slot is called, and what it says it does.
+        ///
+        /// ⚠️⚠️ WITHOUT THESE, A BUILD IS INVISIBLE THE MOMENT THE MATCH STARTS, WHICH IS MOST OF
+        /// WHY THE HEROES FELT INTERCHANGEABLE. 🧑 2026-09-03: *"i dont want the ppl to feel like
+        /// the characters all js do the same shit"*. `docs/VISION.md` § 3 promises three layers
+        /// that stay in step: **Learn** on the character select, **Recall** on the hold key,
+        /// **Play** on the deck. The loadout board and the picker's ability rows already show
+        /// `AbilityVariant.Name`, so LEARN was right; `AbilityInspectPanel` and `StatusStack`
+        /// both drew `HeroAbility.Name`, so a player who equipped **ARC LINE** held the info key
+        /// mid-round and read **BOLT SPRINT** with the wrong sentence under it. The one screen
+        /// that exists to answer *"what did I bring"* answered with what everybody brings.
+        ///
+        /// ⚠️ IT IS `VariantCastCue`'s PATTERN EXACTLY, DELIBERATELY. Same writer
+        /// (`HeroAbilitySystem.ApplyLoadoutToPresentation`), same null-means-default fallback,
+        /// same `internal set`. A default build writes null into all three and every string in
+        /// the game is byte-identical to before this existed.
+        ///
+        /// ⚠️ THE GLYPH IS NOT HERE AND MUST NOT BE. `AbilityVariant.GlyphName` is the SLOT's
+        /// glyph for every reading of it, which is `VISION.md` § 3 rule 1: the icon says what the
+        /// power does to the WORLD, and a sidegrade does not change the job. Two icons for one
+        /// slot would teach the player that the icon means the build.
+        /// </summary>
+        public string VariantName { get; internal set; }
+
+        /// <summary>See <see cref="VariantName"/>.</summary>
+        public string VariantSummary { get; internal set; }
+
+        /// <summary>The name the player should read for this slot, in a match and out of one.</summary>
+        public string EffectiveName =>
+            string.IsNullOrEmpty(VariantName) ? Name : VariantName;
+
+        /// <summary>The one sentence the player should read for this slot.</summary>
+        public string EffectiveSummary =>
+            string.IsNullOrEmpty(VariantSummary) ? Summary : VariantSummary;
+
+        /// <summary>
+        /// The FULL text the hold-key panel should show for this slot.
+        ///
+        /// ⚠️⚠️ IT FALLS BACK TO `Description` AND NOT TO `Summary`, AND THE FIRST VERSION OF
+        /// THIS FELL BACK TO `Summary` AND QUIETLY SHORTENED THE ONE SCREEN THAT IS SUPPOSED TO
+        /// BE LONG. `docs/VISION.md` § 3 gives the RECALL layer *"the same, in full"*, against
+        /// the deck's *"icon, key, name"* and the character select's *"one sentence"*. Swapping
+        /// the panel's body to a one-liner would have made all three layers say the same short
+        /// thing, which is three layers doing one job.
+        ///
+        /// ⚠️ AN `AbilityVariant` HAS ONE STRING AND NOT TWO, so when a variant IS equipped its
+        /// own description is the best text that exists and is used for both. That is a real
+        /// asymmetry rather than an oversight: `Phase10Tests.EveryVariantRowFitsTheTileItIsDrawnOn`
+        /// caps a variant's description at 67 characters because it also has to fit the picker's
+        /// ability row, so there is no long form to fall back to.
+        /// </summary>
+        public string EffectiveDescription =>
+            string.IsNullOrEmpty(VariantSummary) ? KeyedDescription : VariantSummary;
+
+        /// <summary>The input action this ability's slot is cast with, read from its stable id.</summary>
+        public string InputAction => Id.EndsWith("_ultimate") ? "Ultimate" : Id.EndsWith("_skill1") ? "Skill1" : "Skill2";
+
+        /// <summary>
+        /// `Description` with its key marks (`{KEY}`, `{Grab}`, ...) filled with the player's live bindings
+        /// (`UI.AbilityKeys`). Every screen shows this; `Description` itself keeps the marks.
+        /// </summary>
+        public string KeyedDescription => UI.AbilityKeys.Fill(Description, InputAction);
+
+        /// <summary>
+        /// What this slot's button does RIGHT NOW, for the deck tile, the touch button, the hold-key panel, the cast callout and
+        /// the event feed. Normally the slot itself; a kit whose button does something else inside a state answers with what it
+        /// does then (Sean's E is VOLCANIC BOMB while he is Molten). The saved id, the loadout and the slot's own glyph never
+        /// change, so `Glyph`'s rule (one icon per slot in every build) still holds outside the state.
+        /// </summary>
+        public virtual string LiveName => EffectiveName;
+        public virtual UI.AbilityGlyph LiveGlyph => Glyph;
+        public virtual string LiveDescription => EffectiveDescription;
+
+        protected HeroAbility(string id, string name, string description, float cooldown,
+                              float duration = 0.0f,
+                              UI.AbilityGlyph glyph = UI.AbilityGlyph.Burst,
+                              string summary = null,
+                              float telegraphRadius = 0.0f,
+                              float telegraphRange = 0.0f,
+                              string castAction = null,
+                              string viewmodelAction = null,
+                              string castCue = null,
+                              int charges = 0,
+                              Recharge rechargedBy = Recharge.Never)
+        {
+            CastCue = castCue;
+
+            Id = id;
+            Name = name;
+            Description = description;
+            Summary = string.IsNullOrEmpty(summary) ? description : summary;
+            Cooldown = cooldown;
+            Duration = duration;
+            Glyph = glyph;
+            TelegraphRadius = telegraphRadius;
+            TelegraphRange = telegraphRange;
+            CastAction = castAction;
+            ViewmodelAction = viewmodelAction ?? castAction;
+            MaxCharges = charges;
+            ChargesRemaining = charges;
+            RechargedBy = rechargedBy;
+        }
+
+        /// <summary>
+        /// Applies the checked loadout to the numbers the deck and reticle expose. The effect
+        /// call site still uses the same scale, so the promise and the result move together.
+        /// </summary>
+        internal void ScaleLoadout(float duration = 1.0f, float telegraphRadius = 1.0f,
+                                   float telegraphRange = 1.0f, float aimMax = 1.0f,
+                                   float aimRamp = 1.0f)
+        {
+            Duration *= Mathf.Max(0.05f, duration);
+            TelegraphRadius *= Mathf.Max(0.05f, telegraphRadius);
+            TelegraphRange *= Mathf.Max(0.05f, telegraphRange);
+            AimMaxRange *= Mathf.Max(0.05f, aimMax);
+            AimRampSeconds *= Mathf.Max(0.05f, aimRamp);
+        }
+
+        internal void RestoreLoadoutTuning(HeroAbility authored)
+        {
+            if (authored == null) return;
+            // Only authored tuning changes. Live durations own grants that must
+            // end normally; readiness and charges must not refresh on roster sync.
+            Duration = authored.Duration;
+            TelegraphRadius = authored.TelegraphRadius;
+            TelegraphRange = authored.TelegraphRange;
+            AimMaxRange = authored.AimMaxRange;
+            AimRampSeconds = authored.AimRampSeconds;
+        }
+
+        // -------------------------------------------------------------------
+        // § WHAT A REJOINING PLAYER GETS BACK
+        //
+        // ⚠️⚠️ 🧑 2026-08-27, ON THE NETWORKING: *"or if u retain ur skill cooldowns and charges
+        // and shi"*. The answer before this existed was NO, AND IT WAS AN EXPLOIT RATHER THAN A
+        // COSMETIC GAP. `MatchRpc.BroadcastWorldSnapshot` sends the round number, the defender
+        // slot, the clock, the scores, the lata, the slippers, the picks and the unit transforms.
+        // **It has never sent one byte of ability state**, so a client that dropped and came back
+        // rebuilt its kit from the constructor: every cooldown zero, every charge full, the
+        // ultimate meter empty.
+        //
+        // ⚠️⚠️ BOTH DIRECTIONS ARE WRONG AND ONLY ONE OF THEM IS OBVIOUS. Reconnecting to refresh
+        // a 62 s cooldown is the cheat everybody thinks of first. The one that actually gets
+        // reported is the other half: a player who had banked 115 charge toward an ultimate loses
+        // all of it to a dropped packet, which reads as the game stealing a round's work.
+        //
+        // ⚠️ AND THE HOST NEVER HAD THE BUG, WHICH IS WHY IT SURVIVED. The host's own kits are
+        // continuous objects that were never rebuilt, so nothing about this is visible in a
+        // single-machine test or to the person running the lobby.
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// Overwrites this ability's live timers with the host's.
+        ///
+        /// ⚠️⚠️ IT DELIBERATELY DOES NOT TOUCH `DurationRemaining`, AND THAT IS A CORRECTNESS
+        /// RULE RATHER THAN AN OMISSION. A duration is not a number, it is a GRANT that `OnEnd`
+        /// has to take back: `Reset`'s own header records that zeroing one behind an ability's
+        /// back leaves Demonic Carapace's stun immunity and Phantom Phase's tag immunity switched
+        /// on with no timer left to switch them off. Writing a duration in from the wire would do
+        /// the same thing from a second direction, and a rejoiner would arrive permanently
+        /// unstunnable. A running duration expires on its own within seconds; a cooldown does
+        /// not, which is why only the cooldown is worth carrying across the wire at all.
+        /// </summary>
+        public void ApplyNetworkSnapshot(float cooldownRemaining, int chargesRemaining,
+                                         bool mayLower = true)
+        {
+            // ⚠️⚠️ `mayLower` IS WHAT STOPS AN ABILITY BEING SPAMMED ON A LOSSY LINK, and it is
+            // false for exactly one peer: the one that owns this seat, while a round is live.
+            // 🧑 2026-08-29, of Phaister: *"si phaister need ayusin yung 2nd ability kasi
+            // spammable teleport (lan problem)"*, and later *"phaister ability works right
+            // everywhere else except for lan"*, *"its spammable in lan, weirdly"*.
+            //
+            // The chain, and none of it is Phaister-specific:
+            //
+            //   1. A client casts. `HeroAbilitySystem.Cast` predicts locally, which spends the
+            //      cooldown on the client, and sends `RequestAbilityCast`.
+            //   2. The host checks `PlausibleIntentPose`: is the pose the client claims within
+            //      `IntentPoseLeeway` 2.25 m of the host's own copy of that body? If not, the
+            //      request is DROPPED. Silently, and correctly as far as that guard goes.
+            //   3. Because it dropped, the host never ran `Activate`, so the host's copy of that
+            //      kit still reads a cooldown of ZERO.
+            //   4. The next `BroadcastAbilityState` sends that zero to everyone, and the OWNER
+            //      assigned it straight over the cooldown it had just spent. Ready again, one
+            //      snapshot later, for as long as the player kept pressing.
+            //
+            // ⚠️ AND THAT IS WHY IT WAS LAN-ONLY, WHICH IS THE PART THAT LOOKS IMPOSSIBLE.
+            // Nothing here branches on the transport. Step 2 fails when the host's copy of a
+            // moving body is more than 2.25 m stale, which is 375 ms at a sprint, and until this
+            // batch `SyncUnit` and `SubmitMove` went out `ReliableSequenced`: one lost packet
+            // head-of-line blocked the whole pose stream and delivered the backlog in a burst.
+            // Hamachi has real loss and a smaller MTU, so the LAN sessions produced those stalls
+            // and the relay sessions did not. `MatchRpc.PoseDelivery` attacks the same root from
+            // the transport end; this is the half that holds even when a packet does go missing.
+            //
+            // ⚠️ THE HOST CAN STILL MAKE AN ABILITY UNAVAILABLE, which is the direction authority
+            // actually needs. It may raise a cooldown on anybody at any time. What it may no
+            // longer do is hand the owner a cast back by reporting a state it reached by refusing
+            // to act.
+            float wanted = Mathf.Max(0.0f, cooldownRemaining);
+            CooldownRemaining = mayLower ? wanted : Mathf.Max(CooldownRemaining, wanted);
+
+            if (UsesCharges)
+            {
+                int clamped = Mathf.Clamp(chargesRemaining, 0, MaxCharges);
+                ChargesRemaining = mayLower ? clamped : Mathf.Min(ChargesRemaining, clamped);
+            }
+        }
+
+        /// <summary>
+        /// Hands one charge back, up to the cap. Called by <see cref="HeroKit"/> when the match
+        /// reports the event this ability is keyed to.
+        /// </summary>
+        public void GrantCharge()
+        {
+            if (!UsesCharges) return;
+            ChargesRemaining = Mathf.Min(MaxCharges, ChargesRemaining + 1);
+        }
+
+        /// <summary>
+        /// Puts the two numbers that gate a NEW cast back to ready, and touches nothing else.
+        ///
+        /// ⚠️⚠️ IT IS NOT `Reset` AND IT MUST NOT BECOME IT. `Reset` also clears
+        /// `DurationRemaining` without running <see cref="OnEnd"/>, which is the fault
+        /// `HeroKit.Reset` carries a whole note about: an ability caught mid-duration has its
+        /// grant left switched on with no timer left to switch it off, and Dante would spend the
+        /// rest of the round unstunnable. This runs EVERY FRAME while the sandbox is on, so that
+        /// would not be an edge case, it would be the normal outcome of holding a skill key.
+        ///
+        /// ⚠️ ONLY <see cref="PracticeSandbox"/> CALLS IT, and the name says so on purpose. A
+        /// method called `ClearCooldown` invites a gameplay caller; there is no legitimate one,
+        /// because every cooldown in the game is a balance number.
+        /// </summary>
+        public void RefillForSandbox(bool cooldown = true, bool charges = true)
+        {
+            if (cooldown) CooldownRemaining = 0.0f;
+            if (charges && UsesCharges) ChargesRemaining = MaxCharges;
+        }
+
+        public virtual AbilityContext CaptureLocalCastContext(AbilityContext ctx) => ctx;
+
+        public virtual bool AllowsImpairedCast(AbilityContext ctx) => false;
+
+        public virtual bool CanActivate(AbilityContext ctx)
+        {
+            if (ctx == null || ctx.Motor == null) return false;
+            if (!IsReady) return false;
+
+            // ⚠️ A WIND-UP ALREADY RUNNING IS NOT A SECOND CAST. Without this a player mashing
+            // the ultimate key during the beat would re-enter the speed zone once per press and
+            // exit it once, leaving one root behind for every extra press.
+            if (IsWindingUp) return false;
+
+            if (!ctx.Motor.CanAct() && !AllowsImpairedCast(ctx)) return false;
+            return true;
+        }
+
+        public virtual void Activate(AbilityContext ctx)
+        {
+            AcceptedCastEvent = 0;
+            AcceptedUltimatePhase = 0;
+            _joiningPreparationSettled=true;
+            // ⚠️ A CHARGE ABILITY SPENDS A CHARGE AND NOTHING ELSE. Setting `CooldownRemaining`
+            // as well would put it behind two gates, and the deck would then draw it as Cooling
+            // while it still had charges in hand: `Cooldown` is 0 on every charge ability, so
+            // this is written as a branch rather than relying on that to stay true.
+            if (!_reservedForIntroduction)
+            {
+                HadSharedIntroduction = false;
+                if (UsesCharges) ChargesRemaining = Mathf.Max(0, ChargesRemaining - 1);
+                else CooldownRemaining = Cooldown;
+            }
+            _reservedForIntroduction = false;
+
+            // ⚠️ THE RESOURCE IS SPENT AT THE PRESS, BEFORE THE WIND-UP, and that is deliberate:
+            // the cast is committed the moment it starts, which is what lets the wind-up be
+            // uninterruptible without any refund path. See the block above.
+            //
+            // ⚠️ NO MOTOR MEANS NO WIND-UP. The EditMode ability tests drive `Activate(null)` and
+            // assert the effect synchronously, and a headless harness has nothing to root and no
+            // `Tick` loop to finish the cast. Falling straight through keeps those honest.
+            if (Windup > 0.0f && ctx != null && ctx.Motor != null && !(HadSharedIntroduction && IntroductionIsTheWindup))
+            {
+                WindupRemaining = Windup;
+                // Hold the accepted release aim through the delay. A replica's live
+                // intent is not the sender's cast and can point somewhere else.
+                _committedContext = ctx.Capture();
+
+                _rooted = ctx.Motor;
+                _rooted.EnterSpeedZone(RootSpeed);
+                return;
+            }
+
+            DurationRemaining = Duration;
+            if (DefersPredictedEffect && NetAuthority.IsNetworked && !NetAuthority.IsHost
+                && ctx?.Motor != null && ctx.Motor.PlayerSlot == NetAuthority.LocalSlot
+                && !ctx.IsApprovedReplay) return;
+            OnActivate(ctx);
+        }
+
+        /// <summary>
+        /// Lets the caster move again.
+        ///
+        /// ⚠️⚠️ EVERY PATH OUT OF A WIND-UP MUST REACH THIS. A speed zone is entered on one
+        /// object and exited on another call, so an ability that leaves a wind-up without
+        /// exiting leaves the player rooted at 0.0 for the rest of the match with nothing left
+        /// to release it. This is the same class of leak `ResetForRound`'s note describes for
+        /// Carapace's stun immunity, and it is worse, because a rooted player cannot play at all.
+        /// </summary>
+        private void ReleaseRoot()
+        {
+            if (_rooted == null) return;
+
+            _rooted.ExitSpeedZone(RootSpeed);
+            _rooted = null;
+        }
+
+        public long AcceptedCastEvent { get; private set; }
+
+        // A command belongs to its original effect lifetime, not a new spawn.
+        // The host and approved playback call this after accepting the initial cast.
+        public void AdoptAcceptedCastEvent(long eventId, bool reactivation)
+        {
+            if (reactivation || eventId <= 0) return;
+            AcceptedCastEvent = eventId;
+            OnAcceptedCastEvent(eventId);
+        }
+
+        protected virtual void OnAcceptedCastEvent(long eventId) { }
+
+        // Shared cohorts have their own identity space, separate from ordinary
+        // cast receipts. Deferred spawns retain this until their activation runs.
+        public long AcceptedUltimatePhase { get; private set; }
+        public void AdoptUltimatePhase(long phaseId)
+        {
+            if (phaseId <= 0 || phaseId == AcceptedUltimatePhase) return;
+            AcceptedUltimatePhase = phaseId;
+            OnAcceptedUltimatePhase(phaseId);
+        }
+        protected virtual void OnAcceptedUltimatePhase(long phaseId) { }
+
+        public virtual void Tick(AbilityContext ctx, float dt)
+        {
+            // ⚠️⚠️ THE COOLDOWN IS THE ONLY QUANTITY A MAP MAY SPEED UP, AND IT IS SCALED HERE
+            // RATHER THAN AT THE CALL SITE ON PURPOSE. `HeroAbilitySystem` hands `Tick` one `dt`
+            // that also drives `DurationRemaining` and, through `HeroKit`, the ultimate charge.
+            // Scaling that `dt` would shorten every live effect and fill the meter faster, and
+            // `docs/VISION.md` § 4 forbids the second of those outright: a meter that fills on a
+            // timer is a reason to stand still. Scaling only the drain pays a player who is
+            // already casting, which is the point of the window.
+            //
+            // Everywhere except under the LRT guideway on Ilalim ng Tulay this is 1.0.
+            if (CooldownRemaining > 0.0f)
+                CooldownRemaining = Mathf.Max(0.0f, CooldownRemaining - dt * OverheadPassWindow.CooldownRate);
+
+            // ⚠️ THE WIND-UP RUNS BELOW THE COOLDOWN AND ABOVE THE DURATION. The cooldown must
+            // keep draining (the ability is spent either way), and the duration must NOT start
+            // until the effect actually exists, or a 0.4 s wind-up would silently eat 0.4 s off
+            // every ultimate's live time.
+            //
+            // ⚠️ NOTHING HERE CAN CANCEL IT. There is no stun check and no `CanAct` check on
+            // purpose: see the wind-up block at the top of the class.
+            if (WindupRemaining > 0.0f)
+            {
+                WindupRemaining = Mathf.Max(0.0f, WindupRemaining - dt);
+                if (WindupRemaining > 0.0f) return;
+
+                ReleaseRoot();
+
+                DurationRemaining = Duration;
+                var committed=_committedContext??ctx;
+                _committedContext=null;
+                OnActivate(committed);
+                return;
+            }
+
+            // A deferred effect has not been initialized yet. Its cooldown is spent,
+            // but ticking its live state now can destroy a grant before confirmation.
+            if (DefersPredictedEffect && ctx?.Motor?.AbilitySystem?.AwaitingSkillEffect(this) == true) return;
+
+            if (DurationRemaining > 0.0f)
+            {
+                DurationRemaining = Mathf.Max(0.0f, DurationRemaining - dt);
+                OnTick(ctx, dt);
+
+                if (DurationRemaining <= 0.0f)
+                    OnEnd(ctx);
+            }
+        }
+
+        public virtual Vector3 TelegraphCentre(AbilityContext context)
+            => context.Position + context.Forward * TelegraphRange;
+
+        /// <summary>
+        /// A HELD COMMAND instead of a cast: asked on the press edge on the owner's screen. True takes this press away from the
+        /// cast buffer entirely and routes it, frame by frame until release, to <see cref="StepHeldCommand"/>. Used by Zack's
+        /// Live Wire reel-in (look at your own wire and hold) and his Overclock zap (hold the ultimate while Overclocked). The
+        /// ability owns any request it sends; nothing here spends a cooldown or a charge.
+        /// </summary>
+        public virtual bool TakesHeldCommand(AbilityContext ctx) => false;
+
+        /// <summary>One frame of a held command. <paramref name="down"/> false is the release (or a loss of control) and the last call.</summary>
+        public virtual void StepHeldCommand(AbilityContext ctx, bool down, float heldSeconds) { }
+
+        public virtual bool CanReactivate => false;
+
+        /// <summary>
+        /// ⚠️ WHETHER A SECOND PRESS WOULD DO ANYTHING RIGHT NOW (owner, 2026-09-26, of Paete's BAKYA BLOOM: *"bug found unli
+        /// cast for e, supposed to have cooldown"*). A reactivating ability whose second press has nothing to act on (a pod with
+        /// no clog grown yet) answers false: the press is refused as NOT YET, so it plays no gesture and no sound and sends no
+        /// request, instead of looking like an endless cast. True by default, so every other ability is unchanged.
+        /// </summary>
+        public virtual bool ReactivateReady => true;
+
+        /// <summary>Seconds until <see cref="ReactivateReady"/> turns true, for the deck's label (0 when it is ready).</summary>
+        public virtual float ReactivateReadyIn => 0.0f;
+
+        public virtual void Reactivate(AbilityContext ctx)
+        {
+            EndEarly(ctx);
+        }
+
+        /// <summary>
+        /// Takes back a cast this peer PREDICTED and the host then refused.
+        ///
+        /// ⚠️⚠️ IT EXISTS BECAUSE THE HOST USED TO REFUSE SILENTLY AND THE OWNER PAID FOR IT.
+        /// `HeroAbilitySystem.Cast` runs the kit locally before it asks, so by the time
+        /// `MatchRpc.OnReqAbilityMsg` drops the request on `PlausibleIntentPose` the client has
+        /// already spent the cooldown, played the confirm and drawn the effect. Nothing came
+        /// back, so the player was charged a full cooldown for an ability that never happened on
+        /// the machine that decides what happened. `ApplyNetworkSnapshot`'s `mayLower` guard, which
+        /// is `docs/TODO.md` § 71's Phaister fix, is what stops the host handing the cast straight
+        /// BACK a snapshot later, and it is deliberately one-directional: it closed the spam and
+        /// it made the silent refusal permanent instead of self-healing. This is the other
+        /// direction, and it is the one the owner actually needs.
+        ///
+        /// ⚠️⚠️ IT IS NOT `Reset()`. Reset zeroes `DurationRemaining` behind the ability's back,
+        /// and `ResetForRound`'s note records at length what that leaks: Demonic Carapace's stun
+        /// immunity and Phantom Phase's tag immunity are GRANTS handed out in `OnActivate` and
+        /// taken back in `OnEnd`, so dropping the timer without running `OnEnd` leaves a client
+        /// permanently unstunnable off a refused cast. `EndEarly` is the path that ends a live
+        /// effect properly and is a no-op when nothing is running.
+        ///
+        /// ⚠️⚠️ AND THE WIND-UP HAS TO COME OFF FIRST, FOR THE REASON `Reset` GIVES. A refusal can
+        /// land during the wind-up beat, when `OnActivate` has NOT run yet and the caster is
+        /// rooted in a speed zone that only `ReleaseRoot` can exit. Zeroing `WindupRemaining`
+        /// without releasing would strand the player at `RootSpeed` for the rest of the match with
+        /// nothing left to let them go, which is the worst outcome in this file.
+        ///
+        /// ⚠️ THE REFUND IS THE EXACT INVERSE OF WHAT `Activate` SPENT, and it is written as the
+        /// same branch so the two cannot drift: a charge ability spends a charge and nothing else,
+        /// so it gets the charge back and its cooldown is not touched.
+        ///
+        /// ⚠️ THE CAP IS REAL. `GrantCharge` clamps to `MaxCharges` and this goes through it, so a
+        /// duplicated or replayed refusal cannot mint charges.
+        /// </summary>
+        public void RollBackPredictedCast(AbilityContext ctx, bool refundResources = true)
+        {
+            ReleaseRoot();
+            WindupRemaining = 0.0f;
+            _committedContext=null;
+
+            CancelActive(ctx);
+
+            if(refundResources) { if (UsesCharges) GrantCharge();
+            else CooldownRemaining = 0.0f; }
+        }
+
+        public void EndEarly(AbilityContext ctx)
+        {
+            if (DurationRemaining > 0.0f)
+            {
+                DurationRemaining = 0.0f;
+                OnEnd(ctx);
+            }
+        }
+
+        public void ReduceCooldown(float seconds)
+        {
+            if (!float.IsFinite(seconds) || seconds <= 0) return;
+            CooldownRemaining = Mathf.Max(0, CooldownRemaining - seconds);
+        }
+
+        public virtual void Reset()
+        {
+            AcceptedCastEvent = 0;
+            AcceptedUltimatePhase = 0;
+            _reservedForIntroduction = false;
+            // ⚠️ THE ROOT COMES OFF FIRST. A round can end mid-wind-up, and `Reset` zeroing the
+            // timer behind the wind-up's back would strand the speed zone with nothing left to
+            // release it. See `ReleaseRoot`.
+            ReleaseRoot();
+            WindupRemaining = 0.0f;
+            _committedContext=null;
+
+            CooldownRemaining = 0.0f;
+            DurationRemaining = 0.0f;
+
+            // ⚠️⚠️ CHARGES REFILL AT A ROUND BOUNDARY AND ONLY THERE. 🧑 2026-08-25: *"a cooldown
+            // instead of charges that reset each round"*. Four rounds is four fresh sets, so a
+            // player who spends everything in round one is not punished for the rest of the
+            // match, and one who hoards gains nothing by carrying them over. That symmetry is
+            // what stops the charge economy from rewarding a quiet round, which
+            // `docs/VISION.md` § 4 forbids.
+            ChargesRemaining = MaxCharges;
+        }
+
+        /// <summary>
+        /// The round-boundary reset: end cleanly first, THEN zero.
+        ///
+        /// ⚠⚠ THE PARAMETERLESS `Reset` DROPS `DurationRemaining` WITHOUT RUNNING `OnEnd`,
+        /// and for the abilities that grant something for a duration that is a leak, not a
+        /// reset. Demonic Carapace hands out stun immunity in `OnActivate` and takes it back in
+        /// `OnEnd`; Phantom Phase does the same for tag immunity. Zeroing the timer behind their
+        /// backs at a round boundary leaves the grant switched on with no timer left to switch
+        /// it off, so a hero who happened to be mid-Carapace when the round ended would start
+        /// the next one permanently unstunnable.
+        ///
+        /// `EndEarly` is a no-op when nothing is running, so this is safe on every ability.
+        /// </summary>
+        public void ResetForRound(AbilityContext ctx)
+        {
+            CancelActive(ctx);
+            Reset();
+        }
+
+        private void CancelActive(AbilityContext ctx)
+        {
+            if (DurationRemaining<=0) return;
+            DurationRemaining=0;
+            OnCancelled(ctx);
+        }
+
+        // Most cancellation only releases an existing grant. A recalled familiar
+        // also relocates its owner on normal completion, which a denied/reset cast
+        // must never do. Keep that distinction explicit without changing recasts.
+        // Rehydrate an already accepted live effect without spending resources or
+        // replaying the activation callback. Used by explicit familiar snapshots.
+        protected void RestoreLiveClock(float remaining)
+        {
+            ReleaseRoot();_committedContext=null;WindupRemaining=0;
+            DurationRemaining=Mathf.Clamp(remaining,0,Duration);
+        }
+
+        public bool CapturePendingPreparation(out AbilityContext context,out float remaining)
+        {
+            context=_committedContext;remaining=WindupRemaining;
+            return SupportsPendingSnapshot && IsWindingUp && context!=null;
+        }
+
+        // Initial state belongs only to a new ability instance. A known cast or
+        // an already-settled empty snapshot cannot be restarted by an older reply.
+        public bool RestoreJoiningPreparation(AbilityContext context,float remaining,float heldSeconds)
+        {
+            if(!SupportsPendingSnapshot || _joiningPreparationSettled || IsWindingUp || IsActive
+                || context?.Motor==null || float.IsNaN(remaining) || float.IsInfinity(remaining)
+                || float.IsNaN(heldSeconds) || float.IsInfinity(heldSeconds)
+                || remaining<0 || remaining>Windup+.0001f || heldSeconds<0)return false;
+            _joiningPreparationSettled=true;
+            if(remaining<=0)return false;
+            HeldSecondsOnCast=heldSeconds;
+            RestoreWindupClock(context,remaining);
+            return true;
+        }
+
+        // Restore an accepted preparation without spending resources or invoking
+        // its activation callback. Normal completion still releases the root.
+        protected void RestoreWindupClock(AbilityContext ctx, float remaining)
+        {
+            ReleaseRoot();
+            DurationRemaining = 0;
+            WindupRemaining = Mathf.Clamp(remaining, 0, Windup);
+            _committedContext = ctx.Capture();
+            if (WindupRemaining > 0 && ctx.Motor != null)
+            {
+                _rooted = ctx.Motor;
+                _rooted.EnterSpeedZone(RootSpeed);
+            }
+        }
+
+        protected virtual void OnCancelled(AbilityContext ctx) => OnEnd(ctx);
+
+        protected virtual void OnActivate(AbilityContext ctx) { }
+        protected virtual void OnTick(AbilityContext ctx, float dt) { }
+        protected virtual void OnEnd(AbilityContext ctx) { }
+    }
+}

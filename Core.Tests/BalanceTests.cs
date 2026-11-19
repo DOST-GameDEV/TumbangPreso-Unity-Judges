@@ -1,0 +1,1347 @@
+using System.Linq;
+using System.Collections.Generic;
+using TumbangPreso.Core;
+using Xunit;
+
+namespace TumbangPreso.Core.Tests
+{
+    /// <summary>
+    /// THE VERIFICATION SPINE OF THE PORT.
+    ///
+    /// Design.md does not merely list the tuning, it records the MEASUREMENTS taken
+    /// against it: probes were built, whole matches were run, and the results were written
+    /// down. Those measurements are what make the balance a fact rather than an intention,
+    /// and reproducing them here is what converts "we think the port preserved the tuning"
+    /// into something a build answers in under a second.
+    ///
+    /// ⚠️ WHERE A TEST DISAGREES WITH Design.md, IT ASSERTS THE CODE AND SAYS SO IN A
+    /// COMMENT. Three numbers have drifted between the doc and the GDScript and in every
+    /// case the code is the newer half. A test written against the stale half would fail
+    /// against a correct port, which is the worst possible outcome for a safety net.
+    /// docs/Port_Plan.md §7.1 tracks all three for reconciliation upstream.
+    /// </summary>
+    public class BalanceTests
+    {
+        private const float Tol = 0.001f;
+
+        [Fact]
+        public void LeavingTheCanDownCostsTheTayaAfterSevenSeconds()
+        {
+            Assert.Equal(-5, MatchRules.PointsFor(ScoreEvent.CanDownPenalty));
+            Assert.False(TournamentRules.IsCanDownPenalty(6.9f));
+            Assert.True(TournamentRules.IsCanDownPenalty(7.0f));
+            Assert.True(TournamentRules.IsCanDownWarning(2.5f));
+            Assert.False(MatchRules.IsChainBonus(ScoreEvent.CanDownPenalty));
+            Assert.Equal((int)ScoreEvent.MultiCatch + 1, (int)ScoreEvent.CanDownPenalty); // appended for the wire
+        }
+
+        [Fact]
+        public void ShortMatchesChargeUltimatesFasterAndEightRoundsAreUnchanged()
+        {
+            Assert.Equal(1.0f, Balance.UltimateChargeScale(8), 3);
+            Assert.Equal(2.0f, Balance.UltimateChargeScale(4), 3); // October 22: ults were rare in 4 rounds.
+            Assert.Equal(1.0f, Balance.UltimateChargeScale(0), 3);
+            Assert.True(Balance.UltimateChargeScale(1) <= 3.0f);
+        }
+
+        // ===================================================================
+        // STAMINA
+        // ===================================================================
+
+        /// <summary>
+        /// Sprint to empty.
+        ///
+        /// ⚠️ ASSERTS 1.5 s, WHERE Design.md's PROSE SAYS 1.25 s. ✅ RESOLVED 2026-08-15:
+        /// the code is right. The pool went 50 → 60 in commit 071061c, on instruction, and
+        /// deliberately: the box had grown, and the raise restored the property that ONE
+        /// SPRINT CROSSES THE DANGER ZONE, which is the retrieval the whole game is about.
+        /// The commit puts a full sprint at 8.2 m against the doc's 6.84.
+        ///
+        /// So the doc's headline stamina finding is the number from BEFORE the correction,
+        /// which is exactly why it reads as contradicting its own table. This is the
+        /// interlock between the pool and the box working, not breaking.
+        /// </summary>
+        [Fact]
+        public void SprintToEmpty_TakesPoolOverDrainRate()
+        {
+            var s = new Stamina();
+            const float dt = 1.0f / 60.0f;
+            float elapsed = 0.0f;
+
+            while (s.Current > 0 && elapsed < 10.0f)
+            {
+                s.Step(dt, moving: true, sprintHeld: true);
+                elapsed += dt;
+            }
+
+            Assert.False(s.IsFatigued);
+            Assert.False(s.IsSprinting);
+            Assert.Equal(Balance.StaminaMax / Balance.StaminaDrainRate, elapsed, 1);
+
+            // ⚠️ 2.1, UP FROM 1.5, AND THE SECONDS ARE NOT THE THING BEING GUARDED. The drain
+            // went 40 → 24 → 29 across 2026-08-29 so a full bar would keep buying the same
+            // DISTANCE while the attacker speed was cut and then partly restored (§§ 83.1b and
+            // 83.23); the pool is unchanged throughout, so every fraction priced against it —
+            // the shove's 25, the sprint floor's 7.5 — is unchanged too.
+            //
+            // ⚠️ THE LITERAL EARNS ITS PLACE ANYWAY, because the line above it is a tautology:
+            // it restates the formula `Stamina` implements and would pass at any drain rate.
+            // This one says what that formula currently WORKS OUT TO, which is the number a
+            // player experiences. `ASprintBuysOneCrossingOfTheDangerZone` holds the invariant
+            // that says whether it is the right number.
+            Assert.Equal(2.5f, elapsed, 1);
+        }
+
+        [Fact]
+        public void EmptyBarRegeneratesAfterTheNormalDelayAndCanSprintAgain()
+        {
+            var s = DrainedToEmpty();
+            Assert.False(s.IsFatigued);
+            s.Step(.5f, moving: true, sprintHeld: true);
+            Assert.Equal(0, s.Current);
+            Assert.False(s.IsSprinting);
+            s.Step(.5f, moving: true, sprintHeld: true);
+            Assert.Equal(50f, s.Current);
+            s.Step(.1f, moving: true, sprintHeld: true);
+            Assert.True(s.IsSprinting);
+            Assert.Equal(40f, s.Current);
+        }
+
+        [Fact]
+        public void DepletionAndLegacySnapshotsDoNotAddFatigueZonesOrRemoveHazards()
+        {
+            var zones = new SpeedZoneStack();
+            zones.Enter(.5f);
+            var s = new Stamina(zones);
+            Assert.True(s.Spend(Balance.StaminaMax));
+            Assert.False(s.IsFatigued);
+            Assert.Equal(1, zones.Count);
+            Assert.Equal(.5f, zones.Value);
+            s.ApplyNetworkSnapshot(50, 0, 2.5f);
+            s.ApplyNetworkSnapshot(50, 0, 2.5f);
+            Assert.False(s.IsFatigued);
+            Assert.Equal(0, s.FatigueLeft);
+            Assert.Equal(1, zones.Count);
+            Assert.Equal(.5f, zones.Value);
+            s.ApplyNetworkSnapshot(50, 0, 0);
+            Assert.Equal(1, zones.Count);
+        }
+
+        [Fact]
+        public void EmptyToFullIncludesOnlyTheNormalRegenDelay()
+        {
+            var s = DrainedToEmpty();
+            const float dt = .01f;
+            float refill = 0;
+            while (s.Current < Balance.StaminaMax - .01f && refill < 10)
+            {
+                s.Step(dt, moving: false, sprintHeld: false);
+                refill += dt;
+            }
+            Assert.InRange(refill, 3.48f, 3.52f);
+            Assert.False(s.IsFatigued);
+        }
+
+        /// <summary>
+        /// ⚠️ THE FLOOR IS WHAT STOPS THE BAR BEING FEATHERED. You may continue a sprint at
+        /// any level but may not start one below the floor, so tapping Shift on a sub-tick
+        /// rhythm cannot buy a permanent sprint.
+        /// </summary>
+        [Fact]
+        public void Sprint_CannotStartBelowTheFloor()
+        {
+            var s = new Stamina();
+            const float dt = 1.0f / 60.0f;
+
+            while (s.Current > Balance.StaminaSprintFloor - 1.0f)
+                s.Step(dt, moving: true, sprintHeld: true);
+
+            // Release, then immediately ask for a new sprint from below the floor.
+            s.Step(dt, moving: true, sprintHeld: false);
+            float scale = s.Step(dt, moving: true, sprintHeld: true);
+
+            Assert.Equal(1.0f, scale, 3);
+            Assert.False(s.IsSprinting);
+        }
+
+        [Fact]
+        public void NetworkStaminaCorrectionPreservesAnExistingSprintBelowTheStartFloor()
+        {
+            var stamina = new Stamina();
+            stamina.Step(.1f, moving: true, sprintHeld: true);
+            stamina.ApplyNetworkSnapshot(Balance.StaminaSprintFloor - 1, 0, 0);
+            Assert.True(stamina.IsSprinting);
+            Assert.Equal(Balance.SprintScale, stamina.Step(.01f, moving: true, sprintHeld: true));
+            stamina.Step(.01f, moving: true, sprintHeld: false);
+            stamina.ApplyNetworkSnapshot(Balance.StaminaSprintFloor - 1, 0, 0);
+            Assert.Equal(1f, stamina.Step(.01f, moving: true, sprintHeld: true));
+            Assert.False(stamina.IsSprinting);
+        }
+
+        [Fact]
+        public void NetworkStaminaEmptyCorrectionEndsSprintWithoutFatigue()
+        {
+            var stamina = new Stamina();
+            stamina.Step(.1f, moving: true, sprintHeld: true);
+            stamina.ApplyNetworkSnapshot(0, 0, Balance.FatigueTime);
+            Assert.False(stamina.IsSprinting); Assert.False(stamina.IsFatigued);
+            stamina.ApplyNetworkSnapshot(Balance.StaminaMax, 0, 0);
+            Assert.False(stamina.IsSprinting);
+            stamina.Step(.1f, moving: true, sprintHeld: true);
+            stamina.ApplyNetworkSnapshot(0, 0, 0);
+            Assert.False(stamina.IsSprinting);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A TAG CLEANSES. The moment an attacker is most likely to be tagged is the
+        /// moment they are most likely to be empty, so the old behaviour stacked a 5 s
+        /// stun, a spent bar and often a live fatigue lockout onto one mistake, and the two
+        /// invisible punishments outlasted the one the HUD showed.
+        /// </summary>
+        [Fact]
+        public void TagPenalty_RefillsTheBarAndClearsFatigue()
+        {
+            var s = DrainedToEmpty();
+            Assert.False(s.IsFatigued);
+
+            s.RefillAndClearFatigue();
+
+            Assert.False(s.IsFatigued);
+            Assert.Equal(Balance.StaminaMax, s.Current, 3);
+            Assert.Equal(1.0f, s.SpeedZones.Value, 3);
+            Assert.Equal(0, s.SpeedZones.Count);
+        }
+
+        /// <summary>
+        /// A full bar buys one crossing of the danger zone, which is the retrieval the whole
+        /// game is about.
+        ///
+        /// ⚠️⚠️ THIS IS THE INVARIANT `Stamina`'s HEADER NAMES AND NOBODY COULD RUN. It says
+        /// StaminaMax, StaminaDrainRate, SprintScale and ConfinementRadius are ONE INTERLOCKED
+        /// SET and that *"a change to any one of the four has to be re-measured against the other
+        /// three rather than reasoned about"* — and then the re-measurement lived only in that
+        /// sentence. When 🧑 asked for attackers to be 40% slower (§ 83.1), the set silently fell
+        /// out of step: a full bar went from 7.76 m of sprint to 4.66 m, so an attacker could
+        /// sprint in to the can and not back out, on every map, every time.
+        ///
+        /// ⚠️ IT IS A DISTANCE AND NOT A TIME, which is the finding that entry records. Asserting
+        /// the seconds would have passed through the whole change without noticing.
+        ///
+        /// ⚠️ THE BAND IS WIDE ON PURPOSE. This is not a knob, it is a guard against a retune
+        /// that quietly halves or doubles what a sprint is worth; anything inside the box's own
+        /// radius and twice it is a design decision, and anything outside is an accident.
+        /// </summary>
+        [Fact]
+        public void OwnerSprintBarProvidesTwoPointFiveSecondsAtExplicitRunSpeed()
+        {
+            float seconds = Balance.StaminaMax / Balance.StaminaDrainRate;
+            Assert.Equal(2.5f, seconds, 4);
+            Assert.Equal(9.375f, Balance.AttackerRunSpeed * seconds, 4);
+            Assert.Equal(14.0625f, Balance.DefenderRunSpeed * seconds, 4);
+        }
+
+        /// <summary>
+        /// The shove costs 25 of 60, and the two role scales are the two named constants.
+        ///
+        /// It asserted the LITERALS 1.0 and 0.75, and both moved on 2026-08-29 (docs/TODO.md
+        /// sections 83.1 and 83.3). A test that re-types a balance number tests only that
+        /// somebody edited two files instead of one; what is worth holding is that the scale is
+        /// read from the role and that the taya is the faster of the two, which is the whole
+        /// shape of chase versus escape and is what a retune must not accidentally invert.
+        /// </summary>
+        [Fact]
+        public void ShoveCost_IsPayableAndRoleScaleIsByRole()
+        {
+            var s = new Stamina();
+            Assert.True(s.Spend(Balance.ShoveStaminaCost));
+            Assert.Equal(Balance.StaminaMax - Balance.ShoveStaminaCost, s.Current, 3);
+
+            Assert.Equal(Balance.DefenderWalkSpeed, Stamina.MovementSpeed(isDefender: true, running: false), 3);
+            Assert.Equal(Balance.AttackerWalkSpeed, Stamina.MovementSpeed(isDefender: false, running: false), 3);
+
+            Assert.True(Balance.DefenderWalkSpeed > Balance.AttackerWalkSpeed,
+                        "the taya must stay the faster role");
+        }
+
+        // ===================================================================
+        // COMBAT GEOMETRY
+        // ===================================================================
+
+        /// <summary>Every impulse solves v²/(2·Friction). The shove lands at 2.50 m.</summary>
+        [Fact]
+        public void ShoveKnockback_Is2Point50Metres()
+        {
+            Assert.Equal(2.50f, Combat.ShoveDistance(), 2);
+        }
+
+        /// <summary>
+        /// The owner requested a longer lunge on 2026-09-30. Full travel is 3m;
+        /// the charge, sweep radius and active window keep their existing rules.
+        /// </summary>
+        [Fact]
+        public void LungeReach_IsDashPlusSweepRadius()
+        {
+            Assert.Equal(3.50f, Combat.LungeDash(), 2);
+            Assert.Equal(3.50f + Balance.LungeTagRadius, Combat.LungeReach(), 2);
+            Assert.Equal(4.80f, Combat.LungeReach(), 2);
+            Assert.True(Balance.LungeSpeed / Balance.Friction <= Balance.LungeActiveTime);
+            Assert.Equal(3.5f * Balance.LungeMinPower * Balance.LungeMinPower,
+                Combat.LungeDash(0), 3);
+        }
+
+        /// <summary>
+        /// ⚠️ 4.583 IS sqrt(0.35 × 60) AND NOTHING ELSE. Every impulse is derived from
+        /// Friction rather than typed in as a distance; move Friction and a hard-coded
+        /// distance beside it would be silently wrong.
+        /// </summary>
+        [Fact]
+        public void BlockKnockback_SolvesToThePublished0Point6Metres()
+        {
+            Assert.Equal(0.6f, Combat.KnockbackDistance(Balance.BlockKnockbackSpeed), 2);
+            Assert.Equal(Balance.BlockKnockbackSpeed, Combat.SpeedForDistance(0.6f), 2);
+        }
+
+        /// <summary>
+        /// ⚠️ A BLOCKED SLIPPER MUST STAY IN THE BOX, and the two scales that decide it
+        /// must not be collapsed back into one. At the old 0.62 a block threw the slipper
+        /// to the chalk or past it, so the retrieval never entered the box and the tag
+        /// could never happen: 22.5% of all points before, 1.8% after.
+        ///
+        /// ⚠️ THE DISTANCE ITSELF IS NOT ASSERTED HERE, DELIBERATELY. Both impulses carry
+        /// a lift, so they are ballistic rather than sliding, and their travel is a
+        /// property of the flight integrator. That is Phase 3's measurement against the
+        /// Godot build. What IS checkable now is that the two scales stayed separate and
+        /// kept their published ordering: they were ONE constant until 2026-08-01 and had
+        /// to move in opposite directions, and nesting them is what silently collapsed the
+        /// can knock to 0.3 m for a reason that had nothing to do with it.
+        /// </summary>
+        [Fact]
+        public void DeflectAndLataRecoil_AreSeparateScalesInTheRightOrder()
+        {
+            Assert.Equal(0.27f, Balance.DeflectSpeedScale, 3);
+            Assert.Equal(0.25f, Balance.LataRecoilScale, 3);
+            Assert.NotEqual(Balance.DeflectSpeedScale, Balance.LataRecoilScale);
+
+            // Both are a fraction of LaunchSpeed in their own right, neither nested in
+            // the other, and both well under it.
+            Assert.True(Balance.DeflectSpeedScale < 1.0f);
+            Assert.True(Balance.LataRecoilScale < 1.0f);
+        }
+
+        /// <summary>
+        /// ⚠️ STUNS OVERLAP RATHER THAN STACK. Max() is the entire bound on a stun chain in
+        /// a 1-vs-3 game. There must be no additive path anywhere.
+        /// </summary>
+        [Fact]
+        public void Stagger_TakesTheMaximumAndNeverSums()
+        {
+            Assert.Equal(5.0f, Combat.ApplyStagger(5.0f, 1.25f), 3);
+            Assert.Equal(5.0f, Combat.ApplyStagger(1.25f, 5.0f), 3);
+            Assert.NotEqual(6.25f, Combat.ApplyStagger(5.0f, 1.25f));
+        }
+
+        // ===================================================================
+        // GETTING BACK UP
+        //
+        // 🧑, 2026-08-25: *"then fall down animation plays and u have to spam a button to
+        // get back up"*. These four assert the bound rather than the feel: what a mash is worth,
+        // what it cannot do, and that hardware cannot beat a hand.
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️ A MASH SHORTENS A TRIP, IT DOES NOT CANCEL ONE. If a press could take the fall to
+        /// zero the hazard would cost nothing to whoever reacts first, and a hazard that can be
+        /// answered for free is a hazard nobody has to route around.
+        /// </summary>
+        /// <summary>
+        /// § MASHING OUT OF AN ABILITY STUN. The three properties that make the escape fair,
+        /// asserted rather than playtested, which is why the rules layer is engine-free.
+        /// </summary>
+        [Fact]
+        public void StunMash_ShortensAnAbilityStunButNeverCancelsIt()
+        {
+            float left = 3.0f;
+            for (int i = 0; i < 200; i++)
+                left = Combat.MashOutOfStun(left, 3.0f, Balance.StunBreakPressesDefault,
+                                            Balance.MashCooldown, out _);
+
+            Assert.Equal(Balance.MinStunDown, left, 3);
+            Assert.True(left > 0.0f,
+                        "an ability stun that mashing can cancel outright is not a control " +
+                        "ability, and the cooldown that bought it is refunded for free.");
+        }
+
+        /// <summary>
+        /// ⚠️ THE SAME PROPERTY THE TRIP MASH HAD TO LEARN: a press may never LENGTHEN the thing
+        /// it is answering. `Mash_NeverLengthensAFall` records the day `MashRecover` clamped up
+        /// to its floor and a player hammering the key pinned themselves on the road. This is
+        /// the identical shape of function, so it gets the identical guard from the start.
+        /// </summary>
+        [Fact]
+        public void StunMash_NeverLengthensAStun()
+        {
+            float[] starts =
+            {
+                5.0f, 3.0f, 1.5f, Balance.MinStunDown + 0.01f, Balance.MinStunDown,
+                Balance.MinStunDown * 0.5f, 0.05f, 0.001f
+            };
+
+            foreach (float start in starts)
+            {
+                float after = Combat.MashOutOfStun(start, start, Balance.StunBreakPressesDefault,
+                                                   Balance.MashCooldown, out _);
+
+                Assert.True(after <= start + 0.0001f,
+                            $"a press against {start:F3} s of stun returned {after:F3} s, " +
+                            "which is a press that made the stun longer.");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE RATE CAP IS THE ANTI-TURBO BOUND AND IT HAS TO HOLD HERE TOO. A press inside
+        /// `MashCooldown` buys nothing, so a macro cannot beat a hand. Asserted separately from
+        /// the trip because these are two functions and a fix to one does not reach the other.
+        /// </summary>
+        [Fact]
+        public void StunMash_RefusesPressesInsideTheRateCap()
+        {
+            float left = 3.0f;
+            float after = Combat.MashOutOfStun(left, 3.0f, Balance.StunBreakPressesDefault,
+                                               Balance.MashCooldown * 0.5f, out bool accepted);
+
+            Assert.False(accepted);
+            Assert.Equal(left, after, 5);
+        }
+
+        /// <summary>
+        /// The bound a player actually experiences, written down so a change to either constant
+        /// has to restate what it costs. See § MASHING OUT OF AN ABILITY STUN in `Balance`.
+        /// </summary>
+        [Fact]
+        public void StunMash_ClosesTheSlackInAKnownNumberOfPresses()
+        {
+            const float duration = 3.0f;
+
+            // ⚠️⚠️ THE PRESS COUNT IS THE TUNABLE AND THE SECONDS FOLLOW FROM IT, which is the
+            // property worth pinning: a stun retuned to a different DURATION still breaks in the
+            // number of presses its ability asked for. 🧑 asked for the cost to be per skill and
+            // "dependent on how hard the skill is supposed to hit", and that only stays true if
+            // the count is what survives a duration change.
+            foreach (int declared in new[] { 3, 6, 9, 14 })
+            {
+                foreach (float total in new[] { 2.0f, 3.0f, 5.0f })
+                {
+                    float left = total;
+                    int presses = 0;
+
+                    while (presses < 100)
+                    {
+                        left = Combat.MashOutOfStun(left, total, declared,
+                                                    Balance.MashCooldown, out bool ok);
+                        if (!ok) break;
+                        presses++;
+                        if (left <= Balance.MinStunDown + 0.0001f) break;
+                    }
+
+                    Assert.Equal(declared, presses);
+                }
+            }
+
+            // A declared count outside the bounds is clamped rather than trusted.
+            Assert.Equal(Combat.StunMashPerPress(duration, Balance.StunBreakPressesMin),
+                         Combat.StunMashPerPress(duration, 0), 5);
+            Assert.Equal(Combat.StunMashPerPress(duration, Balance.StunBreakPressesMax),
+                         Combat.StunMashPerPress(duration, 999), 5);
+
+            // And the floor is what a perfect mash actually reaches.
+            Assert.Equal(Balance.MinStunDown, Combat.FastestStunRecovery(duration), 3);
+
+            // A stun already shorter than the floor is left alone rather than extended to it.
+            Assert.Equal(0.5f, Combat.FastestStunRecovery(0.5f), 3);
+        }
+
+        [Fact]
+        public void Mash_ShortensATripButNeverCancelsIt()
+        {
+            float left = 2.5f;
+            for (int i = 0; i < 200; i++)
+                left = Combat.MashRecover(left, Balance.MashCooldown, out _);
+
+            Assert.Equal(Balance.MinTripDown, left, 3);
+            Assert.True(left > 0.0f);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A PRESS CAN NEVER MAKE A FALL LONGER, AND FOR ONE DAY IT COULD.
+        ///
+        /// 🧑, 2026-08-26: *"if i mash, the progress pauses"*, reported twice, off two builds.
+        /// `Combat.MashRecover` clamped its result UP to `MinTripDown` unconditionally, so once
+        /// the fall was inside the floor — the last 0.35 s, the get-up animation, where
+        /// `tripLeft` is already below `MinTripDown` — an accepted press RETURNED A LARGER
+        /// NUMBER THAN IT WAS GIVEN and reset the fall to the floor. At the 10 Hz cap a player
+        /// still hammering the key held themselves on the tarmac indefinitely. Mashing harder
+        /// made the fall longer.
+        ///
+        /// ⚠️ THE PROPERTY IS ASSERTED, NOT THE FIX. "The result is never greater than the input,
+        /// from any starting point" is what must hold; the current implementation happens to
+        /// achieve it by refusing the press outright, and a later one may not.
+        /// </summary>
+        [Fact]
+        public void Mash_NeverLengthensAFall()
+        {
+            float[] starts =
+            {
+                2.5f, 1.0f, Balance.MinTripDown + 0.01f, Balance.MinTripDown,
+                Balance.MinTripDown * 0.5f, 0.05f, 0.001f
+            };
+
+            foreach (float start in starts)
+            {
+                float after = Combat.MashRecover(start, Balance.MashCooldown, out _);
+
+                Assert.True(after <= start + 0.0001f,
+                            $"a press against {start:F3} s of trip returned {after:F3} s, " +
+                            "which is a press that made the fall longer.");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ AND THE FLOOR IS REACHED AND THEN HELD, NOT ORBITED. Once the fall is at or under
+        /// `MinTripDown` nothing a press does may move it at all: the remaining time is the
+        /// get-up clip, which `CharacterAnimator` time-scales to fit exactly, and shortening it
+        /// would stand a body up through the middle of its own animation.
+        /// </summary>
+        [Fact]
+        public void Mash_IsRefusedOnceTheFloorIsReached()
+        {
+            float atFloor = Combat.MashRecover(Balance.MinTripDown, 99.0f, out bool accepted);
+
+            Assert.False(accepted);
+            Assert.Equal(Balance.MinTripDown, atFloor, 3);
+
+            float inside = Combat.MashRecover(Balance.MinTripDown * 0.4f, 99.0f, out accepted);
+
+            Assert.False(accepted);
+            Assert.Equal(Balance.MinTripDown * 0.4f, inside, 3);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE RATE CAP IS THE ANTI-TURBO BOUND. A press inside `MashCooldown` of the
+        /// last accepted one changes nothing at all, so a macro or a turbo-fire mouse cannot
+        /// take a trip below what a human burst reaches. `docs/VISION.md` § 4 aims the mode at
+        /// a bracket, and a status that is answered by hardware does not belong in one.
+        /// </summary>
+        [Fact]
+        public void Mash_IgnoresPressesInsideTheRateCap()
+        {
+            float left = Combat.MashRecover(2.5f, Balance.MashCooldown * 0.5f, out bool accepted);
+
+            Assert.False(accepted);
+            Assert.Equal(2.5f, left, 3);
+
+            left = Combat.MashRecover(2.5f, Balance.MashCooldown, out accepted);
+            Assert.True(accepted);
+            Assert.Equal(2.5f - Balance.MashRecoverPerPress, left, 3);
+        }
+
+        /// <summary>
+        /// ⚠️ THE SAVING HAS TO FIT INSIDE THE FALL, OR THE CAP IS THE REAL RULE AND THE
+        /// PER-PRESS VALUE IS DECORATION. `StreetTripHazard` trips for 2.50 s and the floor is
+        /// 0.90 s, so 1.60 s has to be removable at 0.13 s a press and no faster than 10 Hz:
+        /// 12.3 presses over 1.23 s, comfortably inside the 2.50 s the player is down for.
+        /// </summary>
+        [Fact]
+        public void Mash_CanReachTheFloorWithinTheFallItself()
+        {
+            const float trip = 2.5f;
+            float removable = trip - Balance.MinTripDown;
+            float presses = removable / Balance.MashRecoverPerPress;
+            float secondsOfMashing = presses * Balance.MashCooldown;
+
+            Assert.True(secondsOfMashing < trip,
+                        $"{presses:F1} presses need {secondsOfMashing:F2} s of a {trip:F2} s fall.");
+        }
+
+        /// <summary>
+        /// ⚠️ THE FLOOR MUST LEAVE THE KNOCKDOWN CLIP TIME TO PLAY.
+        ///
+        /// ⚠️⚠️ AND THE SEPARATE 0.70 THIS TEST USED TO TRANSCRIBE IS GONE. `CharacterAnimator`
+        /// switched from the knockdown clip to the get-up at a hardcoded 0.70 while the mash
+        /// floor and the HUD both used `MinTripDown` = 0.90, so for 0.20 s of every fall the
+        /// player was refused a press, told GETTING UP, and left face down. `StepTripPose` now
+        /// switches at `MinTripDown` itself, which is why there is no second number left to
+        /// compare against here: one number, one meaning.
+        /// </summary>
+        [Fact]
+        public void Mash_LeavesTheKnockdownClipTimeToPlay()
+        {
+            Assert.True(Balance.MinTripDown > 0.0f);
+            Assert.Equal(Balance.MinTripDown, Combat.FastestTripRecovery(2.5f), 3);
+
+            // A trip already shorter than the floor is not lengthened by the rule.
+            // ⚠️ 0.20, NOT 0.40. `MinTripDown` came down to 0.35 on 2026-08-26, so 0.40 is
+            // above the floor now and this line was asserting the clamp rather than the
+            // pass-through it is named for.
+            Assert.Equal(0.2f, Combat.FastestTripRecovery(0.2f), 3);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE MASH IS THE ONLY WAY UP INSIDE THE WINDOW, AND THAT IS A PROPERTY OF THE
+        /// NUMBERS RATHER THAN OF THE MOTOR. 🧑, 2026-08-26, off the 4.70 player: *"u randomly
+        /// get up after set amt of time, i dont have to actually mash it"*. Three passes before
+        /// this one answered that complaint by retuning a decay RATE, and each left the thing he
+        /// was describing in place. `Balance.TripPassiveDecayRate` is deleted; what is left is a
+        /// count of presses and a stranding guard far enough out that waiting is never the
+        /// better play.
+        /// </summary>
+        [Fact]
+        public void Trip_OnlyPressesEndAFallInsideTheGuard()
+        {
+            const float trip = 2.5f;
+            float slack = trip - Balance.MinTripDown;
+
+            int presses = (int)System.Math.Ceiling(slack / Balance.MashRecoverPerPress);
+            float mashWindow = presses * Balance.MashCooldown;
+            float mashed = mashWindow + Balance.MinTripDown;
+
+            Assert.True(mashed <= 2.0f,
+                        $"a perfectly answered fall is {mashed:F2} s, outside the 1-2 s asked for.");
+
+            // ⚠️ THE GUARD IS A STRANDING GUARD, NOT A SECOND WAY UP. If it were close to the
+            // answered time, "wait it out" would be a strategy again and the meter would be back
+            // to decorating a countdown.
+            Assert.True(Balance.TripAutoRecoverSeconds >= mashed * 3.0f,
+                        $"waiting costs {Balance.TripAutoRecoverSeconds:F2} s against {mashed:F2} s " +
+                        "answered, which is close enough that not pressing is playable.");
+
+            // ⚠️ AND IT STILL ENDS. A fall only a press can clear strands a player whose hands
+            // left the keyboard and hands a griefing tool to anything that can re-apply one.
+            Assert.True(Balance.TripAutoRecoverSeconds > 0.0f);
+            Assert.True(Balance.TripAutoRecoverSeconds <= 6.0f,
+                        $"an unanswered fall lasts {Balance.TripAutoRecoverSeconds:F2} s, which is "
+                        + "long enough to read as being stuck rather than as being punished.");
+
+            // ⚠️ THE MASH IS STILL A BURST, NOT A TAP. § 14.1 shipped 0.22 because at 0.35 two
+            // presses plus the bleed were enough; with the bleed gone the press count IS the
+            // fall, so it has to stay a number you feel.
+            Assert.True(presses >= 8,
+                        $"the slack is {presses} presses, which is a tap rather than a mash.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE GRACE HAS TO OUTLAST THE HAZARD YOU ARE STANDING ON. The mash is bound to
+        /// Jump, so a fall ends with a jump by construction, and a jump clears
+        /// `StreetTripHazard.MinSpeedToTrip` (1.0 m/s) while the body is still on the thing that
+        /// felled it. `TripGraceAfterGetUp` has to carry an attacker clear of the widest hazard
+        /// footprint on the map, which is the sunken trench at 2.60 m.
+        /// </summary>
+        [Fact]
+        public void Trip_GraceCarriesAPlayerClearOfTheHazardThatFelledThem()
+        {
+            const float widestHazardFootprint = 2.6f;
+
+            float attackerSpeed = Balance.AttackerWalkSpeed;
+            float carried = attackerSpeed * Balance.TripGraceAfterGetUp;
+
+            Assert.True(carried > widestHazardFootprint,
+                        $"the grace carries {carried:F2} m, which does not clear a " +
+                        $"{widestHazardFootprint:F2} m hazard.");
+
+            // ⚠️ AND IT IS SHORTER THAN THE FALL IT FOLLOWS, so it cannot become a window in
+            // which a player is immune to the map while doing something else.
+            Assert.True(Balance.TripGraceAfterGetUp < 2.5f);
+        }
+
+        // ===================================================================
+        // THE THROW AND THE HIT WINDOW
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️ THE PUBLISHED PER-CAN WINDOWS ARE WHAT PIN THE FORMULA. Dividing the whole
+        /// window by STANCE gives BOYBEN 0.465 and matches neither figure; dividing only
+        /// the margin reproduces both to three decimals.
+        /// </summary>
+        [Fact]
+        public void HitWindow_MatchesThePublishedPerCanFigures()
+        {
+            int boyben = IndexOf(Roster.Cans, "boyben");
+            int pasip = IndexOf(Roster.Cans, "pasip");
+
+            Assert.Equal(0.493f, ThrowRules.HitWindow(boyben), 3);
+            Assert.Equal(0.579f, ThrowRules.HitWindow(pasip), 3);
+
+            // The stance ordering is the design: the stable can is the hard one to hit.
+            Assert.True(ThrowRules.HitWindow(boyben) < ThrowRules.HitWindow(pasip));
+        }
+
+        /// <summary>All six conditions, each refused on its own.</summary>
+        [Fact]
+        public void CanThrow_RefusesOnEachConditionIndependently()
+        {
+            var ok = ThrowContext.Default();
+            ok.X = Balance.ConfinementRadius + 1.0f; // outside the box
+            Assert.True(ThrowRules.CanThrow(ok));
+
+            var c = ok; c.RoundActive = false; Assert.False(ThrowRules.CanThrow(c));
+            c = ok; c.IsDefender = true; Assert.False(ThrowRules.CanThrow(c));
+            c = ok; c.HoldingSlipper = false; Assert.False(ThrowRules.CanThrow(c));
+            c = ok; c.ThrowCooldownLeft = 0.5f; Assert.False(ThrowRules.CanThrow(c));
+
+            // Can orientation does not prohibit throwing; restore decay is a carrier lock.
+            c = ok; c.LataUpright = false; Assert.True(ThrowRules.CanThrow(c));
+            c = ok; c.X = 0.0f; c.Z = 0.0f; Assert.False(ThrowRules.CanThrow(c)); // inside
+        }
+
+        /// <summary>
+        /// The shortest legal throw is the box radius, against the 45° range of the launch
+        /// speed. Both map builders re-verify this and abort rather than shipping an arena
+        /// where a legal position cannot reach the can.
+        /// </summary>
+        [Fact]
+        public void EveryLegalThrowingPosition_CanReachTheCan()
+        {
+            for (int i = 0; i < Roster.Slippers.Count; i++)
+            {
+                float range = ThrowRules.MaxRange(Roster.SlipperLaunchSpeed(i));
+                Assert.True(range > Confinement.ThrowingLine(),
+                    $"{Roster.Slippers[i].Name} cannot reach the can from the throwing line");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ FLIGHT IS THE NARROWEST STAT IN THE GAME, spanning only 2..4. The AI inverts
+        /// the range equation against LaunchSpeed to decide how long to charge, so a
+        /// per-skin launch speed is an error term inside a solve living in another file.
+        /// A wider spread would make every bot holding a slow slipper fall short, and read
+        /// as an AI regression rather than as a balance change.
+        /// </summary>
+        [Fact]
+        public void SlipperFlight_StaysWithinFivePercentOfBaseline()
+        {
+            for (int i = 0; i < Roster.Slippers.Count; i++)
+            {
+                int points = Roster.SlipperTrait(i, Trait.Bilis);
+                Assert.InRange(points, 2, 4);
+
+                float speed = Roster.SlipperLaunchSpeed(i);
+                Assert.InRange(speed, Balance.LaunchSpeed * 0.95f, Balance.LaunchSpeed * 1.05f);
+            }
+
+            Assert.Equal(19.4f, Roster.SlipperLaunchSpeed(IndexOf(Roster.Slippers, "sike")), 1);
+            Assert.Equal(17.6f, Roster.SlipperLaunchSpeed(IndexOf(Roster.Slippers, "crocs")), 1);
+        }
+
+        // ===================================================================
+        // THE ARENA
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️⚠️ A SQUARE, NOT A CIRCLE, and this test is the difference. The two agree only
+        /// at the four edge midpoints and disagree by 2.07 units on the diagonals, which is
+        /// exactly where a taya moves to cover a corner.
+        /// </summary>
+        [Fact]
+        public void TheBox_IsASquareAndNotACircle()
+        {
+            float r = Balance.ConfinementRadius;
+
+            // A corner is inside a square of this radius, and outside a circle of it.
+            float corner = r * 0.9f;
+            Assert.True(Confinement.IsInsideBox(corner, corner));
+
+            float radialDistance = (float)System.Math.Sqrt(corner * corner + corner * corner);
+            Assert.True(radialDistance > r, "the corner case only exists if the diagonal exceeds r");
+
+            // ⚠️ THE DISAGREEMENT SCALES WITH THE RADIUS, which is why it is computed and
+            // not pasted. Design.md's published 2.07 is correct AT RADIUS 5.0, the value
+            // in force when it was written; the box has since grown to 7.0 and the gap
+            // with it, to 2.90. Asserting the literal 2.07 was a test that failed against
+            // a correct port because the doc's figure predates the current arena.
+            float gap = r * (float)System.Math.Sqrt(2.0) - r;
+            Assert.Equal(r * 0.41421f, gap, 2);
+            Assert.Equal(2.07f, 5.0f * 0.41421f, 2); // the published figure, at its own radius
+            Assert.Equal(2.90f, gap, 2);             // and what it is today
+        }
+
+        /// <summary>The clamp and the test must use the same boundary, or the chalk and
+        /// the throwing line stop agreeing and nobody can see why.</summary>
+        [Fact]
+        public void ClampAndInsideTest_AgreeOnTheBoundary()
+        {
+            float x = 99.0f, z = -99.0f;
+            Confinement.ClampToBox(ref x, ref z);
+
+            Assert.Equal(Balance.ConfinementRadius, x, 3);
+            Assert.Equal(-Balance.ConfinementRadius, z, 3);
+
+            // Exactly on the chalk counts as OUT, so a body clamped to the edge may throw.
+            Assert.False(Confinement.IsInsideBox(Balance.ConfinementRadius, 0.0f));
+        }
+
+        /// <summary>Attackers spawn outside the box, or they are vulnerable on frame one.</summary>
+        [Fact]
+        public void AttackerSpawnRing_IsOutsideTheBox()
+        {
+            float ring = Confinement.AttackerSpawnRing();
+            Assert.True(ring > Balance.ConfinementRadius);
+            Assert.False(Confinement.IsInsideBox(ring, 0.0f));
+        }
+
+        // ===================================================================
+        // MATCH STRUCTURE AND SCORING
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️⚠️ THE WHOLE FAIRNESS ARGUMENT, IN ONE TEST. Role is a pure function of the
+        /// round, not an accumulated counter, so "everyone defends exactly once,
+        /// clockwise" is true by construction rather than by careful bookkeeping.
+        /// </summary>
+        [Fact]
+        public void EverySlotAppearsInTheDefaultRotation()
+        {
+            var seen = new HashSet<int>();
+            for (int round = 1; round <= Balance.Rounds; round++)
+                seen.Add(MatchRules.DefenderSlotFor(round));
+
+            Assert.Equal(Balance.PlayerCount, seen.Count);
+            Assert.Equal(0, MatchRules.DefenderSlotFor(1));
+            Assert.Equal(3, MatchRules.DefenderSlotFor(4));
+        }
+
+        [Fact]
+        public void MatchLengthFollowsTheSelectedMode()
+        {
+            Assert.Equal(4, MatchRules.RoundCountFor(GameMode.Classic));
+            Assert.Equal(4, MatchRules.RoundCountFor(GameMode.HeroStrike));
+
+            var defended = new int[Balance.PlayerCount];
+            for (int round = 1; round <= MatchRules.RoundCountFor(GameMode.HeroStrike); round++)
+                defended[MatchRules.DefenderSlotFor(round)]++;
+
+            foreach (int turns in defended) Assert.Equal(1, turns);
+        }
+
+        /// <summary>Defensive against a caller passing round 0 or negative.</summary>
+        [Fact]
+        public void DefenderSlot_ClampsRoundToAtLeastOne()
+        {
+            Assert.Equal(0, MatchRules.DefenderSlotFor(0));
+            Assert.Equal(0, MatchRules.DefenderSlotFor(-5));
+        }
+
+        [Fact]
+        public void ScoreEvents_CarryTheirPublishedValues()
+        {
+            Assert.Equal(100, MatchRules.PointsFor(ScoreEvent.LataKnocked));
+            Assert.Equal(100, MatchRules.PointsFor(ScoreEvent.Tag));
+            Assert.Equal(50, MatchRules.PointsFor(ScoreEvent.Sabotage));
+            Assert.Equal(10, MatchRules.PointsFor(ScoreEvent.DefenseTick));
+        }
+
+        /// <summary>
+        /// ⚠️ A TIE AT THE TOP IS AN HONEST DRAW. Breaking it by seat order would hand
+        /// round 1's taya a structural advantage in a game whose whole fairness argument is
+        /// that the seats are symmetric.
+        /// </summary>
+        [Fact]
+        public void TieAtTheTop_ReportsMinusOne()
+        {
+            var board = new Scoreboard();
+            board.Add(0, ScoreEvent.Tag);
+            board.Add(1, ScoreEvent.Tag);
+
+            Assert.Equal(-1, board.WinningSlot());
+
+            board.Add(1, ScoreEvent.DefenseTick);
+            Assert.Equal(1, board.WinningSlot());
+        }
+
+        /// <summary>
+        /// The theoretical passive ceiling: a full round with the can never knocked down.
+        /// The arithmetic that once read as the most likely thing to be wrong in the whole
+        /// table, and was closed by measurement: a taya who does nothing collects 38 of it,
+        /// because the attackers put the can down and it stays down.
+        /// </summary>
+        [Fact]
+        public void PassiveDefence_CeilingIsOneRoundOfUprightTime()
+        {
+            int ticks = (int)(Balance.RoundTime / Balance.DefenseTickInterval);
+            Assert.Equal(900, ticks * Balance.ScoreDefensePerTick);
+
+            // Each player is taya once in the four-round default match.
+            Assert.Equal(1, CountRoundsDefending(slot: 0));
+        }
+
+        // ===================================================================
+        // THE ROSTER
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️ ALL TWELVE ROWS DISTINCT. Two pairs were byte-identical until 2026-08-01,
+        /// which is two characters wearing two rigs and playing as one. It is invisible on
+        /// the select screen because the meters look correct on both.
+        /// </summary>
+        [Fact]
+        public void AllPersonRows_AreDistinct()
+        {
+            Assert.Equal(12, Roster.ClassicPeople.Count);
+            Assert.Equal(9, Roster.HeroPeople.Count);
+            Assert.Equal(21, Roster.AllPeople.Count);
+            Assert.DoesNotContain(Roster.ClassicPeople, person => person.Id == "rafi");
+
+            var seenClassic = new HashSet<string>();
+            foreach (var e in Roster.ClassicPeople)
+                Assert.True(seenClassic.Add($"{e.Bilis}/{e.Lakas}/{e.Tatag}"),
+                    $"{e.Name} duplicates another classic row: two characters playing as one");
+
+            var seenHeroes = new HashSet<string>();
+            foreach (var e in Roster.HeroPeople)
+                Assert.True(seenHeroes.Add($"{e.Bilis}/{e.Lakas}/{e.Tatag}"),
+                    $"{e.Name} duplicates another hero row: two characters playing as one");
+
+            Assert.Equal(Roster.ClassicPeople, Roster.GetPeople(GameMode.Classic));
+            Assert.Equal(Roster.HeroPeople, Roster.GetPeople(GameMode.HeroStrike));
+        }
+
+        /// <summary>
+        /// Sean is the slowest hero, strictly, and the two tables that hold him agree.
+        ///
+        /// ⚠⚠ IT IS A SIZE DEBUFF AND `Roster.HeroPeople`'S HEADER CARRIES THE REASONING.
+        /// 🧑 2026-08-30: *"bcz Sean is larger than all, he should be slower than all (he has a
+        /// defender advantage)"*, *"js a bit slower than all"*. A bigger body reaches further and
+        /// contact resolves by DISTANCE, so being large is a real advantage at the one verb the
+        /// taya has.
+        ///
+        /// ⚠⚠ STRICTLY SLOWEST, NOT JOINT-SLOWEST, WHICH IS THE HALF A NUMBER CHANGE CAN LOSE.
+        /// Dante is on 2, so a "slower Sean" written as 2 would have tied rather than led, and
+        /// nothing would have failed. The points are a 5% ladder, so 1 is the only value that
+        /// expresses the ask at all.
+        ///
+        /// ⚠ AND IT IS ASSERTED IN BOTH TABLES. `HeroPeople` is what Hero Strike reads and
+        /// `AllPeople` is the master list; a trait edited in one and not the other is two
+        /// characters wearing one name, which is exactly the fault `AllPersonRows_AreDistinct`
+        /// above exists for, one list over.
+        /// </summary>
+        [Fact]
+        public void SeanIsStrictlyTheSlowestHero_InEveryTableThatHoldsHim()
+        {
+            var heroIds = Roster.HeroPeople.Select(e => e.Id).ToHashSet();
+
+            foreach (var table in new[] { Roster.HeroPeople, Roster.AllPeople })
+            {
+                var sean = table.First(e => e.Id == "sean");
+
+                foreach (var other in table)
+                {
+                    if (other.Id == "sean") continue;
+
+                    // ⚠⚠ HEROES ONLY, AND LOLA PACING IS THE REASON THIS FILTER EXISTS. She is
+                    // `bilis` 1 in `ClassicPeople` and has been since the roster was written, so
+                    // "slower than all" cannot mean the master list: `AllPeople` holds both
+                    // casts and `CLAUDE.md` § 1 says the two modes are not variants of each
+                    // other, so a Classic character and a hero never stand in one match. The ask
+                    // was about the six who do. Her row is also the precedent that says 0.90 is a
+                    // shipped, played value rather than a new extreme.
+                    if (!heroIds.Contains(other.Id)) continue;
+
+                    Assert.True(sean.Bilis < other.Bilis,
+                        $"{other.Name} is not faster than SEAN ({other.Bilis} against " +
+                        $"{sean.Bilis}). Sean is the largest body in the game and the slowest by " +
+                        "design; see Roster.HeroPeople's header.");
+                }
+            }
+
+            // The ladder, so the size of the debuff is on record and not only its direction.
+            Assert.Equal(0.90f, Roster.TraitScale(1, Balance.TraitSpeedPerPoint), 6);
+            Assert.Equal(0.95f, Roster.TraitScale(2, Balance.TraitSpeedPerPoint), 6);
+
+            // ⚠ STILL INSIDE `Balance`'s narrow-spread rule: *"a pick 40% faster than another
+            // is not a personality, it is the correct answer"*. The widest gap is 17%.
+            float slowest = Roster.TraitScale(Roster.TraitMin, Balance.TraitSpeedPerPoint);
+            float fastest = Roster.TraitScale(Roster.TraitMax, Balance.TraitSpeedPerPoint);
+            Assert.True(fastest / slowest < 1.40f,
+                "the speed spread across the roster has passed 40%, which Balance's trait note " +
+                "calls the point where a pick stops being a personality and becomes the correct " +
+                "answer");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ NEUTRAL IS EXACTLY 1.0 BY CONSTRUCTION. That is what makes "no pick", "an AI
+        /// seat", "a peer on an older build" and "entry 0" all play the same game.
+        /// </summary>
+        [Fact]
+        public void NeutralIsExactlyOne_OnEveryStat()
+        {
+            Assert.Equal(1.0f, Roster.TraitScale(Roster.TraitNeutral, Balance.TraitSpeedPerPoint), 6);
+            Assert.Equal(1.0f, Roster.TraitScale(Roster.TraitNeutral, Balance.TraitPowerPerPoint), 6);
+            Assert.Equal(1.0f, Roster.TraitScale(Roster.TraitNeutral, Balance.TraitGritPerPoint), 6);
+
+            // An index with no entry resolves to neutral rather than throwing.
+            Assert.Equal(1.0f, Roster.PersonSpeedScale(-1), 6);
+            Assert.Equal(1.0f, Roster.PersonGritScale(9999), 6);
+        }
+
+        /// <summary>
+        /// ⚠️ ENTRY 0 OF EACH PROP LIST STAYS NEUTRAL ON PURPOSE. It is what an unpicked
+        /// prop wears, so a non-neutral row would silently retune every AI seat and every
+        /// peer that never reached the CHARACTER screen.
+        /// </summary>
+        [Fact]
+        public void EntryZeroOfEachPropList_IsNeutral()
+        {
+            Assert.Equal(1.0f, Roster.SlipperFlightScale(0), 6);
+            Assert.Equal(1.0f, Roster.SlipperImpactScale(0), 6);
+            Assert.Equal(1.0f, Roster.SlipperRecoveryScale(0), 6);
+        }
+
+        /// <summary>
+        /// ⚠️ GRIT DIVIDES, SO ITS SCALE MAY NEVER REACH ZERO. The floor cannot be hit by
+        /// any authored row; it exists so a future per-point change cannot make it so.
+        /// </summary>
+        [Fact]
+        public void GritScale_IsFlooredSoItCanNeverDivideByZero()
+        {
+            for (int i = 0; i < Roster.People.Count; i++)
+                Assert.True(Roster.PersonGritScale(i) >= 0.1f);
+        }
+
+        /// <summary>
+        /// ⚠️ THE THREE LATA STATS ARE THREE ROUTES TO ONE GOAL. Each can owns exactly one
+        /// 5: a can that did all three would simply be the correct answer.
+        /// </summary>
+        [Fact]
+        public void NoCanIsBestAtEverything()
+        {
+            foreach (var can in Roster.Cans)
+            {
+                int fives = 0;
+                if (can.Bilis == 5) fives++;
+                if (can.Lakas == 5) fives++;
+                if (can.Tatag == 5) fives++;
+                Assert.True(fives <= 1, $"{can.Name} owns more than one 5 and dominates the tab");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE TWO STAT TABLES COMPOSE AND NEITHER KNOWS ABOUT THE OTHER, BUT ONLY ONE
+        /// OF THEM IS STILL ALLOWED TO SPEAK IN CLASSIC. `Make Classic character choices
+        /// cosmetic` archived the person table there, so `Roster.PersonGritScale` answers a
+        /// flat 1.0 for every Classic index and a blocker's own grit divides nothing. The
+        /// equipment half is untouched, in both modes.
+        ///
+        /// ⚠️ THIS FIXTURE ASSERTED THE PRE-COSMETIC COMPOSITION AND HAD BEEN RED SINCE. The
+        /// published pair below is kept, because it is still exactly reproducible: it was
+        /// measured on Jun-Jun, whose tatag is 2, and 2 was never the reason for either
+        /// figure. Design.md's sentence names Bebang and Jun-Jun and its measurement then
+        /// says "on one blocker", which reads as one slipper on two people and is two
+        /// slippers on one: 5.618 / 4.238 is the IMPACT ratio 1.14 / 0.86 and no grit ratio.
+        /// What changed under it is the DIVISOR, which is 1.0 in Classic and the blocker's
+        /// own grit in Hero Strike, so the pair now reproduces against Classic exactly.
+        /// </summary>
+        [Fact]
+        public void BodyBlock_ScalesByThrowerImpactAndDividesByBlockerGrit()
+        {
+            int crocs = IndexOf(Roster.Slippers, "crocs");
+            int pantulog = IndexOf(Roster.Slippers, "pantulog");
+            int bebang = IndexOf(Roster.People, "bebang");
+            int junjun = IndexOf(Roster.People, "jun_jun");
+
+            // The impact half, which is equipment and survives the archive. Both published
+            // figures are the neutral push scaled by the slipper alone.
+            Assert.Equal(5.16f, Combat.BlockKnockbackSpeed(pantulog, junjun), 2);
+            Assert.Equal(6.84f, Combat.BlockKnockbackSpeed(crocs, junjun), 2);
+            Assert.Equal(1.14f / 0.86f,
+                Combat.BlockKnockbackSpeed(crocs, junjun) / Combat.BlockKnockbackSpeed(pantulog, junjun), 3);
+
+            // ⚠️ AND THE REVERSAL ITSELF, ASSERTED SO IT CANNOT COME BACK BY ACCIDENT.
+            // Bebang is grit 5 and Jun-Jun is grit 2 and in Classic they take the identical
+            // push, because the character a Classic player picks is a costume.
+            Assert.Equal(Combat.BlockKnockbackSpeed(crocs, bebang),
+                         Combat.BlockKnockbackSpeed(crocs, junjun), 6);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE SENTENCE'S OWN CLAIM STILL HOLDS, IN THE MODE THAT STILL HAS CHARACTERS.
+        /// Hero Strike keeps its own person table, so grit there divides the push a body
+        /// block costs the blocker exactly as `Design.md` describes. `CombatVerbs` passed
+        /// `victim.Mode` for the tag and the shove already; the body block did not, so this
+        /// comparison was 1.00 for every hero in the game until `Combat.BlockKnockbackSpeed`
+        /// grew the mode overload this asserts.
+        /// </summary>
+        [Fact]
+        public void BodyBlock_InHeroStrike_IsStillDividedByTheBlockersGrit()
+        {
+            int crocs = IndexOf(Roster.Slippers, "crocs");
+            int dante = IndexOf(Roster.HeroPeople, "dante"); // tatag 5, scale 1.14
+            int zack = IndexOf(Roster.HeroPeople, "zack");  // tatag 3, scale 1.00
+
+            float onDante = Combat.BlockKnockbackSpeed(crocs, dante, GameMode.HeroStrike);
+            float onZack = Combat.BlockKnockbackSpeed(crocs, zack, GameMode.HeroStrike);
+
+            Assert.True(onDante < onZack, "grit must reduce the push a block costs you");
+            Assert.Equal(onZack / 1.14f, onDante, 3);
+
+            // And Classic is the flat case beside it, off the same throw.
+            Assert.Equal(Combat.BlockKnockbackSpeed(crocs, dante, GameMode.Classic),
+                         Combat.BlockKnockbackSpeed(crocs, zack, GameMode.Classic), 6);
+        }
+
+        /// <summary>
+        /// The reset channel divides by the can's RESET: fastest on PASIP.
+        ///
+        /// ⚠️ ASSERTS 1.36 / 1.67, NOT Design.md's 1.30 / 1.79. Drift 4. lata.gd:178 is
+        /// `RESET_CHANNEL_TIME / _scale(&"bilis", TRAIT_SPEED_PER_POINT)`, i.e. 5% per
+        /// point, which gives 1.5/1.10 and 1.5/0.90. Reproducing the doc's pair needs
+        /// roughly 8% per point, so those figures predate the current constant. The
+        /// ORDERING is the design and it is unaffected.
+        /// </summary>
+        [Fact]
+        public void ResetChannel_IsFastestOnPasipAndSlowestOnBoyben()
+        {
+            float pasip = Combat.ResetChannelFor(IndexOf(Roster.Cans, "pasip"));
+            float boyben = Combat.ResetChannelFor(IndexOf(Roster.Cans, "boyben"));
+
+            Assert.Equal(1.364f, pasip, 2);
+            Assert.Equal(1.667f, boyben, 2);
+            Assert.True(pasip < boyben, "the tall empty can must be the quick one to right");
+        }
+
+        /// <summary>Names have one cap, not two on one row: nothing clips at draw time.</summary>
+        [Fact]
+        public void EveryAuthoredName_FitsThePlayerNameCap()
+        {
+            foreach (var e in Roster.People)
+                Assert.True(e.Name.Length <= Balance.PlayerNameMax,
+                    $"{e.Name} is {e.Name.Length} chars and would be clipped on a card");
+        }
+
+        [Fact]
+        public void TournamentPenalties_ValuesAreNegativeAndConsistent()
+        {
+            Assert.Equal(-5, Balance.ScoreTayaCampPenalty);
+            Assert.Equal(-5, Balance.ScoreUnretrievedPenalty);
+            Assert.Equal(-5, MatchRules.PointsFor(ScoreEvent.TayaCampPenalty));
+            Assert.Equal(-5, MatchRules.PointsFor(ScoreEvent.UnretrievedSlipperPenalty));
+            Assert.Equal(5.0f, Balance.TayaCampGracePeriod);
+            Assert.True(Balance.TayaCampWarningTime < Balance.TayaCampGracePeriod);
+            Assert.True(Balance.TayaCampClearRadius > Balance.TayaCampRadius);
+            Assert.True(Balance.SlipperUnretrievedWarningTime < Balance.SlipperUnretrievedGracePeriod);
+            Assert.Equal(15.0f, Balance.SlipperUnretrievedGracePeriod);
+            Assert.Equal(7.5f, Balance.SlipperUnretrievedWarningTime);
+            Assert.Equal(2.5f, Balance.TayaCampWarningTime);
+            Assert.Equal(1.5f, Balance.TayaCampRadius);
+            Assert.Equal(2.0f, Balance.TayaCampClearRadius);
+            Assert.Equal(0f, Balance.FatigueTime);
+            Assert.Equal(1f, Balance.FatigueSpeedScale);
+        }
+
+        [Fact]
+        public void TournamentCamping_UsesHysteresisAndDeterministicReset()
+        {
+            Assert.True(TournamentRules.IsTayaCamping(false, Balance.TayaCampRadius));
+            Assert.True(TournamentRules.IsTayaCamping(true, Balance.TayaCampRadius + 0.3f));
+            Assert.False(TournamentRules.IsTayaCamping(true, Balance.TayaCampClearRadius + 0.01f));
+
+            float timer = TournamentRules.StepViolationTimer(4.9f, true, 0.2f);
+            Assert.True(TournamentRules.IsCampPenalty(timer));
+            Assert.Equal(0.0f, TournamentRules.StepViolationTimer(timer, false, 0.1f));
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THIS TEST USED TO PASS WHILE THE THING IT IS NAMED FOR WAS FALSE. It compared
+        /// each objective against ten seconds of passive charge and found 25 > 10 and 20 > 10,
+        /// which is true and proves nothing: the quantity that mattered was passive charge
+        /// against the WHOLE ROUND. At 1.0/s over 90 s that was 90 of the 100 needed, so waiting
+        /// was worth nine tenths of an ultimate and "favors objectives over waiting" was exactly
+        /// backwards.
+        ///
+        /// The passive trickle is deleted. This now asserts the shape that replaced it, which
+        /// cannot be satisfied by a bad constant the way a 10-second window could.
+        /// </summary>
+        [Fact]
+        public void HeroUltimateEconomy_UsesOnlyTheOwnersThreeIncomeSources()
+        {
+            Assert.Equal(0f, Balance.UltimateChargeLegalThrow);
+            Assert.Equal(0f, Balance.UltimateChargeOwnSlipperRetrieved);
+            Assert.Equal(1f, Balance.UltimateChargeLataKnock);
+            Assert.Equal(1f, Balance.UltimateChargeTag);
+            Assert.Equal(1f, Balance.UltimateChargeDefenderRound);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE OBJECTIVE IS THE UNIT OF THE METER, AND THAT IS THE POINT OF THE 2026-08-27
+        /// RESCALE. Every other earning is expressed as a fraction of one lata knockdown, so
+        /// "how close am I" is a count rather than a division nothing on screen shows you. If a
+        /// future pass wants a knockdown to be worth more than one, it wants a cheaper ultimate
+        /// instead: this is the anchor everything else is priced against.
+        /// </summary>
+        [Fact]
+        public void HeroUltimateEconomy_OneObjectiveIsOneCharge()
+        {
+            Assert.Equal(1.0f, Balance.UltimateChargeLataKnock);
+            Assert.Equal(Balance.UltimateChargeLataKnock, Balance.UltimateChargeTag);
+
+            // A fraction of the objective, both of them, and in the order VISION.md § 0 sets.
+            Assert.True(Balance.UltimateChargeOwnSlipperRetrieved < Balance.UltimateChargeLataKnock);
+            Assert.Equal(0f, Balance.UltimateChargeLegalThrow);
+            Assert.Equal(0f, Balance.UltimateChargeOwnSlipperRetrieved);
+        }
+
+        [Fact]
+        public void Scoreboard_PenaltiesClampAtZero()
+        {
+            var board = new Scoreboard();
+            board.Add(0, ScoreEvent.TayaCampPenalty);
+            Assert.Equal(0, board[0]); // should clamp at zero, not go negative
+
+            board.Set(0, 10);
+            board.Add(0, ScoreEvent.TayaCampPenalty);
+            Assert.Equal(5, board[0]);
+
+            board.Add(0, ScoreEvent.UnretrievedSlipperPenalty);
+            Assert.Equal(0, board[0]);
+        }
+
+        [Fact]
+        public void Pektus_CurveConstantsAreValid()
+        {
+            Assert.True(Balance.PektusCurveStrength > 0.0f);
+            Assert.True(Balance.MaxPektusSpin >= 1.0f);
+            Assert.True(Balance.SlipperMaxRestReach > 0.0f);
+            Assert.True(Balance.SlipperMaxRestReach < Balance.PickupRadius,
+                "a slipper resting at the full pickup radius above the feet can only be " +
+                "reached from exactly underneath it, so the out-of-play cutoff must be lower");
+            Assert.True(Balance.PektusBankRestitution > Balance.BounceRestitution);
+            Assert.Equal(1, Balance.MaxScoringBanks);
+        }
+
+        // ===================================================================
+        // helpers
+        // ===================================================================
+
+        private static Stamina DrainedToEmpty()
+        {
+            var s = new Stamina();
+            const float dt = 1.0f / 60.0f;
+            int guard = 0;
+            while (s.Current > 0 && guard++ < 2000)
+                s.Step(dt, moving: true, sprintHeld: true);
+            return s;
+        }
+
+        // ===================================================================
+        // THE REMATCH VOTE
+        //
+        // ⚠️⚠️ `docs/TODO.md` § 1 WARNS THAT THE WIRE HALF CANNOT BE FINISHED HONESTLY WITHOUT
+        // TWO REAL PROCESSES ON A LAN, AND THAT IS STILL TRUE OF THE TRANSPORT. It is not true
+        // of the rules the transport carries, and those are the parts that actually broke: the
+        // ready gate once confused a transport peer id with a seat id. `Core.RematchVote` holds
+        // the same rules where they can be asserted rather than played.
+        // ===================================================================
+
+        /// <summary>
+        /// ⚠️ NGO PEER 0 IS A REAL VOTER AND MUST STAY DISTINCT FROM CLIENT 1. Mapping the host
+        /// to its seat number makes a host in seat 1 collide with client id 1 and strands the
+        /// gate one vote short forever.
+        /// </summary>
+        [Fact]
+        public void Rematch_WithdrawnEligibilityCannotSatisfyTheRemainingQuorum()
+        {
+            var vote = new RematchVote(); vote.Add(0); vote.Add(1); vote.Add(2);
+            vote.RetainEligible(peer => peer == 0);
+            Assert.Equal(1, vote.Count); Assert.True(vote.HasVoted(0));
+            Assert.False(vote.HasVoted(1)); Assert.False(vote.Satisfied(2));
+            vote.RetainEligible(_ => false);
+            Assert.False(vote.Satisfied(0));
+        }
+
+        [Fact]
+        public void Rematch_HostPeerZeroNeverCollidesWithClientOne()
+        {
+            var vote = new RematchVote();
+
+            Assert.True(vote.Add(0));
+            Assert.True(vote.Add(1));
+
+            Assert.Equal(2, vote.Count);
+            Assert.True(vote.HasVoted(0));
+            Assert.True(vote.HasVoted(1));
+            Assert.True(vote.Satisfied(2));
+        }
+
+        /// <summary>⚠️ A SECOND PRESS FROM ONE PEER CHANGES NOTHING. It is a set, exactly as the
+        /// ready gate is, so a player leaning on the button cannot open a gate alone.</summary>
+        [Fact]
+        public void Rematch_APeerCannotVoteTwice()
+        {
+            var vote = new RematchVote();
+
+            vote.Add(2);
+            vote.Add(2);
+            vote.Add(3);
+
+            Assert.Equal(2, vote.Count);
+            Assert.False(vote.Satisfied(3));
+            Assert.True(vote.Satisfied(2));
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A PEER THAT LEAVES MID-VOTE MUST NOT STRAND THE REST, and this is the failure
+        /// `ReadyGate.OnPeerLeft` was written for: the expected count drops when somebody quits,
+        /// and if nobody re-evaluates, the players still watching wait forever on a gate that is
+        /// already satisfied.
+        /// </summary>
+        [Fact]
+        public void Rematch_ALeavingPeerReleasesTheGate()
+        {
+            var vote = new RematchVote();
+
+            vote.Add(1);
+            vote.Add(2);
+            Assert.False(vote.Satisfied(3));
+
+            // Peer 3 quits without voting. Two of two remaining have pressed.
+            Assert.False(vote.Remove(3));
+            Assert.True(vote.Satisfied(2));
+
+            // And a peer that HAD voted takes its vote with it.
+            Assert.True(vote.Remove(2));
+            Assert.Equal(1, vote.Count);
+            Assert.False(vote.Satisfied(2));
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ AN EMPTY LOBBY MUST NOT START A MATCH. `Count >= expected` alone is true at
+        /// 0 >= 0, so a lobby that empties out entirely would have begun a rematch that nobody
+        /// asked for. The floor is the whole reason `Satisfied` exists rather than the caller
+        /// comparing two numbers.
+        /// </summary>
+        [Fact]
+        public void Rematch_NobodyVotingNeverStartsAMatch()
+        {
+            var vote = new RematchVote();
+
+            Assert.False(vote.Satisfied(0));
+            Assert.False(vote.Satisfied(1));
+
+            vote.Add(1);
+            vote.Clear();
+            Assert.False(vote.Satisfied(0));
+        }
+
+        private static int IndexOf(IReadOnlyList<RosterEntry> entries, string id)
+        {
+            for (int i = 0; i < entries.Count; i++)
+                if (entries[i].Id == id) return i;
+            return -1;
+        }
+
+        private static int CountRoundsDefending(int slot)
+        {
+            int n = 0;
+            for (int r = 1; r <= Balance.Rounds; r++)
+                if (MatchRules.DefenderSlotFor(r) == slot) n++;
+            return n;
+        }
+    }
+}

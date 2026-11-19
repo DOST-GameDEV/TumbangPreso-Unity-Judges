@@ -1,0 +1,308 @@
+using System.Collections.Generic;
+
+namespace TumbangPreso.Core
+{
+    /// <summary>
+    /// The multiplicative stack of speed modifiers.
+    ///
+    /// ⚠️ FATIGUE RIDES THIS STACK RATHER THAN BEING MULTIPLIED IN DIRECTLY, so it
+    /// composes with a hazard zone instead of one of the two silently winning. The
+    /// hazard-zone system still exists and still works even though nothing currently
+    /// places one, so the composition is live even when only fatigue uses it.
+    /// </summary>
+    public sealed class SpeedZoneStack
+    {
+        private readonly List<float> _multipliers = new List<float>();
+
+        public void Enter(float multiplier) => _multipliers.Add(multiplier);
+
+        /// <summary>Removes ONE instance, not all matching. Two overlapping zones of the
+        /// same strength must each be exited once.</summary>
+        public void Exit(float multiplier)
+        {
+            int i = _multipliers.IndexOf(multiplier);
+            if (i >= 0) _multipliers.RemoveAt(i);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE LOWEST WINS; SLOWS DO NOT MULTIPLY. `character_base.gd`'s
+        /// `_recompute_speed_multiplier()` takes `minf` across the stack, and this used to
+        /// take the PRODUCT — a real divergence, not a rounding one.
+        ///
+        /// Fatigue (0.75) rides this same stack, so standing fatigued in a 0.5 hazard gave
+        /// 0.375 here against Godot's 0.5. Two overlapping 0.5 zones gave 0.25 against 0.5.
+        /// Compounding slows turns a pair of hazards into a near-stun, which is the same
+        /// reasoning that keeps stuns on Max() rather than additive.
+        /// </summary>
+        public float Value
+        {
+            get
+            {
+                float lowest = 1.0f;
+                for (int i = 0; i < _multipliers.Count; i++)
+                    if (_multipliers[i] < lowest) lowest = _multipliers[i];
+                return lowest;
+            }
+        }
+
+        public int Count => _multipliers.Count;
+
+        public void Clear() => _multipliers.Clear();
+    }
+
+    /// <summary>
+    /// How one body's stamina spends and refills. The capacity is always `Balance.StaminaMax`, so snapshots, the sprint floor
+    /// and every paid verb keep one unit; a hero with its own energy changes only these rates (Zack's Charge, 2026-10-26).
+    /// Every peer derives it from the body's kit and state, so the host's authoritative pool and the owner's agree.
+    /// </summary>
+    public readonly struct StaminaProfile
+    {
+        public readonly float DrainRate, RegenDelay, RegenRate;
+        /// <summary>A sprint that costs nothing and needs no start floor (Zack while Overclocked); the bar refills under it.</summary>
+        public readonly bool FreeSprint;
+
+        public StaminaProfile(float drainRate, float regenDelay, float regenRate, bool freeSprint = false)
+        {
+            DrainRate = drainRate; RegenDelay = regenDelay; RegenRate = regenRate; FreeSprint = freeSprint;
+        }
+
+        public static StaminaProfile Shared => new StaminaProfile(Balance.StaminaDrainRate, Balance.StaminaRegenDelay, Balance.StaminaRegenRate);
+
+        public bool IsValid => Finite(DrainRate) && DrainRate > 0.0f && Finite(RegenDelay) && RegenDelay >= 0.0f
+                               && Finite(RegenRate) && RegenRate > 0.0f;
+
+        private static bool Finite(float v) => !float.IsNaN(v) && !float.IsInfinity(v);
+    }
+
+    /// <summary>
+    /// The stamina pool and sprint. Depletion stops sprinting without an exhaustion lockout.
+    ///
+    /// ⚠️⚠️ THE FINDING IS THE DISTANCE, NOT THE TIME. StaminaMax, StaminaDrainRate,
+    /// SprintScale and ConfinementRadius are ONE INTERLOCKED SET: the bar is dimensioned
+    /// to roughly one crossing of the danger zone, which is the retrieval the whole game
+    /// is about. Move the box and you change what a sprint buys. Nothing had written that
+    /// down until it was measured, and it is the reason a change to any one of the four
+    /// has to be re-measured against the other three rather than reasoned about.
+    ///
+    /// ⚠️ THIS CLASS IS PURE. It holds no transform and touches no engine. Everything it
+    /// needs arrives as arguments, which is what lets a full sprint-to-empty be asserted
+    /// in a unit test in microseconds instead of played out in an editor.
+    /// </summary>
+    public sealed class Stamina
+    {
+        private float _current = Balance.StaminaMax;
+        private float _idle;
+        private float _fatigueLeft;
+        private bool _isSprinting;
+
+        private readonly SpeedZoneStack _speedZones;
+
+        public Stamina(SpeedZoneStack speedZones = null)
+        {
+            _speedZones = speedZones ?? new SpeedZoneStack();
+        }
+
+        public float Current => _current;
+        public float Ratio => _current / Balance.StaminaMax;
+        public bool IsSprinting => _isSprinting;
+        public bool IsFatigued => _fatigueLeft > 0.0f;
+        public float FatigueLeft => _fatigueLeft;
+        public float IdleSeconds => _idle;
+        public SpeedZoneStack SpeedZones => _speedZones;
+
+        private StaminaProfile _profile = StaminaProfile.Shared;
+
+        /// <summary>The body's spend and refill rates (`StaminaProfile`); an invalid profile falls back to the shared one.</summary>
+        public StaminaProfile Profile
+        {
+            get => _profile;
+            set => _profile = value.IsValid ? value : StaminaProfile.Shared;
+        }
+
+        /// <summary>
+        /// Applies the host's resource state to a joining or live client.
+        ///
+        /// The legacy fatigue field stays in the wire layout. Clamp it before updating
+        /// zone membership so a retired exhaustion timer cannot leave a ghost zone.
+        /// </summary>
+        public void ApplyNetworkSnapshot(float current, float idle, float fatigueLeft)
+        {
+            fatigueLeft = System.Math.Clamp(fatigueLeft, 0.0f, Balance.FatigueTime);
+            bool wasFatigued = _fatigueLeft > 0.0f;
+            bool willBeFatigued = fatigueLeft > 0.0f;
+
+            if (wasFatigued && !willBeFatigued)
+                _speedZones.Exit(Balance.FatigueSpeedScale);
+            else if (!wasFatigued && willBeFatigued)
+                _speedZones.Enter(Balance.FatigueSpeedScale);
+
+            _current = System.Math.Clamp(current, 0.0f, Balance.StaminaMax);
+            _idle = System.Math.Max(0.0f, idle);
+            _fatigueLeft = fatigueLeft;
+            // A resource correction is not a release of the owner's sprint key.
+            // Preserve continuation below the start floor; empty/fatigue still stop it.
+            _isSprinting = _isSprinting && _current > 0 && !willBeFatigued;
+        }
+
+        /// <summary>
+        /// One physics step. Returns the speed multiplier the SPRINT contributes, which
+        /// is either SprintScale or 1.0. The fatigue penalty is deliberately NOT in this
+        /// return value: it is on the speed-zone stack.
+        /// </summary>
+        public float Step(float delta, bool moving, bool sprintHeld)
+        {
+            if (_fatigueLeft > 0.0f)
+            {
+                // ⚠️⚠️ NO REGEN WHILE FATIGUED. This used to refill the bar at full rate
+                // DURING the penalty, so a player who ran themselves to zero was already
+                // recovering while "being punished" and walked out with a usable bar.
+                // The punishment did not touch the resource it was punishing.
+                _isSprinting = false;
+                _idle += delta;
+                return 1.0f;
+            }
+
+            bool wants = moving && sprintHeld;
+
+            // ⚠️ THE FLOOR IS WHAT STOPS THE BAR BEING FEATHERED. You may CONTINUE a
+            // sprint at any level, but you may not START one below StaminaSprintFloor,
+            // so tapping Shift on a sub-tick rhythm cannot buy a permanent sprint.
+            bool mayStart = _isSprinting || _current >= Balance.StaminaSprintFloor || _profile.FreeSprint;
+            _isSprinting = wants && mayStart && (_current > 0.0f || _profile.FreeSprint);
+
+            if (_isSprinting)
+            {
+                // A free sprint spends nothing, and the bar underneath keeps refilling as if he were resting.
+                if (_profile.FreeSprint)
+                {
+                    _idle += delta;
+                    if (_idle >= _profile.RegenDelay && !RecoveryBlocked)
+                        _current = System.Math.Min(Balance.StaminaMax, _current + _profile.RegenRate * delta);
+                    return Balance.SprintScale;
+                }
+                _current -= _profile.DrainRate * delta;
+                if (_current < 0.0f) _current = 0.0f;
+                _idle = 0.0f;
+
+                if (_current <= 0.0f)
+                {
+                    StopDepletedSprint();
+                    return 1.0f;
+                }
+                return Balance.SprintScale;
+            }
+
+            _idle += delta;
+            if (_idle >= _profile.RegenDelay && !RecoveryBlocked)
+            {
+                _current += _profile.RegenRate * delta;
+                if (_current > Balance.StaminaMax) _current = Balance.StaminaMax;
+            }
+            return 1.0f;
+        }
+
+        /// <summary>
+        /// ⚠️ DRAINED (HERO-10 v3, the owner's table): *"Prevents stamina recovery for 2.5 seconds."* Set every step by
+        /// the body from its own replicated status timer, so the bar and the icon cannot disagree and a joining peer needs
+        /// nothing extra. The idle clock keeps counting through it, so recovery resumes the moment the status ends rather
+        /// than a regen delay later.
+        /// </summary>
+        public bool RecoveryBlocked { get; set; }
+
+        /// <summary>
+        /// ⚠️ DRAINED: *"Depletes stamina to 0."* The bar empties and any sprint stops. It is NOT fatigue: the owner's
+        /// row says nothing about the fatigue slow, so none is added; an empty bar already refuses a sprint start
+        /// (`StaminaSprintFloor`) and every paid verb.
+        /// </summary>
+        public void Deplete()
+        {
+            _current = 0.0f;
+            _isSprinting = false;
+        }
+
+        /// <summary>
+        /// Counts the fatigue window down.
+        ///
+        /// ⚠️ THE SPEED ZONE IS EXITED BEFORE _fatigueLeft IS ZEROED, and the order is
+        /// load-bearing. Zero it first and the 0.75 multiplier is orphaned on the stack
+        /// for the rest of the round, because this is the only frame that ever pops it
+        /// and that frame would never come.
+        /// </summary>
+        public void StepFatigue(float delta)
+        {
+            if (_fatigueLeft <= 0.0f) return;
+
+            _fatigueLeft -= delta;
+            if (_fatigueLeft <= 0.0f)
+            {
+                _speedZones.Exit(Balance.FatigueSpeedScale);
+                _fatigueLeft = 0.0f;
+            }
+        }
+
+        private void StopDepletedSprint()
+        {
+            _isSprinting = false;
+        }
+
+        /// <summary>
+        /// Pay a one-off cost, such as a retrieval slide. An empty bar stops the
+        /// current sprint and starts the normal regen delay without an extra penalty.
+        /// </summary>
+        public bool Spend(float amount)
+        {
+            if (_fatigueLeft > 0.0f || _current < amount) return false;
+
+            _current -= amount;
+            _idle = 0.0f;
+            if (_current <= 0.0f)
+            {
+                _current = 0.0f;
+                StopDepletedSprint();
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Reverse a predicted spend refused by the host. This is not a general
+        /// stamina pickup. Clamp to capacity if regeneration beat the refund.
+        /// </summary>
+        public void Refund(float amount)
+        {
+            if (amount <= 0.0f) return;
+
+            bool wasEmptied = _current <= 0.0f;
+
+            _current += amount;
+            if (_current > Balance.StaminaMax) _current = Balance.StaminaMax;
+
+            if (wasEmptied && _current > 0.0f && _fatigueLeft > 0.0f)
+            {
+                _speedZones.Exit(Balance.FatigueSpeedScale);
+                _fatigueLeft = 0.0f;
+            }
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A TAG CLEANSES. The moment an attacker is most likely to be tagged is the
+        /// moment they are most likely to be EMPTY: they sprinted in, grabbed, and were
+        /// caught on the way out. Stacking a 5 s stun, a spent bar and a live fatigue
+        /// lockout onto one mistake meant the two INVISIBLE punishments outlasted the one
+        /// the HUD showed. The penalty that remains is the teleport, the five seconds,
+        /// and the whole trip to make again.
+        /// </summary>
+        public void RefillAndClearFatigue()
+        {
+            if (_fatigueLeft > 0.0f) _speedZones.Exit(Balance.FatigueSpeedScale);
+            _fatigueLeft = 0.0f;
+            _current = Balance.StaminaMax;
+            _idle = 0.0f;
+            _isSprinting = false;
+        }
+
+        /// <summary>Absolute ordinary locomotion speed; character traits do not scale it.</summary>
+        public static float MovementSpeed(bool isDefender, bool running) => isDefender
+            ? (running ? Balance.DefenderRunSpeed : Balance.DefenderWalkSpeed)
+            : (running ? Balance.AttackerRunSpeed : Balance.AttackerWalkSpeed);
+    }
+}

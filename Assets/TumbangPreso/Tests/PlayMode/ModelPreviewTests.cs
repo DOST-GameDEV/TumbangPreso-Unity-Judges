@@ -1,0 +1,752 @@
+using System.Collections;
+using System.IO;
+using System.Linq;
+using TumbangPreso.UI.Hub;
+using NUnit.Framework;
+using TumbangPreso.UI;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.SceneManagement;
+using UnityEngine.TestTools;
+
+namespace TumbangPreso.PlayTests
+{
+    /// <summary>
+    /// The CHARACTER screen's model preview: framed to the panel, posed, and movable.
+    ///
+    /// ⚠️⚠️ ALL FOUR OF THESE SHIPPED BROKEN TOGETHER AND NONE OF THEM FAILED ANY CHECK. The
+    /// report was *"model isnt movable and its stretched"*, against a screen whose own hint line
+    /// reads "Drag to turn the view · scroll to zoom · right-click to reset":
+    ///
+    ///  1. Nothing in the project ever called `Orbit` or `Zoom`, so all three controls were lies.
+    ///  2. The render target was a fixed 512x640 stretched across a panel of another shape.
+    ///  3. The framing fitted height alone and ignored the aspect entirely.
+    ///  4. No clip was playing, so the subject stood in its bind pose with its arms straight out.
+    ///
+    /// The assertions below are the mechanism rather than the picture, because a picture cannot
+    /// fail a build. The pictures are written beside them for the reader.
+    /// </summary>
+    public class ModelPreviewTests
+    {
+        private bool _hubEnabled;
+        /// <summary>
+        /// ⚠️⚠️ THE PAIR THAT MAKES A FULL-SUITE RESULT MEAN ANYTHING. `docs/TODO.md` § 126.8:
+        /// the full PlayMode run came back 42, 41 and then 56 red with the red set moving, and a
+        /// gate whose red set moves is not measuring the code. `PlayModeWorld.Reset` has the
+        /// mechanism and why BOTH hooks are needed rather than one.
+        /// </summary>
+        [UnitySetUp]
+        public IEnumerator ResetWorldBefore()
+        {
+            _hubEnabled = ConvertedMatchSetup.HubEnabled;
+            yield return PlayModeWorld.Reset();
+        }
+
+        /// <summary>
+        /// ⚠️ THE RULE PIN IS RELEASED HERE OR EVERY SUITE AFTER THIS ONE INHERITS IT.
+        /// SceneFlow.RulesPinned is process state, and process state outliving the fixture
+        /// that set it is the whole of docs/TODO.md § 126.8.
+        /// </summary>
+        [UnityTearDown]
+        public IEnumerator ResetWorldAfter()
+        {
+            ConvertedMatchSetup.HubEnabled = _hubEnabled;
+            UI.SceneFlow.UnpinSelectedRules();
+            yield return PlayModeWorld.Reset();
+        }
+
+        private const string OutDir = "Logs/shots-preview";
+
+        [UnityTest]
+        public IEnumerator RetainedCharacterAuthoringDoesNotCompoundBodyScaleOnRefresh()
+        {
+            var panel = new GameObject("Authoring preview", typeof(RectTransform));
+            var rect = panel.GetComponent<RectTransform>(); rect.sizeDelta = new Vector2(320, 400);
+            var preview = panel.AddComponent<ModelPreview>(); preview.Attach(rect);
+            var screen = panel.AddComponent<CustomCharacterScreen>();
+            var editing = new Core.CustomCharacter { HeightPercent = 115, BuildSizeIndex = 2 };
+            const System.Reflection.BindingFlags fields = System.Reflection.BindingFlags.Instance |
+                                                          System.Reflection.BindingFlags.NonPublic;
+            typeof(CustomCharacterScreen).GetField("_preview", fields).SetValue(screen, preview);
+            typeof(CustomCharacterScreen).GetField("_editing", fields).SetValue(screen, editing);
+            var refresh = typeof(CustomCharacterScreen).GetMethod("ShowModel", fields);
+            var art = RosterBook.Load().FindPersonArt(Core.CustomCharacterRules.BaseRigId);
+            Assert.IsNotNull(art);
+            try
+            {
+                var palette = Visual.CustomCharacterOutfit.PaletteFor(art.Palette, editing);
+                preview.Show(art.Model, art.Clips, palette, art.PetModel);
+                var baseScale = preview.Subject.transform.localScale;
+                refresh.Invoke(screen, null);
+                var first = preview.Subject;
+                var expected = Vector3.Scale(baseScale, new Vector3(
+                    Core.CustomCharacterRules.BuildWidthScale(2), 1.15f,
+                    Core.CustomCharacterRules.BuildWidthScale(2)));
+                Assert.Less(Vector3.Distance(expected, first.transform.localScale), 0.0001f);
+                int dressedParts = first.GetComponentsInChildren<Renderer>().Length;
+                refresh.Invoke(screen, null);
+                Assert.AreNotSame(first, preview.Subject);
+                Assert.IsFalse(first.activeSelf);
+                Assert.Less(Vector3.Distance(expected, preview.Subject.transform.localScale), 0.0001f);
+                Assert.AreEqual(dressedParts, preview.Subject.GetComponentsInChildren<Renderer>().Length);
+
+                editing.HeightPercent = 85; editing.BuildSizeIndex = 1;
+                refresh.Invoke(screen, null);
+                expected = Vector3.Scale(baseScale, new Vector3(
+                    Core.CustomCharacterRules.BuildWidthScale(1), 0.85f,
+                    Core.CustomCharacterRules.BuildWidthScale(1)));
+                Assert.Less(Vector3.Distance(expected, preview.Subject.transform.localScale), 0.0001f);
+                var current = preview.Subject;
+                preview.Show(art.Model, art.Clips, palette, art.PetModel);
+                Assert.AreSame(current, preview.Subject, "Ordinary selection must still reuse its subject.");
+                Assert.IsFalse(CustomCharacterScreen.AvailableToPlayers);
+                Assert.IsFalse(screen.IsOpen, "The retained authoring check must not enable its retired player door.");
+                yield return null;
+                Assert.IsTrue(first == null);
+            }
+            finally { Object.DestroyImmediate(panel); }
+        }
+
+        [UnityTest]
+        public IEnumerator CharacterBindingReleasesGeneratedAvatarsButPreservesBorrowedAssets()
+        {
+            var art = RosterBook.Load().FindPersonArt("dante"); Assert.IsNotNull(art);
+            var actor = new GameObject("Avatar ownership");
+            var model = Object.Instantiate(art.Model, actor.transform);
+            var animator = model.GetComponentInChildren<Animator>(); Assert.IsNotNull(animator);
+            animator.avatar = null;
+            var driver = actor.AddComponent<Visual.CharacterAnimator>(); driver.enabled = false;
+            Avatar borrowed = null;
+            try
+            {
+                driver.Bind(model, art.Clips);
+                var first = animator.avatar; Assert.IsNotNull(first); Assert.IsTrue(first.isValid);
+                driver.Bind(model, art.Clips);
+                var second = animator.avatar; Assert.IsNotNull(second); Assert.AreNotSame(first, second);
+                yield return null;
+                Assert.IsTrue(first == null, "Rebinding leaked its previous runtime avatar.");
+                Assert.IsTrue(second.isValid);
+                driver.Bind(null, null);
+                Assert.IsNull(animator.avatar);
+                yield return null;
+                Assert.IsTrue(second == null, "Clearing the binding leaked its runtime avatar.");
+
+                borrowed = AvatarBuilder.BuildGenericAvatar(animator.gameObject, "");
+                Assert.IsTrue(borrowed.isValid); animator.avatar = borrowed;
+                driver.Bind(model, art.Clips); Assert.AreSame(borrowed, animator.avatar);
+                Object.Destroy(driver);
+                yield return null;
+                Assert.IsTrue(borrowed != null && borrowed.isValid);
+                Assert.AreSame(borrowed, animator.avatar, "Teardown cleared an externally supplied avatar.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(actor);
+                if (borrowed != null) Object.DestroyImmediate(borrowed);
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator RepeatedPreviewSelectionReusesSubjectAndRetiresChangedInputsImmediately()
+        {
+            var panel = new GameObject("Preview reuse", typeof(RectTransform));
+            var rect = panel.GetComponent<RectTransform>(); rect.sizeDelta = new Vector2(320, 400);
+            var preview = panel.AddComponent<ModelPreview>(); preview.Attach(rect);
+            var art = RosterBook.Load().FindPersonArt("dante"); Assert.IsNotNull(art);
+            var palette = (Color[])art.Palette.Clone();
+            var clips = (AnimationClip[])art.Clips.Clone();
+            try
+            {
+                preview.Show(art.Model, clips, palette, art.PetModel);
+                yield return null;
+                var first = preview.Subject; Assert.IsNotNull(first);
+                var material = first.GetComponentInChildren<Renderer>().sharedMaterial;
+                preview.Orbit(new Vector2(24, 12));
+                yield return null;
+                var rotation = preview.PreviewCamera.transform.rotation;
+                preview.Show(art.Model, (AnimationClip[])clips.Clone(), (Color[])palette.Clone(), art.PetModel);
+                Assert.AreSame(first, preview.Subject);
+                Assert.AreSame(material, preview.Subject.GetComponentInChildren<Renderer>().sharedMaterial);
+                Assert.AreEqual(rotation, preview.PreviewCamera.transform.rotation);
+
+                palette[0] = Color.magenta;
+                preview.Show(art.Model, clips, palette, art.PetModel);
+                Assert.AreNotSame(first, preview.Subject); Assert.IsFalse(first.activeSelf);
+                var second = preview.Subject;
+                clips[0] = null;
+                preview.Show(art.Model, clips, palette, art.PetModel);
+                Assert.AreNotSame(second, preview.Subject); Assert.IsFalse(second.activeSelf);
+                var third = preview.Subject;
+                preview.ShowingSlipper = true;
+                preview.Show(art.Model, clips, palette, art.PetModel);
+                Assert.AreNotSame(third, preview.Subject); Assert.IsFalse(third.activeSelf);
+                var last = preview.Subject;
+                preview.Show(null, null, null, null);
+                Assert.IsNull(preview.Subject); Assert.IsFalse(last.activeSelf);
+                yield return null;
+                Assert.IsTrue(first == null && second == null && third == null && last == null);
+            }
+            finally { Object.DestroyImmediate(panel); }
+        }
+
+        [UnityTest]
+        public IEnumerator TheCharacterPreviewIsFramedPosedAndMovable()
+        {
+            Directory.CreateDirectory(OutDir);
+
+            var load = SceneManager.LoadSceneAsync("MatchSetup", LoadSceneMode.Single);
+            yield return ProbeWait.Done(load, "scene load");
+
+            for (int i = 0; i < 30; i++) yield return null;
+
+            var panel = Find("CharacterSelectPanel");
+            Assert.IsNotNull(panel, "MatchSetup has no CharacterSelectPanel to open.");
+
+            panel.SetActive(true);
+
+            // The preview builds its target from the panel's rect, which is 0 until the first
+            // layout pass, and re-frames on the frame after a subject is shown.
+            for (int i = 0; i < 20; i++) yield return null;
+
+            // ⚠️⚠️ THE PICKER'S CANVAS IS A SCENE-ROOT SIBLING OF THE PANEL, NOT A CHILD OF IT, AND
+            // THAT IS WHY THIS ANSWERED NULL. `OwnerUiLayout.Canvas` builds its root with
+            // `Rect(null, name)` and moves it into the scene, binding its LIFETIME to the owner
+            // through `CanvasLifetime` rather than its parentage, because § 111.2: a canvas
+            // nested inside another canvas silently ignores its own `CanvasScaler`. So
+            // `TumpPickerView` draws `OwnerLoadoutCanvas` beside `CharacterSelectPanel` and a
+            // `GetComponentInChildren` from the panel reaches none of it. The screen builds
+            // perfectly well; the lookup was asking the wrong object.
+            var preview = Object.FindFirstObjectByType<ModelPreview>(FindObjectsInactive.Include);
+            Assert.IsNotNull(preview, "The character panel built no ModelPreview.");
+
+            Assert.IsNotNull(preview.Subject,
+                "Nothing was instanced to look at. The roster book has no model for this pick.");
+
+            // ---- 2. THE PICTURE IS NOT SQUASHED --------------------------------------------
+            var rect = ((RectTransform)preview.transform).rect;
+            Assert.IsNotNull(preview.Target, "The preview has no render target.");
+
+            float panelAspect = rect.width / rect.height;
+            float targetAspect = (float)preview.Target.width / preview.Target.height;
+
+            Assert.AreEqual(panelAspect, targetAspect, 0.02f,
+                $"The render target is {preview.Target.width}x{preview.Target.height} on a " +
+                $"{rect.width:F0}x{rect.height:F0} panel, so every subject is stretched by the " +
+                "ratio between them.");
+
+            // ---- 4. THE SUBJECT IS POSED, NOT IN ITS BIND POSE ------------------------------
+            var animator = preview.Subject.GetComponentInChildren<Animator>();
+            Assert.IsNotNull(animator,
+                "No Animator on the previewed model, so no clip can be playing and the screen " +
+                "shows the rig's T-pose.");
+
+            // ⚠️ THE POSE MUST ACTUALLY MOVE. An Animator with a null Avatar accepts an
+            // animation output and drives nothing, so "there is an Animator" and "a clip is
+            // playing" are different claims and only the second one matters. The rig's bind
+            // pose is arms straight out, which is the T-pose the screen must never show.
+            var bone = DeepestChild(preview.Subject.transform);
+            Quaternion pose = bone.localRotation;
+
+            for (int i = 0; i < 30; i++) yield return null;
+
+            Assert.Greater(Quaternion.Angle(pose, bone.localRotation), 0.01f,
+                $"'{bone.name}' has not moved in 30 frames, so no clip is playing and the " +
+                "preview is showing the rig's bind pose.");
+
+            Capture("character-person");
+
+            // ---- 1. A DRAG REACHES IT ------------------------------------------------------
+            var input = preview.GetComponentInChildren<ModelPreviewInput>(true);
+            Assert.IsNotNull(input,
+                "The preview surface has no input component, so the panel's own hint line " +
+                "promises three controls that do not exist.");
+
+            var camera = preview.PreviewCamera;
+            Assert.IsNotNull(camera);
+
+            Quaternion before = camera.transform.rotation;
+
+            input.OnDrag(new PointerEventData(EventSystem.current)
+            {
+                button = PointerEventData.InputButton.Left,
+                delta = new Vector2(90.0f, 0.0f),
+            });
+
+            yield return null;
+
+            Assert.Greater(Quaternion.Angle(before, camera.transform.rotation), 1.0f,
+                "Dragging the preview did not move the camera.");
+
+            Capture("character-dragged");
+
+            // ---- ZOOM ----------------------------------------------------------------------
+            float distance = Vector3.Distance(camera.transform.position, Vector3.zero);
+
+            input.OnScroll(new PointerEventData(EventSystem.current)
+            {
+                scrollDelta = new Vector2(0.0f, 1.0f),
+            });
+
+            yield return null;
+
+            Assert.AreNotEqual(distance,
+                Vector3.Distance(camera.transform.position, Vector3.zero),
+                "The wheel did not dolly the preview camera.");
+
+            // ---- RIGHT-CLICK RESTORES THE FRAMED SHOT --------------------------------------
+            input.OnPointerClick(new PointerEventData(EventSystem.current)
+            {
+                button = PointerEventData.InputButton.Right,
+            });
+
+            yield return null;
+
+            // ⚠️ A FEW DEGREES OF SLACK, ON PURPOSE. The framing is re-measured from the POSED
+            // bounds, and the idle clip is still running, so the subject's height-to-width ratio
+            // drifts slightly between frames and the pitch lerp follows it. The claim being made
+            // is "right-click puts the shot back", not "to the bit".
+            Assert.Less(Quaternion.Angle(before, camera.transform.rotation), 5.0f,
+                "Right-click did not restore the auto-framed shot.");
+
+            Capture("character-reset");
+        }
+
+        /// <summary>
+        /// The cast animates in a real match.
+        ///
+        /// ⚠️⚠️ "THE WHOLE CAST STANDS PERFECTLY STILL" HAS BITTEN THIS PORT TWICE, once because
+        /// the clips were stripped from the build and once because glTFast emits an Animator
+        /// with no Avatar and an animation output bound to one drives nothing at all. Neither
+        /// failure logs anything: the characters simply stand in their bind pose, which on these
+        /// rigs is arms out, and it reads as unfinished art rather than as a bug. This asserts
+        /// the only thing that actually distinguishes the two: a bone that moves.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator TheCastAnimatesInAMatch()
+        {
+            var load = SceneManager.LoadSceneAsync("Eskinita", LoadSceneMode.Single);
+            yield return ProbeWait.Done(load, "scene load");
+
+            for (int i = 0; i < 20; i++) yield return null;
+
+            var seat = Object.FindFirstObjectByType<CharacterMotor>();
+            Assert.IsNotNull(seat, "The arena built no seats.");
+
+            var skinned = seat.GetComponentInChildren<SkinnedMeshRenderer>();
+            Assert.IsNotNull(skinned, "The seat has no skinned model.");
+
+            var animator = seat.GetComponentInChildren<Animator>();
+            Assert.IsNotNull(animator, "The seat's model has no Animator.");
+
+            Assert.IsNotNull(animator.avatar,
+                "The Animator has no Avatar, so its animation output binds to nothing and the " +
+                "character stands in its bind pose for the whole match.");
+
+            // ⚠️ A BONE, NOT MERELY THE DEEPEST CHILD.  parks a HandAnchor
+            // under the hand bone, and that node is deeper than any bone and never rotates on
+            // its own: sampling it asserts that a static child is static, which it always is.
+            var bone = DeepestBone(skinned);
+            Assert.IsNotNull(bone, "The skinned renderer has no bones.");
+
+            Quaternion pose = bone.localRotation;
+
+            for (int i = 0; i < 40; i++) yield return null;
+
+            Assert.Greater(Quaternion.Angle(pose, bone.localRotation), 0.01f,
+                $"'{bone.name}' has not moved in 40 frames of a live match.");
+        }
+
+        /// <summary>
+        /// The REPLACED character on the CHARACTER screen: the new mesh, posed, in its palette.
+        ///
+        /// ⚠️⚠️ THE SELECT SCREEN IS A SECOND CONSUMER OF THE ROSTER ART AND IT FAILS
+        /// DIFFERENTLY FROM THE MATCH. Both resolve a pick through `RosterBook`, so a swapped
+        /// model reaches both for free, but the screen instances the prefab ITSELF rather than
+        /// going through `CharacterVisual`: it applies its own scale, its own yaw and its own
+        /// `ToonSkin` call, and it plays the idle clip through `PlayIdle` instead of the
+        /// Playables graph. So "it works in a match" is not evidence that it works here, and the
+        /// screen is where a player meets a character first.
+        ///
+        /// 🧑 2026-08-17, on the first swapped rig: *"i want u to make sure the mdoel works
+        /// everuywhere even in char select"*.
+        ///
+        /// ⚠️ IT ASSERTS THE PALETTE IS LIVE, not merely supplied. `_UsePalette` is the flag
+        /// `ToonSkin` sets only when it is handed sixteen colours, and with it at zero the
+        /// character renders in the atlas's stock colours while every name and meter around it
+        /// stays correct. That is the exact failure mode the cast sheet was hiding.
+        /// </summary>
+        [UnityTest]
+        public IEnumerator TheReplacedCharacterShowsOnTheSelectScreen()
+        {
+            var load = SceneManager.LoadSceneAsync("MatchSetup", LoadSceneMode.Single);
+            yield return ProbeWait.Done(load, "scene load");
+
+            for (int i = 0; i < 30; i++) yield return null;
+
+            var panel = Find("CharacterSelectPanel");
+            Assert.IsNotNull(panel, "MatchSetup has no CharacterSelectPanel to open.");
+
+            panel.SetActive(true);
+
+            for (int i = 0; i < 20; i++) yield return null;
+
+            var preview = Object.FindFirstObjectByType<ModelPreview>(FindObjectsInactive.Include); // scene-root canvas, see above
+            Assert.IsNotNull(preview, "The character panel built no ModelPreview.");
+
+            var book = RosterBook.Load();
+            Assert.IsNotNull(book, "No RosterBook. Run RosterBookBuilder.Build.");
+
+            foreach (var (replacedId, replacedMesh) in HeroCharacters)
+            {
+                int index = Core.Roster.IndexIn(Core.Roster.People, replacedId);
+                Assert.GreaterOrEqual(index, 0, $"No roster entry '{replacedId}'.");
+
+                var art = book.PersonArt(index);
+                Assert.IsNotNull(art, $"The roster book has no art for '{replacedId}'.");
+
+                Assert.IsNotNull(art.Model, $"'{replacedId}' has no model.");
+                Assert.AreEqual(replacedMesh, art.Model.name,
+                    $"The select screen would show the retired CC0 rig for {replacedId}.");
+
+                Assert.IsNotNull(art.Palette);
+                Assert.AreEqual(16, art.Palette.Length,
+                    "A short palette reads past its end for whichever slot is missing.");
+
+                preview.Show(art.Model, art.Clips, art.Palette);
+
+                for (int i = 0; i < 20; i++) yield return null;
+
+                Assert.IsNotNull(preview.Subject, "Nothing was instanced to look at.");
+
+                var skinned = preview.Subject.GetComponentInChildren<SkinnedMeshRenderer>();
+                Assert.IsNotNull(skinned, "The previewed model has no skinned mesh.");
+
+                // The two bones the game hunts by name, checked HERE as well as in the probe because
+                // this is the path that runs in a build.
+                foreach (string wanted in new[] { "arm-right", "head" })
+                {
+                    bool found = false;
+                    foreach (var b in skinned.bones) found |= b != null && b.name == wanted;
+
+                    Assert.IsTrue(found, $"The previewed rig has no '{wanted}' bone.");
+                }
+
+                var poses = new System.Collections.Generic.Dictionary<Transform, Quaternion>();
+                foreach (var b in skinned.bones)
+                {
+                    if (b != null) poses[b] = b.localRotation;
+                }
+
+                for (int i = 0; i < 30; i++) yield return null;
+
+                float maxAngle = 0.0f;
+                foreach (var kvp in poses)
+                {
+                    float angle = Quaternion.Angle(kvp.Value, kvp.Key.localRotation);
+                    if (angle > maxAngle) maxAngle = angle;
+                }
+
+                Assert.Greater(maxAngle, 0.01f,
+                    "No bone in the rig has moved in 30 frames, so the select screen is showing " +
+                    "this character's bind pose.");
+
+                bool palettedAny = false;
+
+                foreach (var r in preview.Subject.GetComponentsInChildren<Renderer>())
+                {
+                    foreach (var material in r.sharedMaterials)
+                    {
+                        if (material == null || !material.HasProperty("_UsePalette")) continue;
+                        palettedAny |= material.GetFloat("_UsePalette") > 0.5f;
+                    }
+                }
+
+                Assert.IsTrue(palettedAny,
+                    "No material on the preview has the palette switched on, so this character is " +
+                    "wearing the atlas's stock colours on the screen the player picks from.");
+
+                Capture($"character-replaced-{replacedId}");
+            }
+        }
+
+        /// <summary>The Hero Strike cast and the custom meshes they alone must wear.</summary>
+        private static readonly (string Id, string Mesh)[] HeroCharacters = new[]
+        {
+            ("dante", "team-dante"),
+            ("cheska", "team-cheska"),
+            ("sean", "team-sean"),
+            ("zack", "team-zack"),
+            ("nemu", "team-nemu"),
+        };
+
+        [UnityTest]
+        public IEnumerator ClassicCharacterSelectDrawsTheGodotCastAndBackdrop()
+        {
+            int choice = Settings.SettingsStore.Current.HubQueueChoice;
+            int pick = Settings.SettingsStore.Current.CharacterPick;
+            try
+            {
+                HubHome.Choice = 1; Settings.SettingsStore.Current.CharacterPick = 0;
+                yield return HubFlowTests.OpenHome();
+                yield return HubFlowTests.Press("ModeCard");
+                yield return HubFlowTests.Press("CustomCard");
+                yield return HubFlowTests.Press("HostDoor");
+                yield return HubFlowTests.Press("CreateLobby");
+                float until = Time.realtimeSinceStartup + 15;
+                while (!(TumpHub.Current.Top is HubLobby) && Time.realtimeSinceStartup < until) yield return null;
+                Assert.IsInstanceOf<HubLobby>(TumpHub.Current.Top);
+                yield return HubFlowTests.OpenRoomPicker();
+                var picker = TumpHub.Current.Top;
+                Assert.IsTrue(picker.GetComponentsInChildren<UnityEngine.UI.Text>().Any(t => t.name == "Heading" && t.text == "BERTO"));
+                var preview = picker.GetComponentInChildren<ModelPreview>();
+                Assert.IsNotNull(preview.Subject);
+                // Berto (id `bayan`) wears his own redesign since the twelve Classic people were
+                // redrawn (`RosterBookBuilder.PersonModels`, `bd44c197b`), not the shared Kenney rig.
+                StringAssert.AreEqualIgnoringCase("bayan-redesign(Clone)", preview.Subject.name);
+                // The hub's authored warm stage replaces the retired blue gradient; the cast stays.
+                // The hero stands in the can's chalk circle over a soft contact shadow (2026-10-19;
+                // the stage's old "Floor" sticker read as an empty text field and was retired).
+                Assert.IsNotNull(picker.GetComponentsInChildren<HubChalk>().FirstOrDefault(g => g.name == "ChalkCircle"));
+                Assert.IsNotNull(picker.GetComponentsInChildren<HubGlow>().FirstOrDefault(g => g.name == "ContactShadow"));
+                yield return TumpUiCapture.Capture("Hub-character-classic", TumpHub.Current.Canvas, 960, 540, false, checkActionBounds: true);
+            }
+            finally
+            {
+                Net.NetSession.Instance?.Stop();
+                Settings.SettingsStore.Current.HubQueueChoice = choice;
+                Settings.SettingsStore.Current.CharacterPick = pick;
+                // ⚠️ SAVED, because `HubHome.Choice` saved the Classic card: restoring it in memory
+                // alone left CLASSIC on disk for the next launch of the editor (UX-1.5a).
+                Settings.SettingsStore.Save();
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator HeroCharacterSelectShowsAbilitiesInsteadOfClassicAttributes()
+        {
+            Assert.IsFalse(Core.HeroLoadoutRules.SidegradesOpen);
+            ConvertedMatchSetup.HubEnabled = false; // Exercise the supported preparation-board route.
+            Settings.SettingsStore.Current.CharacterPick = 0;
+            UI.SceneFlow.PinSelectedRules(Core.CustomGameRules.Defaults(Core.GameMode.HeroStrike));
+
+            var load = SceneManager.LoadSceneAsync("MatchSetup", LoadSceneMode.Single);
+            yield return ProbeWait.Done(load, "scene load");
+            for (int i = 0; i < 30; i++) yield return null;
+
+            var panel = Find("CharacterSelectPanel");
+            Assert.IsNotNull(panel, "MatchSetup has no CharacterSelectPanel to open.");
+            panel.SetActive(false);
+            panel.SetActive(true);
+            for (int i = 0; i < 20; i++) yield return null;
+
+            // The supported preparation board keeps SKILLS as its route to the four current
+            // role powers. The guide is read-only while sidegrades are closed.
+            var picker = FindActive("TumpSkills");
+            Assert.IsNotNull(picker,
+                "the hero picker has no SKILLS door, so a player choosing a hero cannot read "
+                + "what that hero does at all. TumpPickerView.Collection builds it.");
+
+            string pickerCopy = string.Empty;
+            var pickerCanvas = Find("OwnerLoadoutCanvas");
+            Assert.IsNotNull(pickerCanvas, "the character select panel drew no picker canvas.");
+            foreach (var label in pickerCanvas.GetComponentsInChildren<UnityEngine.UI.Text>(false))
+                pickerCopy += label.text + "\n";
+
+            picker.onClick.Invoke();
+            for (int i = 0; i < 10; i++) yield return null;
+
+            var skills = Find("OwnerSkillsCanvas");
+            Assert.IsNotNull(skills, "pressing SKILLS drew no skills screen.");
+
+            var danteKit = Abilities.HeroAbilitySystem.CreateKitFor("dante");
+            var slots = danteKit.ScreenSlots;
+            Assert.AreEqual(4, slots.Length);
+            for (int index = 0; index < slots.Length; index++)
+            {
+                int slot = index == slots.Length - 1 ? 0 : index + 1;
+                var tab = FindActive("TumpSkillSlot" + slot);
+                Assert.IsNotNull(tab, $"the skills screen has no TumpSkillSlot{slot} tab.");
+                Assert.AreEqual(slots[index].Label, tab.GetComponentInChildren<UnityEngine.UI.Text>().text);
+                tab.onClick.Invoke();
+                for (int i = 0; i < 6; i++) yield return null;
+
+                var texts = skills.GetComponentsInChildren<UnityEngine.UI.Text>(false);
+                Assert.AreEqual(slots[index].Ability.Name,
+                    texts.Single(t => t.name == "AbilityName").text);
+                Assert.AreEqual(slots[index].Ability.Summary,
+                    texts.Single(t => t.name == "WhatItDoes").text);
+                StringAssert.Contains(slots[index].Label,
+                    texts.Single(t => t.name == "Binding").text);
+                Assert.AreEqual(slots[index].Ability.Glyph,
+                    skills.GetComponentsInChildren<TumpAbilitySymbol>(false)
+                        .Single(g => g.name == "AbilityPicture").Glyph);
+                if (slot == 3)
+                    yield return TumpUiCapture.Capture("preparation-skills-defending-960x540",
+                        skills.GetComponent<Canvas>(), 960, 540, false, checkActionBounds: true);
+            }
+
+            Assert.IsFalse(skills.GetComponentsInChildren<RectTransform>(true)
+                .Single(r => r.name == "VariantChoices").gameObject.activeInHierarchy);
+            Assert.IsFalse(skills.GetComponentsInChildren<UnityEngine.UI.Button>(true)
+                .Single(b => b.name == "TumpEquipSkill").gameObject.activeInHierarchy);
+            StringAssert.DoesNotContain("SPEED", pickerCopy,
+                "Hero select still exposes Classic SPEED attributes.");
+            StringAssert.DoesNotContain("POWER", pickerCopy,
+                "Hero select still exposes Classic POWER attributes.");
+            StringAssert.DoesNotContain("GRIT", skills.GetComponentsInChildren<UnityEngine.UI.Text>(false)
+                .Single(t => t.name == "WhatItDoes").text,
+                "Hero select still exposes Classic GRIT attributes.");
+
+            Capture("character-hero-abilities");
+        }
+
+        [Test]
+        public void ClassicRosterUsesTheApprovedClassicRigsAndNoHeroMeshes()
+        {
+            var book = RosterBook.Load();
+            Assert.IsNotNull(book, "No RosterBook. Run RosterBookBuilder.Build.");
+
+            var expected = new[]
+            {
+                "character-male-f", "character-female-f",
+                "character-male-a", "character-female-a",
+                "character-male-b", "character-female-b",
+                "character-male-c", "character-female-c",
+                "character-male-d", "character-female-d",
+                "character-male-e", "character-female-e",
+            };
+
+            Assert.AreEqual(expected.Length, Core.Roster.ClassicPeople.Count);
+            for (int i = 0; i < expected.Length; i++)
+            {
+                var art = book.PersonArt(i, Core.GameMode.Classic);
+                Assert.IsNotNull(art, $"Classic index {i} has no art entry.");
+                Assert.IsNotNull(art.Model, $"Classic index {i} has no model.");
+                Assert.AreEqual(expected[i], art.Model.name,
+                    $"{Core.Roster.ClassicPeople[i].Name} is not using the Godot Classic rig.");
+                StringAssert.DoesNotStartWith("team-", art.Model.name,
+                    "A Hero Strike mesh leaked into the Classic cast.");
+            }
+        }
+
+        /// <summary>The bone furthest down the rig, so the sample is a limb rather than the
+        /// root the clip may deliberately leave still.</summary>
+        private static Transform DeepestBone(SkinnedMeshRenderer skinned)
+        {
+            Transform best = null;
+            int depth = -1;
+
+            foreach (var bone in skinned.bones)
+            {
+                if (bone == null) continue;
+
+                int d = 0;
+                for (var step = bone; step != null; step = step.parent) d++;
+
+                if (d <= depth) continue;
+
+                depth = d;
+                best = bone;
+            }
+
+            return best;
+        }
+
+        /// <summary>A bone well down the rig, so the sample is a limb rather than the root the
+        /// clip may deliberately leave still.</summary>
+        private static Transform DeepestChild(Transform root)
+        {
+            Transform best = root;
+            int depth = 0;
+
+            foreach (var t in root.GetComponentsInChildren<Transform>())
+            {
+                int d = 0;
+                for (var step = t; step != root && step != null; step = step.parent) d++;
+
+                if (d <= depth) continue;
+
+                depth = d;
+                best = t;
+            }
+
+            return best;
+        }
+
+        private static GameObject Find(string name)
+        {
+            foreach (var root in SceneManager.GetActiveScene().GetRootGameObjects())
+            {
+                var hit = FindIn(root.transform, name);
+                if (hit != null) return hit;
+            }
+
+            return null;
+        }
+
+        private static GameObject FindIn(Transform t, string name)
+        {
+            if (t.name == name) return t.gameObject;
+
+            for (int i = 0; i < t.childCount; i++)
+            {
+                var hit = FindIn(t.GetChild(i), name);
+                if (hit != null) return hit;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// ⚠️ AN OVERLAY CANVAS IS INVISIBLE TO Camera.Render, so it is flipped to
+        /// ScreenSpaceCamera first and put in front of the near plane. Same rule UiRuntimeShots
+        /// carries, and the reason a capture can come back as an empty scene.
+        /// </summary>
+        private static void Capture(string name)
+        {
+            var cam = UnityEngine.Camera.main;
+            if (cam == null) return;
+
+            foreach (var c in Object.FindObjectsByType<Canvas>(FindObjectsInactive.Exclude,
+                                                              FindObjectsSortMode.None))
+            {
+                if (c.renderMode != RenderMode.ScreenSpaceOverlay) continue;
+
+                c.renderMode = RenderMode.ScreenSpaceCamera;
+                c.worldCamera = cam;
+                c.planeDistance = cam.nearClipPlane + 0.01f;
+            }
+
+            Canvas.ForceUpdateCanvases();
+
+            var rt = new RenderTexture(1600, 900, 24, RenderTextureFormat.ARGB32);
+            var prev = cam.targetTexture;
+
+            cam.targetTexture = rt;
+            cam.Render();
+
+            RenderTexture.active = rt;
+            var tex = new Texture2D(1600, 900, TextureFormat.RGB24, false);
+            tex.ReadPixels(new Rect(0, 0, 1600, 900), 0, 0);
+            tex.Apply();
+
+            RenderTexture.active = null;
+            cam.targetTexture = prev;
+
+            File.WriteAllBytes($"{OutDir}/{name}.png", tex.EncodeToPNG());
+
+            Object.DestroyImmediate(tex);
+            rt.Release();
+            Object.DestroyImmediate(rt);
+        }
+
+        /// <summary>An active button anywhere in the scene, by name.</summary>
+        private static UnityEngine.UI.Button FindActive(string name)
+        {
+            foreach (var button in Object.FindObjectsByType<UnityEngine.UI.Button>(FindObjectsSortMode.None))
+                if (button.name == name && button.isActiveAndEnabled) return button;
+
+            return null;
+        }
+    }
+}

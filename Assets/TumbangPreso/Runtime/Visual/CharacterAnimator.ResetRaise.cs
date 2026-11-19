@@ -1,0 +1,197 @@
+using UnityEngine;
+
+namespace TumbangPreso.Visual
+{
+    /// <summary>
+    /// ⚠️⚠️ THE TAYA RAISING THE CAN, SHOWN AS A RAISE WITH PROGRESS.
+    ///
+    /// 🧑 2026-09-24: *"refine other gameplay animations too for both FPP and TPP view for example the raising
+    /// of can"*, *"analyze how it should look to communicate that that action is happening"*
+    /// (`docs/reports/gameplay-animation-2026-09-24/research-and-analysis.md` § 2.3). Before this, the 1.5 s
+    /// reset channel was the 0.33 s `pick-up` one-shot re-fired every `ViewmodelArms.GrabSeconds`: a body
+    /// bobbing up and down beside a can that lay flat until it popped upright at the end. Nothing said how far
+    /// along the reset was, which is the one thing an attacker deciding whether to run needs to see.
+    ///
+    /// Now, while a raise is in progress: bowed to the can at the waist (the rig's own `pick-up` vocabulary:
+    /// the legs have no knees and the torso does the bending), both hands down on it, rising as the channel
+    /// fills while the can itself tilts upright under them (`Lata`), then a short press down to plant it.
+    ///
+    /// ⚠️ PROGRESS ON EVERY SCREEN, OFF THE CAN'S REPLICATED CARRY (CAN-CARRY-1024, protocol 179). The reset is a held
+    /// carry the host owns (`Lata.Carry.cs`), and every peer reads its phase: the pickup plays the crouch, grip and lift,
+    /// the carry holds the lift with the can in both hands while the legs walk, and the set-down plays the press
+    /// (`Lata.RaiseShapeFor`). The relayed `grab` clock this used to keep is gone with the host's channel.
+    /// </summary>
+    /// <summary>
+    /// ⚠️⚠️ THE ONE SHAPE OF THE RAISE, SHARED BY THE BODY AND THE FIRST-PERSON VIEW SO THEY AGREE.
+    ///
+    /// 🧑 2026-09-26: *"i want u to improve animation of raising can too when its down"*, *"they should
+    /// crouch first and put it up"*. The 2026-09-24 raise bowed at the waist and rose with the channel,
+    /// so the body reached for a can on the road from standing height. Now it is three acts across the
+    /// channel's progress:
+    ///  * CROUCH (0 to 0.18): the body drops into a squat over the can. These rigs have no knees, so
+    ///    the squat is the legs splaying out (`CrouchSpreadDegrees`) with the root lowered by exactly
+    ///    what that splay costs in hip height, which keeps the feet on the road;
+    ///  * GRIP (to 0.30): held low, both hands on the can;
+    ///  * LIFT (0.30 to 0.85): standing back up WITH it, the hands rising as the can tilts upright;
+    ///  * SET (0.85 to 1): the short press that plants it.
+    /// The first-person camera bends with its own slower curve, <see cref="FppBend"/> (`CameraRig.ApplyFpp`), so the
+    /// player feels the bend as well as seeing their hands on the can.
+    /// </summary>
+    public static class CanRaiseShape
+    {
+        public const float CrouchSpreadDegrees = 31f;
+        /// <summary>How far the first-person eye drops at the bottom of the bend, metres.</summary>
+        public const float FppEyeDrop = .25f;
+        /// <summary>How far the first-person eye leans out over the can at the bottom of the bend, metres.</summary>
+        public const float FppLean = .10f;
+        /// <summary>How far the first-person view tips down toward the can at the bottom, degrees.</summary>
+        public const float FppLookDown = 30f;
+
+        /// <summary>
+        /// The eyes go down with the grip, rise with the can, and lean over the mark for the plant.
+        /// </summary>
+        public static float FppBend(float p) => p >= .85f ? .62f * Press(p)
+            : Mathf.SmoothStep(0, 1, Mathf.InverseLerp(0, .23f, p)) * (1 - Rise(p));
+
+        public static float Crouch(float p) =>
+            Mathf.SmoothStep(0, 1, Mathf.InverseLerp(0f, .18f, p)) * (1f - Mathf.SmoothStep(0, 1, Mathf.InverseLerp(.30f, .85f, p)));
+        public static float Rise(float p) => Mathf.SmoothStep(0, 1, Mathf.InverseLerp(.30f, .85f, p));
+        public static float Press(float p) => p > .85f ? Mathf.Sin(Mathf.InverseLerp(.85f, 1f, p) * Mathf.PI) : 0;
+    }
+
+    public sealed partial class CharacterAnimator
+    {
+        /// <summary>A relayed reach older than this means the channel has stopped.</summary>
+        public const float ResetRelayGap = .6f;
+
+        private float _raiseStart = -100, _raiseSeen = -100, _raiseWeight;
+        private Transform _rrTorso, _rrHead, _rrArmR, _rrArmL, _rrRoot, _rrLegR, _rrLegL;
+        private Vector3 _rrRootRestPos;
+        private Quaternion _rrLegRRest, _rrLegLRest;
+        private float _rrLegLength = -1;
+        private Vector3 _rrAlongR = Vector3.right, _rrAlongL = Vector3.left;
+        private bool _rrResolved, _rrApplied;
+        private Quaternion _rrTorsoRest, _rrHeadRest, _rrArmRRest, _rrArmLRest;
+
+        /// <summary>0 to 1: how far this body is through raising the can, 0 when it is not raising.</summary>
+        public float ResetRaiseProgress { get; private set; }
+
+        /// <summary>Called from `PlayAction("grab")`: on a taya beside a downed can, a reach is a raise.</summary>
+        private bool NoteResetGesture()
+        {
+            if (_motor == null || !_motor.IsDefender) return false;
+            var lata = GameServices.Round?.Lata;
+            if (lata == null || lata.IsUpright) return false;
+            Vector3 a = _motor.transform.position, b = lata.transform.position; a.y = b.y = 0;
+            if (Vector3.Distance(a, b) > Core.Balance.InteractionRadius + .5f) return false;
+            if (Time.time - _raiseSeen > ResetRelayGap) _raiseStart = Time.time;
+            _raiseSeen = Time.time;
+            return true;
+        }
+
+        private float ResetProgressNow()
+        {
+            if (_motor == null || !_motor.IsDefender) return 0;
+            var lata = GameServices.Round?.Lata;
+            if (lata == null || lata.IsUpright) { _raiseSeen = -100; return 0; }
+            // CAN-CARRY-1024: the can's replicated carry drives the shape on every peer (pickup 0 to 0.84, the carry
+            // holds 0.84 with the can in both hands, the set-down 0.85 to 1), so no relayed reach is needed any more.
+            return _carrier != null ? _carrier.RaiseShape : 0;
+        }
+
+        private void RestoreResetRaise()
+        {
+            if (!_rrApplied) return;
+            _rrTorso.localRotation = _rrTorsoRest; _rrArmR.localRotation = _rrArmRRest; _rrArmL.localRotation = _rrArmLRest;
+            if (_rrHead != null) _rrHead.localRotation = _rrHeadRest;
+            if (_rrRoot != null) _rrRoot.localPosition = _rrRootRestPos;
+            if (_rrLegR != null) _rrLegR.localRotation = _rrLegRRest;
+            if (_rrLegL != null) _rrLegL.localRotation = _rrLegLRest;
+            _rrApplied = false;
+        }
+
+        private void ClearResetRaise() { RestoreResetRaise(); _rrTorso = _rrHead = _rrArmR = _rrArmL = _rrRoot = _rrLegR = _rrLegL = null; _rrLegLength = -1; _rrResolved = false; _raiseWeight = 0; ResetRaiseProgress = 0; }
+
+        private float _pickupBodyBend;
+        private void ApplyResetRaise()
+        {
+            if (_motor == null || _animator == null) return;
+            float progress = ResetProgressNow();
+            float pickupWanted = !_motor.IsDefender && _carrier != null ? _carrier.PickupBend : 0;
+            _pickupBodyBend = Mathf.MoveTowards(_pickupBodyBend, pickupWanted, Time.deltaTime / .12f);
+            bool pickup = !_motor.IsDefender && _pickupBodyBend > .001f;
+            ResetRaiseProgress = progress;
+            _raiseWeight = Mathf.MoveTowards(_raiseWeight, progress > 0 || pickup ? 1 : 0, Time.deltaTime / (progress > 0 || pickup ? .12f : .15f));
+            if (_raiseWeight <= .001f) return;
+            if (!_rrResolved)
+            {
+                foreach (var skin in _animator.GetComponentsInChildren<SkinnedMeshRenderer>(false))
+                {
+                    if (!skin.enabled || skin.bones == null) continue;
+                    var binds = skin.sharedMesh != null ? skin.sharedMesh.bindposes : null;
+                    for (int i = 0; i < skin.bones.Length; i++)
+                    {
+                        var b = skin.bones[i];
+                        if (b == null) continue;
+                        if (b.name == "torso" && _rrTorso == null) _rrTorso = b;
+                        else if (b.name == "head" && _rrHead == null) _rrHead = b;
+                        else if (b.name == "arm-right" && _rrArmR == null) { _rrArmR = b; _rrAlongR = AlongArm(binds, i, _rrAlongR); }
+                        else if (b.name == "arm-left" && _rrArmL == null) { _rrArmL = b; _rrAlongL = AlongArm(binds, i, _rrAlongL); }
+                        else if (b.name == "root" && _rrRoot == null) _rrRoot = b;
+                        else if (b.name == "leg-right" && _rrLegR == null) _rrLegR = b;
+                        else if (b.name == "leg-left" && _rrLegL == null) _rrLegL = b;
+                    }
+                }
+                _rrResolved = true;
+            }
+            if (_rrTorso == null || _rrArmR == null || _rrArmL == null) return;
+
+            // The shape of the raise against progress (`CanRaiseShape`): crouch, grip, lift, set.
+            float p = progress > 0 ? progress : 1;
+            float crouch = CanRaiseShape.Crouch(p), rise = CanRaiseShape.Rise(p), press = CanRaiseShape.Press(p);
+            if (pickup)
+            {
+                crouch = _pickupBodyBend * Mathf.Clamp01(PickupMotion.EyeDrop(_carrier.PickupStyle) / .52f);
+                rise = 1 - crouch; press = 0;
+            }
+            // Squatting does most of the reaching now, so the waist bends less than the old 50.
+            float bow = Mathf.Lerp(30, 12, rise) + 12 * crouch + 10 * press;
+            if (pickup) bow = 46 * crouch;
+            // Hands on the can: down at the road in the squat, lifting with it, pushed down in the press.
+            float handY = pickup ? Mathf.Lerp(-.62f, -.30f, rise)
+                : Mathf.Lerp(-.55f, -.24f, rise) - .22f * press;
+            var hand = new Vector3(.12f, handY, Mathf.Lerp(.58f, .86f, rise));
+
+            float w = _raiseWeight;
+            _rrTorsoRest = _rrTorso.localRotation; _rrArmRRest = _rrArmR.localRotation; _rrArmLRest = _rrArmL.localRotation;
+            if (_rrHead != null) _rrHeadRest = _rrHead.localRotation;
+            if (_rrRoot != null) _rrRootRestPos = _rrRoot.localPosition;
+            if (_rrLegR != null) _rrLegRRest = _rrLegR.localRotation;
+            if (_rrLegL != null) _rrLegLRest = _rrLegL.localRotation;
+            _rrApplied = true;
+
+            // THE SQUAT. Each leg splays out from the hip; a straight leg of length L tipped by a
+            // loses L(1 - cos a) of height, and the root drops exactly that so the feet stay planted
+            // on the road rather than sinking or floating. L is measured once from this rig's own
+            // standing pose (hip height above the body's feet).
+            if (_rrRoot != null && _rrLegR != null && _rrLegL != null)
+            {
+                if (_rrLegLength < 0) _rrLegLength = Mathf.Max(.2f, _rrLegR.position.y - transform.position.y);
+                float spread = (pickup ? 40 : CanRaiseShape.CrouchSpreadDegrees) * crouch * w;
+                float legSide = transform.InverseTransformPoint(_rrLegR.position).x >= 0 ? 1f : -1f;
+                _rrLegR.rotation = Quaternion.AngleAxis(spread * legSide, transform.forward) * Quaternion.AngleAxis(-8f * crouch * w, transform.right) * _rrLegR.rotation;
+                _rrLegL.rotation = Quaternion.AngleAxis(-spread * legSide, transform.forward) * Quaternion.AngleAxis(-8f * crouch * w, transform.right) * _rrLegL.rotation;
+                float drop = _rrLegLength * (1f - Mathf.Cos(spread * Mathf.Deg2Rad)) + _rrLegLength * (1f - Mathf.Cos(8f * crouch * w * Mathf.Deg2Rad));
+                _rrRoot.position -= Vector3.up * drop;
+            }
+            _rrTorso.rotation = Quaternion.Slerp(Quaternion.identity, Quaternion.AngleAxis(bow, transform.right), w) * _rrTorso.rotation;
+            // The head looks at the can rather than following the chest all the way down.
+            if (_rrHead != null) _rrHead.rotation = Quaternion.Slerp(Quaternion.identity, Quaternion.AngleAxis(-bow * .35f, transform.right), w) * _rrHead.rotation;
+            float sideR = transform.InverseTransformPoint(_rrArmR.position).x >= 0 ? 1f : -1f;
+            PointArm(_rrArmR, _rrAlongR, new Vector3(hand.x * sideR, hand.y, hand.z), w, 0);
+            PointArm(_rrArmL, _rrAlongL, pickup
+                ? new Vector3(-.30f * sideR, -.15f, .12f) + PickupMotion.Brace(_carrier.PickupStyle)
+                : new Vector3(-hand.x * sideR, hand.y, hand.z), w, 0);
+        }
+    }
+}

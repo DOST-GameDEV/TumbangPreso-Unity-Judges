@@ -1,0 +1,134 @@
+using System;
+using System.Reflection;
+using System.Text;
+using NUnit.Framework;
+using TumbangPreso.Core;
+using TumbangPreso.Net;
+using TumbangPreso.Settings;
+using Unity.Netcode;
+using UnityEngine;
+using Object = UnityEngine.Object;
+
+namespace TumbangPreso.Tests
+{
+    public sealed class LanRecordIdentityTests
+    {
+        private const BindingFlags Hidden = BindingFlags.Instance | BindingFlags.NonPublic;
+        private GameObject _root;
+        private NetSession _session;
+        private NetworkManager _network;
+        private PlayerAccount _account, _previousAccount;
+        private string _settings;
+        private string _previousOverride;
+        private string _previousRoomTitle;
+        [Serializable] private sealed class Hello { public string AccountPlayerId; public string Token; public string Name; }
+
+        [SetUp] public void Before()
+        {
+            _settings = JsonUtility.ToJson(SettingsStore.Current);
+            _previousRoomTitle = NetSession.RoomTitle;
+            _previousOverride=(string)typeof(NetIdentity).GetField("_overrideTokenForTesting",BindingFlags.Static|BindingFlags.NonPublic).GetValue(null);
+            SettingsStore.Current.AccountPlayerId = "cached-profile-id";
+            _previousAccount = GameServices.Account;
+            _root = new GameObject("Dormant identity serialization"); _root.SetActive(false);
+            _account = _root.AddComponent<PlayerAccount>();
+            typeof(GameServices).GetProperty("Account").SetValue(null, _account);
+            _network = _root.AddComponent<NetworkManager>(); _network.NetworkConfig = new NetworkConfig();
+            _session = _root.AddComponent<NetSession>();
+            typeof(NetSession).GetField("_nm", Hidden).SetValue(_session, _network);
+            Assert.IsFalse(_account.IsSignedIn);
+        }
+
+        [TearDown] public void After()
+        {
+            typeof(GameServices).GetProperty("Account").SetValue(null, _previousAccount);
+            Object.DestroyImmediate(_root);
+            JsonUtility.FromJsonOverwrite(_settings, SettingsStore.Current);
+            NetIdentity.OverrideForTesting(_previousOverride);
+            NetSession.RoomTitle = _previousRoomTitle;
+        }
+
+        private Hello Serialize(bool relay, bool signedIn)
+        {
+            typeof(NetSession).GetProperty("IsRelay").SetValue(_session, relay);
+            typeof(PlayerAccount).GetProperty("IsSignedIn").SetValue(_account, signedIn);
+            typeof(NetSession).GetMethod("ConfigureClientHello", Hidden).Invoke(_session, new object[] { false });
+            return JsonUtility.FromJson<Hello>(Encoding.UTF8.GetString(_network.NetworkConfig.ConnectionData));
+        }
+
+        [TestCase(true, "Maria Clara's room")]
+        [TestCase(true, "Friday games")]
+        [TestCase(false, "Maria Clara's room")]
+        [TestCase(false, "Friday games")]
+        public void CustomRoomTitleDoesNotReplaceThePlayerName(bool relay, string title)
+        {
+            SettingsStore.Current.PlayerName = "Maria Clara";
+            SettingsStore.Current.AccountDiscriminator = "4417";
+            NetSession.RoomTitle = title;
+            var hello = Serialize(relay, relay);
+            Assert.AreEqual(_account.LobbyName, hello.Name,
+                "A connection introduces the player, not the room they named.");
+            var room = new LobbySession();
+            var peer = room.Admit(0, hello.Token, hello.Name);
+            Assert.AreEqual(_account.LobbyName, peer.Name,
+                "The name used by lobby cards and match bodies must survive admission.");
+            var titleForBrowser = typeof(NetSession).GetMethod("LocalLobbyName",
+                BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, null);
+            Assert.AreEqual(title, titleForBrowser, "Room discovery still uses the chosen room title.");
+        }
+
+        [Test] public void LanHelloCarriesTheCachedLocalProfileWithoutSigningIn()
+        {
+            var hello = Serialize(false, false);
+            Assert.AreEqual(_account.PlayerId, hello.AccountPlayerId);
+            Assert.AreNotEqual(hello.Token, hello.AccountPlayerId, "Connection and cached profile identities stay separate.");
+            Assert.IsFalse(_account.IsSignedIn);
+        }
+
+        [Test] public void UnsignedRelayDoesNotClaimACachedAccount()
+        { Assert.AreEqual("", Serialize(true, false).AccountPlayerId); }
+
+        [Test] public void SignedRelayKeepsItsAccountIdentity()
+        { Assert.AreEqual(_account.PlayerId, Serialize(true, true).AccountPlayerId); }
+
+        [TestCase(false)] [TestCase(true)]
+        public void LanRejoinKeepsItsSeatWhenOnlineIdentityFinishesLoading(bool guest)
+        {
+            typeof(PlayerAccount).GetProperty("IsGuest").SetValue(_account,guest);
+            NetIdentity.OverrideForTesting("early-online-identity");
+            var first=Serialize(false,false);
+            var room=new LobbySession();room.Admit(0,"host","Host");
+            Assert.AreEqual(1,room.Admit(1,first.Token,"Phone").Seat);
+            room.StartMatch();room.Depart(1);
+            NetIdentity.OverrideForTesting("late-online-identity");
+            typeof(PlayerAccount).GetProperty("IsGuest").SetValue(_account,false);
+            var returning=Serialize(false,true);
+            Assert.AreEqual(first.Token,returning.Token);
+            Assert.AreEqual(NetIdentity.LocalToken,returning.Token);
+            Assert.AreEqual(MidMatchRuling.Reclaim,room.RuleOnArrival(returning.Token));
+            Assert.AreEqual(1,room.Admit(2,returning.Token,"Phone").Seat);
+        }
+
+        [Test] public void RelayStillUsesItsOnlineConnectionIdentity()
+        {
+            NetIdentity.OverrideForTesting("verified-relay-identity");
+            var hello=Serialize(true,true);
+            Assert.AreEqual(_account.ConnectionToken,hello.Token);
+            Assert.AreNotEqual(NetIdentity.LocalToken,hello.Token);
+        }
+
+        [Test] public void RepeatedIntroductionRetainsIdentityWithoutGrantingHandleTrust()
+        {
+            var lobby = new LobbySession();
+            var first = lobby.Admit(1, "same-connection-token", "Local player");
+            first.AccountPlayerId = "local-profile-id";
+            var second = lobby.Admit(1, "same-connection-token", "Local player");
+            Assert.AreEqual("local-profile-id", second.AccountPlayerId);
+            Assert.AreEqual(AccountRules.HandleCheck.NotAsked, second.HandleTrust);
+            var replacement = lobby.Admit(2, "same-connection-token", "Local player");
+            Assert.AreEqual("local-profile-id", replacement.AccountPlayerId);
+            Assert.AreEqual(second.Seat, replacement.Seat);
+            Assert.AreEqual(AccountRules.HandleCheck.NotAsked, replacement.HandleTrust);
+        }
+    }
+}

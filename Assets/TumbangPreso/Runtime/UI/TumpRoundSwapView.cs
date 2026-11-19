@@ -1,0 +1,123 @@
+using System;
+using TumbangPreso.Core;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI
+{
+    /// <summary>One new defender portrait and the actual cumulative standings between rounds.</summary>
+    public sealed partial class TumpRoundSwapView : MonoBehaviour
+    {
+        public Canvas Canvas { get; private set; }
+        private Text _round, _name, _buffer, _continueLabel;
+        private Image _portrait;
+        private readonly Text[] _names = new Text[4], _scores = new Text[4];
+        private readonly Image[] _portraits = new Image[4];
+        private void BuildPrevious(Transform owner, Action dismiss)
+        {
+            var f = TumpUiTheme.Current;
+            Canvas = TumpUiFactory.Canvas(owner, "TumpRoundSwapCanvas", 220);
+            var hud = Hud.Instance;
+            if (hud != null)
+            {
+                Canvas.transform.SetParent(hud.CleanFeedRoot, false);
+                TumpUiFactory.Stretch((RectTransform)Canvas.transform);
+            }
+            var root = (RectTransform)Canvas.transform;
+            TumpUiFactory.Ground(root, f.Cream);
+            _round = TumpUiFactory.Text(root, "RoundHeadline", "", 64, true);
+            _round.color = f.Brick; TumpUiFactory.Place(_round.rectTransform, 96, 54, 1700, 106);
+            var next = TumpUiFactory.Text(root, "NextRole", "Next defender", 42, true);
+            next.color = f.Brick; TumpUiFactory.Place(next.rectTransform, 120, 204, 700, 76);
+            var stage = TumpUiFactory.Surface(root, "DefenderSpotlight", TumpSurface.Form.Disc, f.Yellow, false);
+            TumpUiFactory.Place(stage.rectTransform, 92, 330, 646, 476);
+            var rim = TumpUiFactory.Surface(root, "DefenderSpotlightInner", TumpSurface.Form.Disc, f.Apricot, false);
+            TumpUiFactory.Place(rim.rectTransform, 142, 380, 546, 376);
+            _portrait = TumpUiFactory.Art(root, "NextDefenderPortrait", null);
+            TumpUiFactory.Place(_portrait.rectTransform, 124, 296, 540, 480);
+            var floor = TumpUiFactory.Rect(root, "DefenderUnderline").gameObject.AddComponent<Image>();
+            floor.color = f.HotOrange; floor.raycastTarget = false;
+            TumpUiFactory.Place(floor.rectTransform, 126, 798, 620, 12);
+            _name = TumpUiFactory.Text(root, "NextDefenderName", "", 44, true);
+            TumpUiFactory.Place(_name.rectTransform, 126, 822, 650, 100);
+            var standing = TumpUiFactory.Text(root, "StandingsTitle", "Standings", 46, true);
+            standing.color = f.Brick; TumpUiFactory.Place(standing.rectTransform, 922, 214, 780, 78);
+            for (int i = 0; i < 4; i++)
+            {
+                float y = 330 + i * 124;
+                var place = TumpUiFactory.Text(root, "Place" + i, (i + 1).ToString(), 46, true);
+                place.color = f.Brick; TumpUiFactory.Place(place.rectTransform, 900, y, 80, 84);
+                _portraits[i] = TumpUiFactory.Art(root, "StandingPortrait" + i, null);
+                TumpUiFactory.Place(_portraits[i].rectTransform, 990, y - 6, 96, 96);
+                _names[i] = TumpUiFactory.Text(root, "StandingName" + i, "", 36, true);
+                TumpUiFactory.Place(_names[i].rectTransform, 1110, y, 478, 90);
+                _scores[i] = TumpUiFactory.Text(root, "StandingScore" + i, "", 46, true);
+                _scores[i].alignment = TextAnchor.MiddleRight;
+                TumpUiFactory.Place(_scores[i].rectTransform, 1608, y, 190, 90);
+                var rule = TumpUiFactory.Rect(root, "StandingRule" + i).gameObject.AddComponent<Image>();
+                rule.color = new Color(f.OliveSand.r, f.OliveSand.g, f.OliveSand.b, .55f); rule.raycastTarget = false;
+                TumpUiFactory.Place(rule.rectTransform, 922, y + 104, 872, 2);
+            }
+            var go = TumpUiFactory.Button(root, "ContinueWarmup", "Continue warming up", dismiss, TumpSurface.Form.Pebble, f.Lime, 34);
+            TumpUiFactory.Anchor((RectTransform)go.transform, new Vector2(1, 0), new Vector2(-380, 90), new Vector2(580, 90));
+            _buffer = TumpUiFactory.Text(root, "WarmupTime", "", 26);
+            TumpUiFactory.Place(_buffer.rectTransform, 104, 960, 710, 66);
+        }
+        public void Show(int nextRound,int defender)
+        {
+            _entered=Time.unscaledTime;_remainingStart=0;_nextRoundNumber=nextRound;_halftime=HalftimePresentation.Instance?.IsHalftime==true;_fallback=null;
+            _round.text=_halftime?"HALFTIME":"NEXT ROUND";
+            var who=GameServices.Round?.PlayerAt(defender);
+            _name.text=_popupBuilt?SeatLabel.Raw(defender):PlayerIdentity.Label(defender)+" · "+SeatLabel.Raw(defender);
+            _portrait.sprite=Portrait(who);_portrait.enabled=_portrait.sprite!=null;
+            if(_nextRound!=null)_nextRound.text="ROUND "+nextRound;
+            if(_notice!=null)_notice.text="";
+            var match=GameServices.Match;
+            if(match!=null)
+            {
+                var order=match.Ranking();bool uniqueLeader=match.ScoreFor(order[0])>match.ScoreFor(order[1]);
+                for(int i=0;i<4;i++)
+                {
+                    var actor=GameServices.Round?.PlayerAt(order[i]);
+                    // VISUAL-1.17: the seat tag on the chip, a crown for the leader (not red,
+                    // which means "something is wrong"); the portrait carries who it is.
+                    _names[i].text=_board?PlayerIdentity.Label(order[i]):_popupBuilt?SeatLabel.Raw(order[i]):PlayerIdentity.Label(order[i])+" · "+SeatLabel.Raw(order[i]);
+                    _names[i].color=_scores[i].color=_popupBuilt?HudDraw.Ivory:CourtPresentationPalette.Ink;
+                    TumpMatchReadout.PaintScoreValue(_scores[i], match.ScoreFor(order[i]), _board ? 92 : _popupBuilt ? 60 : 46, 4);
+                    _portraits[i].sprite=_board?Face(actor):Portrait(actor);_portraits[i].enabled=_portraits[i].sprite!=null;
+                }
+                PaintChips(order,defender,uniqueLeader);
+                NoteRoundGains(order,match);
+            }
+            Canvas.gameObject.SetActive(true);
+        }
+        private bool _halftime;private string _fallback;
+        public void SetBreakContext(bool halftime,string fallback)
+        {
+            _halftime=halftime;_fallback=fallback;_round.text=halftime?"HALFTIME":"NEXT ROUND";
+            if(_notice!=null)_notice.text=fallback!=null?"HIGHLIGHT UNAVAILABLE":"";
+        }
+        public void Remaining(float seconds)
+        {
+            // The first reading of a break is its length, so the return ring starts full.
+            if(seconds>_remaining+.5f||_remainingStart<=0)_remainingStart=seconds;
+            _remaining=seconds;_buffer.text=_popupBuilt?Mathf.CeilToInt(seconds).ToString():Mathf.CeilToInt(seconds)+"s";
+        }
+        /// <summary>The rendered close-up the profile uses (`Avatars.Cut`, no sunburst), or the full portrait for anyone without one.</summary>
+        private static Sprite Face(CharacterMotor actor)
+        {
+            if (actor == null) return null;
+            var people = Roster.GetPeople(actor.Mode);
+            if (actor.CharacterIndex < 0 || actor.CharacterIndex >= people.Count) return null;
+            var cut = Resources.Load<Sprite>("UI/hero-cuts/" + people[actor.CharacterIndex].Id);
+            return cut != null ? cut : Portrait(actor);
+        }
+        private static Sprite Portrait(CharacterMotor actor)
+        {
+            if (actor == null) return null;
+            var people = Roster.GetPeople(actor.Mode);
+            return actor.CharacterIndex >= 0 && actor.CharacterIndex < people.Count
+                ? OwnerPortraitArt.Get("UI/portraits/" + people[actor.CharacterIndex].Id) : null;
+        }
+    }
+}

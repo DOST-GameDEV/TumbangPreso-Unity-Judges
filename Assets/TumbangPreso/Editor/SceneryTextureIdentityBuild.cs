@@ -1,0 +1,72 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using TumbangPreso.CameraSystem;
+using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Reporting;
+using UnityEngine;
+
+namespace TumbangPreso.EditorTools
+{
+    public sealed class SceneryTextureIdentityBuild : IPreprocessBuildWithReport
+    {
+        public const string AssetPath="Assets/TumbangPreso/Resources/SceneryTextureIdentities.asset";
+        public int callbackOrder=>-900;
+        public void OnPreprocessBuild(BuildReport report)=>Prepare();
+        public static void Prepare()
+        {
+            var textures=new HashSet<Texture>();
+            const string dronePath="Assets/TumbangPreso/Art/Arena/Props/arena_drone.glb";
+            var paths=AssetDatabase.GetAllAssetPaths().Where(p=>
+                p.StartsWith("Assets/TumbangPreso/Art/models/ambient-life/",StringComparison.Ordinal)
+                && p.EndsWith(".glb",StringComparison.OrdinalIgnoreCase)
+                || p==dronePath).OrderBy(p=>p,StringComparer.Ordinal);
+            foreach(var path in paths)
+            {
+                foreach(var texture in AssetDatabase.LoadAllAssetsAtPath(path).OfType<Texture>())textures.Add(texture);
+                var model=AssetDatabase.LoadAssetAtPath<GameObject>(path);
+                if(model==null)continue;
+                foreach(var renderer in model.GetComponentsInChildren<Renderer>(true))
+                foreach(var material in renderer.sharedMaterials)
+                {
+                    CollectTextures(material,textures);
+                    if(path!=dronePath || material==null)continue;
+                    // ArenaSceneBuilder dresses the saved drone template with
+                    // the map's materials. The raw GLB has no painted textures.
+                    string key=material.name.Replace(" (Instance)","").Trim();
+                    CollectTextures(AssetDatabase.LoadAssetAtPath<Material>(
+                        "Assets/TumbangPreso/Art/Arena/Materials/"+key+".mat"),textures);
+                }
+            }
+            // Everything the Arena's own materials paint with: the scene's drones and marks wear these once it has dressed
+            // them, and a texture left off this list threw on every frame of a match (`arena_stage_props`, 2026-10-31).
+            foreach(var guid in AssetDatabase.FindAssets("t:Material",new[]{"Assets/TumbangPreso/Art/Arena/Materials"}))
+                CollectTextures(AssetDatabase.LoadAssetAtPath<Material>(AssetDatabase.GUIDToAssetPath(guid)),textures);
+            textures.Remove(Texture2D.whiteTexture);textures.Remove(Texture2D.blackTexture);
+            textures.Remove(Texture2D.grayTexture);textures.Remove(Texture2D.normalTexture);
+            var book=AssetDatabase.LoadAssetAtPath<SceneryTextureIdentities>(AssetPath);
+            if(book==null){book=ScriptableObject.CreateInstance<SceneryTextureIdentities>();AssetDatabase.CreateAsset(book,AssetPath);}
+            book.WhiteHash=Texture2D.whiteTexture.imageContentsHash.ToString();
+            book.BlackHash=Texture2D.blackTexture.imageContentsHash.ToString();
+            book.GrayHash=Texture2D.grayTexture.imageContentsHash.ToString();
+            book.NormalHash=Texture2D.normalTexture.imageContentsHash.ToString();
+            book.Entries=textures.OrderBy(t=>t.name,StringComparer.Ordinal).ThenBy(t=>t.width).ThenBy(t=>t.height)
+                .Select(t=>new SceneryTextureIdentities.Entry{Texture=t,Hash=t.imageContentsHash.ToString()}).ToArray();
+            EditorUtility.SetDirty(book);AssetDatabase.SaveAssets();
+            if(book.Entries.Any(e=>e.Texture==null||string.IsNullOrEmpty(e.Hash)))throw new BuildFailedException("Scenery texture identity has a missing imported reference.");
+            foreach(var texture in new[]{Texture2D.whiteTexture,Texture2D.blackTexture,Texture2D.grayTexture,Texture2D.normalTexture})
+                if(SceneryTextureIdentities.ResolvePrepared(texture,book)!=texture.imageContentsHash.ToString())throw new BuildFailedException("Builtin texture fingerprint changed during preparation.");
+            foreach(var texture in textures)
+                if(SceneryTextureIdentities.ResolvePrepared(texture,book)!=texture.imageContentsHash.ToString())throw new BuildFailedException("Imported texture fingerprint changed during preparation: "+texture.name);
+            Debug.Log("[SceneryTextureIdentities] prepared "+book.Entries.Length+" exact imported textures and 4 builtin scalar identities; no scene, model, texture or material was modified.");
+        }
+        private static void CollectTextures(Material material,HashSet<Texture> textures)
+        {
+            if(material==null)return;
+            foreach(var property in material.GetTexturePropertyNames())
+            {var texture=material.GetTexture(property);if(texture!=null)textures.Add(texture);}
+        }
+    }
+}

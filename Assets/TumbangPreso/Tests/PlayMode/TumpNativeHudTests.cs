@@ -1,0 +1,1573 @@
+using System.Collections;
+using System.Linq;
+using System.Reflection;
+using NUnit.Framework;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using TumbangPreso.InputLayer;
+using TumbangPreso.Settings;
+using TumbangPreso.UI;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.LowLevel;
+using UnityEngine.SceneManagement;
+using UnityEngine.TestTools;
+using UnityEngine.UI;
+
+namespace TumbangPreso.PlayTests
+{
+    public sealed class TumpNativeHudTests
+    {
+        private bool _bots; private int _difficulty;
+        [UnitySetUp] public IEnumerator Before() { _bots = AIController.BotsEnabled; _difficulty = Settings.SettingsStore.Current.AiDifficulty; return PlayModeWorld.Reset(); }
+        [UnityTearDown] public IEnumerator After() { AIController.BotsEnabled = _bots; Settings.SettingsStore.Current.AiDifficulty = _difficulty; return PlayModeWorld.Reset(); }
+
+        [UnityTest]
+        public IEnumerator CurrentMatchBarGeometryFitsTheNativeScreen()
+        {
+            yield return Open(GameMode.Classic);
+            Canvas.ForceUpdateCanvases();
+            var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+            var targets = new[] { "MatchScores/ScoreRow0", "MatchScores/ScoreRow0/PlayerPortrait",
+                "MatchScores/ScoreRow0/SeatTag", "RoundClock/ClockFace" };
+            var corners = new Vector3[4];
+            var evidence = new System.Text.StringBuilder();
+            evidence.AppendLine("screen=" + Screen.width + "x" + Screen.height + " canvas=" + canvas.pixelRect + " scale=" + canvas.scaleFactor);
+            foreach (string path in targets)
+            {
+                var target = canvas.transform.HudFind(path) as RectTransform;
+                Assert.IsNotNull(target, path);
+                target.GetWorldCorners(corners);
+                foreach (var corner in corners)
+                {
+                    var point = RectTransformUtility.WorldToScreenPoint(null, corner);
+                    evidence.AppendLine(path + "=" + point);
+                    Assert.That(point.y, Is.InRange(-.5f, Screen.height + .5f),
+                        path + " crosses the actual native screen edge.");
+                }
+            }
+            string folder = System.IO.Path.GetFullPath(System.IO.Path.Combine(Application.dataPath, "../Logs/hud-window-origin1006/native"));
+            System.IO.Directory.CreateDirectory(folder);
+            System.IO.File.WriteAllText(System.IO.Path.Combine(folder, "geometry.txt"), evidence.ToString());
+        }
+
+        [UnityTest]
+        public IEnumerator OrdinaryRoundStandingsAreCenteredAndReplaceTheLiveHud()
+        {
+            yield return Open(GameMode.Classic);
+            var card = Object.FindFirstObjectByType<RoleSwapCard>();
+            var readout = Object.FindFirstObjectByType<TumpMatchReadout>();
+            var view = card.GetComponent<TumpRoundSwapView>();
+            Assert.IsNotNull(card); Assert.IsNotNull(readout);
+            var scores = (Scoreboard)typeof(MatchDirector).GetField("_scores", BindingFlags.Instance | BindingFlags.NonPublic)
+                .GetValue(GameServices.Match);
+            scores.SetAll(new[] { int.MaxValue, 999999, 10000, 2670 });
+            card.ShowForShot(2, 1);
+            yield return null;
+            Assert.IsTrue(RoleSwapCard.Showing);
+            Assert.IsFalse(readout.Canvas.enabled, "Ordinary breaks must hide the HUD just like halftime.");
+            yield return new WaitForSecondsRealtime(.3f);
+            foreach (var shape in new[] { new Vector2Int(960, 540), new Vector2Int(1600, 680) })
+                yield return TumpUiCapture.Capture("Feedback0930-round-break-" + shape.x + "x" + shape.y,
+                    view.Canvas, shape.x, shape.y, false, true, inspectViewport: () =>
+                    {
+                        var popup = (RectTransform)view.Canvas.transform.HudFind("CourtBreakPopup");
+                        var canvas = (RectTransform)view.Canvas.transform;
+                        Assert.Less(Vector3.Distance(popup.TransformPoint(popup.rect.center),
+                            canvas.TransformPoint(canvas.rect.center)), .5f, "Standings left screen center.");
+                        foreach (var text in view.Canvas.GetComponentsInChildren<Text>().Where(t => t.name.StartsWith("StandingScore")))
+                            Assert.LessOrEqual(text.preferredWidth, text.rectTransform.rect.width + .5f,
+                                "Score overflow: " + text.text);
+                    });
+            card.DismissAndPractice();
+            yield return null;
+            Assert.IsFalse(RoleSwapCard.Showing); Assert.IsTrue(readout.Canvas.enabled);
+            card.ShowForShot(2, 1);
+            GameServices.Match.AdvanceRound();
+            yield return null;
+            Assert.IsFalse(RoleSwapCard.Showing); Assert.IsTrue(readout.Canvas.enabled);
+        }
+
+        [UnityTest]
+        public IEnumerator LargeScoreChipsStayInsideTheBarAtNormalAndAccessibleSizes()
+        {
+            yield return Open(GameMode.Classic);
+            var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+            var row = canvas.transform.HudFind("MatchScores/ScoreRow0") as RectTransform;
+            Assert.IsNotNull(row);
+            var score = row.Find("Score").GetComponent<Text>();
+            var seat = row.Find("SeatTag").GetComponent<Text>();
+            var settings = SettingsStore.Current;
+            float oldScale = settings.HudScale;
+            bool oldLarger = settings.LargerText;
+            try
+            {
+                var cases = new[]
+                {
+                    (Value: 10000, Name: "five-digit-960x540", Width: 960, Height: 540, Scale: 1f, Larger: false),
+                    (Value: -100000, Name: "negative-six-digit-1920x1080", Width: 1920, Height: 1080, Scale: 1f, Larger: false),
+                    (Value: -888888, Name: "negative-widest-1280x720", Width: 1280, Height: 720, Scale: 1f, Larger: false),
+                    (Value: 999999, Name: "six-digit-phone-2340x1080", Width: 2340, Height: 1080, Scale: 1f, Larger: false),
+                    (Value: int.MinValue, Name: "minimum-int-accessible-1600x680", Width: 1600, Height: 680, Scale: 1.2f, Larger: true),
+                };
+                foreach (var sample in cases)
+                {
+                    settings.HudScale = sample.Scale;
+                    settings.LargerText = sample.Larger;
+                    yield return null;
+                    yield return TumpUiCapture.Capture("CourtHud-score-" + sample.Name, canvas,
+                        sample.Width, sample.Height, false, true, inspectViewport: () =>
+                        {
+                            score.text = ""; // Stage through the same formatter/fitter used by Scores.
+                            TumpMatchReadout.PaintScoreValue(score, sample.Value);
+                            score.rectTransform.localScale = Vector3.one * (score.fontSize < 36 ? 1f : 1.07f);
+                            Assert.GreaterOrEqual(score.fontSize, 28);
+                            Assert.LessOrEqual(score.preferredWidth, score.rectTransform.rect.width + 0.5f,
+                                sample.Name + ": score font=" + score.fontSize + " preferred=" + score.preferredWidth +
+                                " rect=" + score.rectTransform.rect.width);
+                            var corners = new Vector3[4];
+                            score.rectTransform.GetWorldCorners(corners);
+                            foreach (var corner in corners)
+                            {
+                                var point = row.InverseTransformPoint(corner);
+                                Assert.GreaterOrEqual(point.x, -0.5f);
+                                Assert.LessOrEqual(point.x, row.rect.width + 0.5f,
+                                    "Score pulse left its chip at " + sample.Name);
+                            }
+                            float glyphRight = row.InverseTransformPoint(score.rectTransform.TransformPoint(
+                                new Vector3(score.rectTransform.rect.xMax, 0f, 0f))).x;
+                            float glyphLeft = glyphRight - score.preferredWidth * score.rectTransform.localScale.x;
+                            float seatRight = seat.rectTransform.anchoredPosition.x + seat.preferredWidth;
+                            Assert.Greater(glyphLeft, seatRight,
+                                "A long score covered the seat identity at " + sample.Name);
+                        });
+                }
+            }
+            finally
+            {
+                settings.HudScale = oldScale;
+                settings.LargerText = oldLarger;
+                score.rectTransform.localScale = Vector3.one;
+                score.text = "";
+                TumpMatchReadout.PaintScoreValue(score, GameServices.Match.ScoreFor(0));
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator ClassicHudReflectsTheRealRoundRoleAndRecoveryState()
+        {
+            yield return Open(GameMode.Classic);
+            var hud = Hud.Instance; var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+            Assert.IsTrue(hud.NativePresentation); Assert.IsEmpty(canvas.GetComponentsInChildren<PaperSkin>(true));
+            // The four-chip row is off in play (`ShowScoreRowInPlay`): your own hero and score sit in the bottom-left
+            // corner and the others arrive as plates. The row is still built, for spectators.
+            Assert.AreEqual(4, canvas.GetComponentsInChildren<RectTransform>(true).Count(r => r.name.StartsWith("ScoreRow")));
+            Assert.IsFalse(canvas.transform.HudFind("MatchScores").gameObject.activeSelf, "The four-chip row is retired in ordinary play.");
+            Assert.AreEqual(1, canvas.GetComponentsInChildren<Image>().Count(i => i.name == "VitalsPortrait" && i.enabled && i.sprite != null),
+                "A sprite reference alone is not a visible portrait: your hero must show in the score corner.");
+            Assert.IsFalse(canvas.transform.HudFind("PowerSeals").gameObject.activeSelf, "Classic has no hero power UI.");
+            var local = Object.FindObjectsByType<CharacterMotor>(FindObjectsSortMode.None).First(m => m.PlayerSlot == GameLaunch.SoloSeat);
+            foreach (var size in TumpUiCapture.HudViewports)
+                yield return TumpUiCapture.Capture("CourtHud-Classic-" + size.x + "x" + size.y,
+                    canvas, size.x, size.y, false, true, checkActionBounds: true);
+            // VISUAL-1.4 budget: the permanent HUD in ordinary FPP play stays under about 8
+            // percent of a 1920x1080 frame. Measured on the real canvas at that size.
+            float share = 1; string detail = "";
+            yield return TumpUiCapture.Capture("CourtHud-area-1920x1080", canvas, 1920, 1080, false, true,
+                inspectViewport: () => share = TumpUiCapture.HudShare(canvas, out detail));
+            Debug.Log($"[HudArea] Classic ordinary play: {share * 100:0.00}% of 1920x1080; {detail}");
+            Assert.Less(share, .08f, "Permanent HUD exceeds the VISUAL-1.4 budget: " + detail);
+            // The transient layer: pictogram feed, a score pop into a chip, the hit mark and a toast.
+            var readout = Object.FindFirstObjectByType<TumpMatchReadout>();
+            var lata = GameServices.Round.Lata;
+            Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Block, 2, 0, lata.transform.position);
+            Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Tag, GameServices.Match.DefenderSlot, (GameServices.Match.DefenderSlot + 2) % 4, lata.transform.position);
+            Visual.MatchFlair.Play(Visual.MatchFlair.Kind.LataDown, 1, -1, lata.transform.position);
+            readout.ScorePopForShot(1, ScoreEvent.LataKnocked); readout.Hit(UiTheme.Offense); hud.ShowToast("TAGGED", 2);
+            yield return null;
+            foreach (var size in new[] { new Vector2Int(1920, 1080), new Vector2Int(1280, 720), TumpUiCapture.OwnerWindow, new Vector2Int(960, 540) })
+            {
+                readout.ScorePopForShot(1, ScoreEvent.LataKnocked); readout.Hit(UiTheme.Offense);
+                yield return TumpUiCapture.Capture("CourtHud-moments-" + size.x + "x" + size.y, canvas, size.x, size.y, false, true, checkActionBounds: true);
+            }
+            // VISUAL-1.4 accessibility frames: HUD 120 percent and High contrast, same moment.
+            var settings = Settings.SettingsStore.Current;
+            float scaleBefore = settings.HudScale; bool contrastBefore = settings.HighContrastHud;
+            try
+            {
+                settings.HudScale = 1.2f; settings.HighContrastHud = true; yield return null;
+                foreach (var size in new[] { new Vector2Int(1920, 1080), TumpUiCapture.OwnerWindow, new Vector2Int(960, 540) })
+                {
+                    readout.ScorePopForShot(1, ScoreEvent.LataKnocked); readout.Hit(UiTheme.Offense);
+                    yield return TumpUiCapture.Capture("CourtHud-moments-hud120-contrast-" + size.x + "x" + size.y, canvas, size.x, size.y, false, true, checkActionBounds: true);
+                }
+            }
+            finally { settings.HudScale = scaleBefore; settings.HighContrastHud = contrastBefore; }
+            yield return null;
+            // VISUAL-1.6 reticle states, one frame each: idle cooldown, half charge with left
+            // pektus, full charge with right pektus, refused (can protected), taya in reach.
+            try
+            {
+                var states = new (string name, float charge, float spin, float cooldown, bool refused, bool reach)[]
+                {
+                    ("cooldown", 0, 0, .6f, false, false), ("charge-left", .6f, -.55f, 0, false, false),
+                    ("charge-full-right", 1, .9f, 0, false, false), ("refused", .7f, 0, 0, true, false), ("taya-reach", 0, 0, 0, false, true),
+                };
+                foreach (var state in states)
+                {
+                    readout.ReticleForShot(state.charge, state.spin, state.cooldown, state.refused, state.reach); yield return null;
+                    yield return TumpUiCapture.Capture("CourtHud-reticle-" + state.name + "-1280x720", canvas, 1280, 720, false, true);
+                }
+            }
+            finally { readout.EndReticleShot(); }
+            // VISUAL-1.1: an armed attacker inside the box sees the Defense-blue frame, and no sentence.
+            var effects = Object.FindFirstObjectByType<TumpHudEffects>();
+            var can = GameServices.Round.Lata;
+            float protectedUntil = Time.unscaledTime + 3;
+            while (can.IsProtected && Time.unscaledTime < protectedUntil) yield return null;
+            if (!can.IsUpright) can.HostRestore();
+            local.Teleport(can.transform.position + new Vector3(0, 0, -2.5f)); yield return null;
+            float frameBy = Time.unscaledTime + 1;
+            while (!effects.DangerFrameVisible && Time.unscaledTime < frameBy) yield return null;
+            if (local.IsTaggable())
+            {
+                Assert.IsTrue(effects.DangerFrameVisible, "A taggable attacker must see the danger frame.");
+                Assert.AreNotEqual("You can be tagged", canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt").text);
+                foreach (var size in new[] { new Vector2Int(1920, 1080), TumpUiCapture.OwnerWindow })
+                    yield return TumpUiCapture.Capture("CourtHud-danger-" + size.x + "x" + size.y, canvas, size.x, size.y, false, true);
+            }
+            else Debug.Log("[HudDanger] staged attacker was not taggable (no slipper in hand); frame capture skipped.");
+            bool before = local.IsDefender; local.IsDefender = true; yield return null;
+            Assert.AreEqual("Defender", canvas.GetComponentsInChildren<Text>().First(t => t.name == "LocalRole").text);
+            local.IsDefender = before;
+            local.ApplyFallRecovery(); yield return null;
+            var prompt = canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt");
+            Assert.That(prompt.text.ToLowerInvariant(), Does.Contain("get up").Or.Contain("getting up"));
+            yield return TumpUiCapture.Capture("CourtHud-recovery", canvas, 960, 540, false, true, checkActionBounds: true);
+            local.ClearTrip();
+            hud.ShowToast("Slipper returning · 10.0s", 1); yield return null;
+            Assert.IsTrue(canvas.GetComponentsInChildren<Text>().First(t => t.name == "MatchToast").enabled);
+            var swap = Object.FindFirstObjectByType<RoleSwapCard>();
+            swap.ShowForShot(2, (GameServices.Match.DefenderSlot + 1) % 4); yield return null;
+            var intermission = GameObject.Find("OwnerRoundSwapCanvas").GetComponent<Canvas>();
+            Assert.IsEmpty(intermission.GetComponentsInChildren<PaperSkin>(true));
+            Assert.IsNotNull(intermission.GetComponentsInChildren<Image>().First(i=>i.name=="NextDefenderPortrait").sprite);
+            foreach(var size in TumpUiCapture.HudViewports)
+            {
+                swap.ShowForShot(2,(GameServices.Match.DefenderSlot+1)%4);
+                yield return TumpUiCapture.Capture("CourtBreak-"+size.x+"x"+size.y,intermission,size.x,size.y,false,true,checkActionBounds:true);
+            }
+            swap.DismissAndPractice(); Assert.IsFalse(intermission.gameObject.activeSelf);
+        }
+        [UnityTest]
+        public IEnumerator HeroPowerDetailsAndSpectatorCleanFeedKeepTheirLiveContracts()
+        {
+            yield return Open(GameMode.HeroStrike);
+            var hud = Hud.Instance; var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+            var local = Object.FindObjectsByType<CharacterMotor>(FindObjectsSortMode.None).First(m => m.PlayerSlot == GameLaunch.SoloSeat);
+            Assert.IsTrue(canvas.transform.HudFind("PowerSeals").gameObject.activeSelf);
+            Assert.AreEqual(3, canvas.GetComponentsInChildren<OwnerAbilitySeal>().Count(seal => !seal.Overlay), "The deck holds three powers.");
+            float share = 1; string detail = "";
+            yield return TumpUiCapture.Capture("OwnerHud-Hero-v1", canvas, 1920, 1080, false, true,
+                inspectViewport: () => share = TumpUiCapture.HudShare(canvas, out detail));
+            Debug.Log($"[HudArea] Hero Strike ordinary play: {share * 100:0.00}% of 1920x1080; {detail}");
+            Assert.Less(share, .08f, "Permanent Hero Strike HUD exceeds the VISUAL-1.4 budget: " + detail);
+            var readout = Object.FindFirstObjectByType<TumpPowerReadout>();
+            var kit = local.GetComponent<Abilities.HeroAbilitySystem>().Kit;
+            try
+            {
+                readout.OpenForCapture(kit); yield return null;
+                var names = canvas.GetComponentsInChildren<Text>().Where(t => t.name.StartsWith("PowerName")).Select(t => t.text).ToArray();
+                CollectionAssert.AreEquivalent(new[] { kit.Skill1.EffectiveName, kit.Skill2.EffectiveName, kit.Ultimate.EffectiveName }, names);
+                // The reference carries the cost alone (owner, 2026-11-05), so a changed cooldown is what must refresh.
+                float cooldown=kit.Skill1.Cooldown;
+                var setter=typeof(Abilities.HeroAbility).GetProperty("Cooldown").GetSetMethod(true);
+                try
+                {
+                    setter.Invoke(kit.Skill1,new object[]{cooldown+1});yield return null;
+                    Assert.That(canvas.GetComponentsInChildren<Text>(true).First(t=>t.name=="PowerTiming0").text,
+                        Does.Contain((cooldown+1).ToString("0.#")+"s COOLDOWN"),"A live kit must refresh changed timing details.");
+                }
+                finally{setter.Invoke(kit.Skill1,new object[]{cooldown});}
+                yield return null;
+                foreach (var size in TumpUiCapture.HudViewports)
+                    yield return TumpUiCapture.Capture("CourtHud-held-skills-" + size.x + "x" + size.y,
+                        canvas, size.x, size.y, false, true, checkActionBounds: true);
+            }
+            finally { readout.CloseCapture(); }
+            hud.EnterSpectatorMode(); yield return null;
+            Assert.IsFalse(canvas.transform.HudFind("PowerSeals").gameObject.activeSelf);
+            Assert.IsFalse(canvas.transform.HudFind("LocalState").gameObject.activeSelf);
+            foreach (var size in TumpUiCapture.HudViewports)
+                yield return TumpUiCapture.Capture("CourtHud-spectator-" + size.x + "x" + size.y,
+                    canvas, size.x, size.y, false, true, checkActionBounds: true);
+            hud.SetCleanFeed(true); Assert.IsFalse(canvas.gameObject.activeSelf);
+            hud.SetCleanFeed(false); Assert.IsTrue(canvas.gameObject.activeSelf);
+            hud.ExitSpectatorMode(); yield return null;
+            Assert.IsTrue(canvas.transform.HudFind("LocalState").gameObject.activeSelf);
+        }
+        [UnityTest]
+        public IEnumerator SpectatorCleanFeedHidesDetachedAnnouncementsAndResults()
+        {
+            yield return Open(GameMode.Classic);
+            var hud = Hud.Instance;
+            var settings = SettingsStore.Current;
+            bool oldSpectator = GameLaunch.Spectator, oldMotion = settings.ReducedUiMotion;
+            bool oldCinematic = settings.CinematicCameraMotion;
+            try
+            {
+                settings.ReducedUiMotion = false;
+                settings.CinematicCameraMotion = true;
+                GameLaunch.Spectator = true;
+                hud.EnterSpectatorMode();
+                yield return null;
+                var readout = hud.GetComponent<TumpMatchReadout>();
+                var lata = GameServices.Round.Lata;
+                Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Tag, 0, 1, lata.transform.position);
+                var catchView = hud.GetComponent<CameraSystem.CatchReconstruction>();
+                bool queued = (bool)typeof(CameraSystem.CatchReconstruction).GetField("_pending",
+                    BindingFlags.Instance | BindingFlags.NonPublic).GetValue(catchView);
+                Assert.IsFalse(queued || catchView.Playing, "A spectator must not start an automatic catch inset.");
+
+                CanDownStamp.Play(1);
+                var stamp = GameObject.Find("~CanDownStamp").GetComponent<CanvasGroup>();
+                Assert.AreEqual(1, stamp.alpha);
+                hud.SetCleanFeed(true);
+                Assert.IsFalse(readout.Canvas.gameObject.activeSelf);
+                Assert.AreEqual(0, stamp.alpha);
+                CanDownStamp.Play(2);
+                yield return null;
+                stamp = GameObject.Find("~CanDownStamp").GetComponent<CanvasGroup>();
+                Assert.AreEqual(0, stamp.alpha, "New announcements must also obey the hidden feed.");
+                hud.SetCleanFeed(false);
+                Assert.AreEqual(1, stamp.alpha);
+
+                hud.SetCleanFeed(true);
+                var result = Object.FindFirstObjectByType<MatchResult>();
+                result.OnMatchWon(1);
+                var board = GameObject.Find("OwnerResultCanvas").GetComponent<CanvasGroup>();
+                Assert.AreEqual(0, board.alpha);
+                Assert.IsFalse(board.blocksRaycasts);
+                hud.SetCleanFeed(false);
+                Assert.AreEqual(1, board.alpha);
+                Assert.IsTrue(board.blocksRaycasts);
+            }
+            finally
+            {
+                hud.SetCleanFeed(false);
+                GameLaunch.Spectator = oldSpectator;
+                settings.ReducedUiMotion = oldMotion;
+                settings.CinematicCameraMotion = oldCinematic;
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator RootedPromptTracksLiveBindingsDevicesAndHeldProgress()
+        {
+            var actions = Resources.Load<InputActionAsset>("TumbangPreso");
+            string overrides = actions.SaveBindingOverridesAsJson();
+            var oldDevice = LastInputDevice.Current;
+            bool touchVisible = TouchHud.ForceVisible, touchActive = TouchInput.Active;
+            bool reducedMotion = SettingsStore.Current.ReducedUiMotion;
+            var oldMove = TouchInput.Move;
+            var inputSettings = InputSystem.settings;
+            var background = inputSettings.backgroundBehavior;
+            var editorInput = inputSettings.editorInputBehaviorInPlayMode;
+            inputSettings.backgroundBehavior = InputSettings.BackgroundBehavior.IgnoreFocus;
+            inputSettings.editorInputBehaviorInPlayMode = InputSettings.EditorInputBehaviorInPlayMode.AllDeviceInputAlwaysGoesToGameView;
+            var keyboard = InputSystem.AddDevice<Keyboard>();
+            var pad = InputSystem.AddDevice<Gamepad>();
+            InputSystem.EnableDevice(keyboard); InputSystem.EnableDevice(pad);
+            TouchHud.ForceVisible = true;
+            SettingsStore.Current.ReducedUiMotion = false;
+            try
+            {
+                yield return Open(GameMode.HeroStrike);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                var reader = local.GetComponent<PlayerInputReader>();
+                Assert.IsNotNull(reader);
+                Assert.IsTrue(reader.isActiveAndEnabled, "The local seat needs an active hardware reader.");
+                Assert.AreSame(actions, typeof(PlayerInputReader).GetField("_actions", BindingFlags.Instance | BindingFlags.NonPublic)
+                    .GetValue(reader), "The live binding and the reader must use the same input asset.");
+                var interactAction = actions.FindActionMap("Player", true).FindAction("Interact", true);
+                var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+                var prompt = canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt");
+                var progress = canvas.GetComponentsInChildren<Image>(true).First(i => i.name == "ProgressFill");
+                var glyph = canvas.GetComponentsInChildren<Image>(true).First(i => i.name == "ActionBindingGlyph");
+                var touch = Object.FindFirstObjectByType<TouchHud>();
+                var interact = touch.Buttons.First(b => b.Entry.Verb == Verb.Interact);
+                local.ApplyRooted(45);
+                TouchInput.ReleaseAll(); TouchInput.Active = false; TouchInput.Move = Vector2.zero;
+                InputSystem.QueueStateEvent(keyboard, new KeyboardState(Key.F9));
+                InputSystem.Update(); keyboard.MakeCurrent(); LastInputDevice.Sample();
+                yield return null;
+                Assert.That(prompt.text, Does.Contain("Remove Rooted"));
+                Assert.IsTrue(glyph.enabled);Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("Interact"),true),glyph.sprite);
+                Assert.IsTrue(progress.transform.parent.gameObject.activeSelf);
+
+                Assert.IsNull(Rebinding.TryRebind(actions, "Interact", keyboard.f10Key));
+                InputSystem.QueueStateEvent(keyboard, new KeyboardState(Key.F10));
+                yield return new WaitForSeconds(.4f);
+                Assert.AreEqual(InputDeviceKind.KeyboardMouse, LastInputDevice.Current);
+                Assert.AreEqual("Removing Rooted", prompt.text);
+                Assert.IsTrue(glyph.enabled);Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("Interact"),true),glyph.sprite);
+                Debug.Log($"[RootedInput] device={keyboard.enabled} key={keyboard.f10Key.isPressed} action={interactAction.enabled}/{interactAction.IsPressed()} reader={reader.isActiveAndEnabled} intent={local.Intent.Pressed(Verb.Interact)} parked={local.Intent.Parked} locked={local.Intent.Locked(Verb.Interact)} held={PresentationClock.Held} local={local.IsLocallySimulated()} rooted={local.IsRooted} progress={local.BreakFreeProgress:F3}");
+                Assert.IsTrue(keyboard.enabled && keyboard.f10Key.isPressed, "The synthetic F10 hold did not reach an enabled keyboard.");
+                Assert.IsTrue(interactAction.enabled && interactAction.IsPressed(), "The configured Interact action did not read the F10 hold.");
+                Assert.IsTrue(local.Intent.Pressed(Verb.Interact), "The reader did not publish an effective Interact hold; see RootedInput diagnostics.");
+                Assert.Greater(local.BreakFreeProgress, 0);
+                InputSystem.QueueStateEvent(keyboard, new KeyboardState());
+                yield return null; yield return new WaitForFixedUpdate(); yield return null;
+                float released = local.BreakFreeProgress;
+                yield return TumpUiCapture.Capture("CourtHud-rooted-keyboard", canvas, 1280, 720, false, true, checkActionBounds: true);
+                Assert.AreEqual(released, local.BreakFreeProgress, .001f, "Root escape keeps earned progress when released.");
+                Assert.AreEqual(local.BreakFreeProgress, progress.rectTransform.anchorMax.x, .01f);
+
+                Assert.IsNull(Rebinding.TryRebind(actions, "Interact", pad.rightStickButton));
+                InputSystem.QueueStateEvent(pad, new GamepadState().WithButton(GamepadButton.RightStick));
+                yield return new WaitForSeconds(.4f);
+                Assert.AreEqual(InputDeviceKind.Gamepad, LastInputDevice.Current);
+                Assert.Greater(local.BreakFreeProgress, released, "The prompted pad control must perform the hold.");
+                Assert.AreEqual("Removing Rooted", prompt.text);
+                Assert.IsTrue(glyph.enabled);Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("Interact"),true),glyph.sprite);
+                InputSystem.QueueStateEvent(pad, new GamepadState());
+                yield return null;
+                yield return TumpUiCapture.Capture("CourtHud-rooted-pad", canvas, 960, 540, false, true, checkActionBounds: true);
+
+                TouchInput.Active = true; TouchInput.Move = Vector2.right; LastInputDevice.Sample();
+                TouchInput.Move = Vector2.zero;
+                yield return new WaitForSeconds(.15f);
+                Assert.AreEqual(InputDeviceKind.Touch, LastInputDevice.Current);
+                Assert.AreEqual("Remove Rooted", prompt.text);Assert.IsFalse(glyph.enabled);
+                Assert.Greater(interact.transform.localScale.x, 1, "The touch Interact button must be visibly emphasised.");
+                float beforeTouch = local.BreakFreeProgress;
+                interact.SetHeld(true);
+                yield return new WaitForSeconds(.4f);
+                interact.SetHeld(false);
+                Assert.Greater(local.BreakFreeProgress, beforeTouch, "The prompted touch button must perform the hold.");
+                yield return TumpUiCapture.Capture("CourtHud-rooted-touch", canvas, 1280, 720, false, true,
+                    underlays: new[] { touch.Canvas }, checkActionBounds: true);
+
+                Hud.Instance.EnterSpectatorMode(); yield return null;
+                Assert.IsFalse(prompt.gameObject.activeInHierarchy, "Spectators must never see their former body's interaction prompt.");
+                Hud.Instance.ExitSpectatorMode(); yield return null;
+                Assert.IsTrue(prompt.gameObject.activeInHierarchy);
+                interact.SetHeld(true);
+                float deadline = Time.time + PaeteRules.BreakFreeHoldSeconds + .5f;
+                while (local.IsRooted && Time.time < deadline) yield return null;
+                interact.SetHeld(false); yield return null;
+                Assert.IsFalse(local.IsRooted, "Holding the prompted control must finish the escape.");
+                Assert.That(prompt.text, Does.Not.Contain("Rooted"));
+                Assert.IsFalse(progress.transform.parent.gameObject.activeSelf);
+            }
+            finally
+            {
+                // Loading an empty snapshot changes nothing, so clear the test's own rebinds first.
+                actions.RemoveAllBindingOverrides(); if (!string.IsNullOrEmpty(overrides)) actions.LoadBindingOverridesFromJson(overrides);
+                Rebinding.Invalidate(); Rebinding.Save(actions);
+                TouchInput.ReleaseAll(); TouchInput.Active = touchActive; TouchInput.Move = oldMove;
+                TouchHud.ForceVisible = touchVisible; SettingsStore.Current.ReducedUiMotion = reducedMotion;
+                InputSystem.RemoveDevice(pad); InputSystem.RemoveDevice(keyboard);
+                inputSettings.backgroundBehavior = background; inputSettings.editorInputBehaviorInPlayMode = editorInput;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { oldDevice });
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator CanResetTouchCueUsesTheActualReachAndRestoreSetting()
+        {
+            bool visible = TouchHud.ForceVisible, active = TouchInput.Active;
+            bool toggle = SettingsStore.Current.ToggleRestore, reduced = SettingsStore.Current.ReducedUiMotion;
+            var device = LastInputDevice.Current; var move = TouchInput.Move;
+            TouchHud.ForceVisible = true; SettingsStore.Current.ReducedUiMotion = false;
+            try
+            {
+                yield return Open(GameMode.HeroStrike);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled = false; local.Intent.Clear(); local.IsDefender = true;
+                var can = GameServices.Round.Lata;
+                float protectionDeadline = Time.time + 3;
+                while (can.IsProtected && Time.time < protectionDeadline) yield return null;
+                can.HostKnockDown((local.PlayerSlot + 1) % 4);
+                Assert.IsFalse(can.IsUpright);
+                var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+                var prompt = canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt");
+                var touch = Object.FindFirstObjectByType<TouchHud>();
+                var grab = touch.Buttons.First(b => b.Entry.Verb == Verb.Grab);
+                TouchInput.Active = true; TouchInput.Move = Vector2.right; LastInputDevice.Sample(); TouchInput.Move = Vector2.zero;
+                local.Teleport(can.transform.position + Vector3.back * (Balance.InteractionRadius + 1));
+                yield return new WaitForSeconds(.35f);
+                Assert.IsEmpty(prompt.text, "An unreachable can must not display a reset instruction.");
+                Assert.AreEqual(1, grab.transform.localScale.x, .001f, "An unreachable can must not pulse a dead action.");
+                local.Teleport(can.transform.position + Vector3.back * (Balance.InteractionRadius * .8f));
+                SettingsStore.Current.ToggleRestore = false;
+                yield return new WaitForSeconds(.2f);
+                Assert.AreEqual("Reset Can", prompt.text);
+                Assert.Greater(grab.transform.localScale.x, 1);
+                SettingsStore.Current.ToggleRestore = true; yield return null;
+                Assert.AreEqual("Reset Can", prompt.text);
+                local.Intent.Set(Verb.Grab, true); yield return new WaitForSeconds(.2f);
+                Assert.Greater(local.GetComponent<Carrier>().ChannelRatio, 0);
+                Assert.AreEqual("Resetting Can · tap to cancel", prompt.text);
+                yield return TumpUiCapture.Capture("CourtHud-can-reset-touch", canvas, 1280, 720, false, true,
+                    underlays: new[] { touch.Canvas }, checkActionBounds: true);
+                local.Intent.Set(Verb.Grab, false); yield return null; yield return new WaitForFixedUpdate(); yield return null;
+                Assert.AreEqual(0, local.GetComponent<Carrier>().ChannelRatio);
+                Assert.AreEqual("Reset Can", prompt.text);
+            }
+            finally
+            {
+                TouchInput.ReleaseAll(); TouchInput.Active = active; TouchInput.Move = move; TouchHud.ForceVisible = visible;
+                SettingsStore.Current.ToggleRestore = toggle; SettingsStore.Current.ReducedUiMotion = reduced;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { device });
+            }
+        }
+
+        [UnityTest]
+        public IEnumerator ArmedAttackerInsideTheBoxSeesTheDefenseFrame()
+        {
+            yield return Open(GameMode.Classic);
+            var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+            local.GetComponent<PlayerInputReader>().enabled = false; local.Intent.Clear();
+            Assert.IsFalse(local.IsDefender); Assert.IsTrue(local.HoldingSlipper, "Round start arms the attacker.");
+            var can = GameServices.Round.Lata;
+            local.Teleport(can.transform.position + new Vector3(0, 0, -2.5f)); local.transform.rotation = Quaternion.identity;
+            TumpUiCapture.StageHudReview(local);
+            var effects = Object.FindFirstObjectByType<TumpHudEffects>();
+            float frameBy = Time.unscaledTime + 1;
+            while (!effects.DangerFrameVisible && Time.unscaledTime < frameBy) yield return null;
+            Assert.IsTrue(local.IsTaggable());
+            Assert.IsTrue(effects.DangerFrameVisible, "An armed attacker inside the box must see the frame.");
+            Assert.IsFalse(effects.CanDownFrameVisible);
+            yield return new WaitForSecondsRealtime(.4f);
+            LogCanMarker("attacker");
+            yield return TumpUiCapture.Capture("CourtHud-attacker-danger-1280x720",
+                GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>(), 1280, 720, false, true, OffscreenUnderlay());
+        }
+
+        [UnityTest]
+        public IEnumerator TayaCanDownCueKeepsPulsingInReachUntilRestore()
+        {
+            int seat = GameLaunch.SoloSeat;
+            var settings = SettingsStore.Current;
+            bool reducedMotion = settings.ReducedUiMotion, reducedEffects = settings.ReducedEffects;
+            float flashIntensity = settings.FlashIntensity;
+            GameLaunch.SoloSeat = MatchRules.DefenderSlotFor(1);
+            settings.ReducedUiMotion = settings.ReducedEffects = false;
+            settings.FlashIntensity = 1f;
+            try
+            {
+                yield return Open(GameMode.Classic);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled = false; local.Intent.Clear();
+                Assert.IsTrue(local.IsDefender, "The local seat is the real round-one taya.");
+                var can = GameServices.Round.Lata;
+                var effects = Object.FindFirstObjectByType<TumpHudEffects>();
+                // Chasing, looking away: the knockdown lands behind the taya.
+                local.Teleport(can.transform.position + Vector3.forward * (Balance.InteractionRadius + 2));
+                local.transform.rotation = Quaternion.identity;
+                float protectionDeadline = Time.time + 5;
+                while (can.IsProtected && Time.time < protectionDeadline) yield return null;
+                yield return null;
+                Assert.IsFalse(effects.DangerFrameVisible || effects.CanDownFrameVisible, "An upright can frames nothing for the taya.");
+                can.HostKnockDown((local.PlayerSlot + 1) % 4);
+                Assert.IsFalse(can.IsUpright);
+                float frameBy = Time.unscaledTime + 1;
+                while (!effects.CanDownFrameVisible && Time.unscaledTime < frameBy) yield return null;
+                Assert.IsTrue(effects.CanDownFrameVisible, "The taya whose can is down must see the frame.");
+                Assert.IsFalse(effects.DangerFrameVisible, "The taya is never told they can be tagged.");
+                var carrier = local.GetComponent<Carrier>();
+                Assert.IsFalse(carrier.HasResetTarget, "The knockdown starts outside Grab range.");
+                local.Teleport(can.transform.position + Vector3.back * (Balance.InteractionRadius * .7f));
+                yield return new WaitForSecondsRealtime(.35f);
+                Assert.IsTrue(carrier.HasResetTarget, "Entering Grab range must exercise the old cutoff.");
+                var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+                var wash = canvas.GetComponentsInChildren<Image>().First(image => image.name == "DangerEdges");
+                float lowest = 1f, highest = 0f;
+                float sampleUntil = Time.unscaledTime + 1.6f;
+                while (Time.unscaledTime < sampleUntil)
+                {
+                    Assert.IsFalse(can.IsUpright);
+                    Assert.IsTrue(effects.CanDownFrameVisible, "The cue stays visible in reach, even at the pulse trough.");
+                    Assert.IsFalse(wash.enabled, "Can down should read as corner strikes instead of a vignette.");
+                    lowest = Mathf.Min(lowest, effects.FrameColour.a);
+                    highest = Mathf.Max(highest, effects.FrameColour.a);
+                    yield return null;
+                }
+                Assert.Greater(highest - lowest, .15f, "The pulse must continue when Grab becomes available.");
+                yield return TumpUiCapture.Capture("CourtHud-tumba-in-reach-1280x720",
+                    canvas, 1280, 720, false, true, OffscreenUnderlay());
+                can.HostRestore();
+                Assert.IsTrue(can.IsUpright, "The referee restored the can.");
+                float clearBy = Time.unscaledTime + .5f;
+                while (effects.CanDownFrameVisible && Time.unscaledTime < clearBy) yield return null;
+                Assert.IsFalse(effects.CanDownFrameVisible, "The frame clears once the can stands again.");
+            }
+            finally
+            {
+                GameLaunch.SoloSeat = seat;
+                settings.ReducedUiMotion = reducedMotion;
+                settings.ReducedEffects = reducedEffects;
+                settings.FlashIntensity = flashIntensity;
+            }
+        }
+
+        // The edge can marker is its own canvas; the renders show it with the frame.
+        private static Canvas[] OffscreenUnderlay()
+        {
+            var marker = Object.FindFirstObjectByType<OffscreenIndicators>();
+            var canvas = marker != null ? marker.GetComponentInChildren<Canvas>(true) : null;
+            return canvas != null ? new[] { canvas } : null;
+        }
+
+        private static void LogCanMarker(string viewer)
+        {
+            var marker = Object.FindFirstObjectByType<OffscreenIndicators>();
+            Debug.Log($"[CanMarker] {viewer}: present={marker != null} visible={marker != null && marker.CanMarkerVisible} " +
+                      $"state={(marker != null ? marker.CanMarkerState : "")}");
+        }
+
+        [UnityTest]
+        public IEnumerator PlantPromptRequiresAnEligibleOpponentPlantAndTracksThePull()
+        {
+            yield return Open(GameMode.HeroStrike);
+            var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+            local.GetComponent<PlayerInputReader>().enabled = false;
+            local.Intent.Clear(); local.Intent.Parked = false;
+            var canvas = GameObject.Find("OwnerMatchCanvas").GetComponent<Canvas>();
+            var prompt = canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt");
+            var progress = canvas.GetComponentsInChildren<Image>(true).First(i => i.name == "ProgressFill");
+            Vector3 near = local.transform.position + Vector3.forward;
+            int enemy = (local.PlayerSlot + 1) % 4;
+            var plant = PaetePlant.Restore(near, local.PlayerSlot, PaeteRules.PlantRootedSeconds + 1, 3);
+            yield return null;
+            Assert.That(prompt.text, Does.Not.Contain("pull it out"), "The owner cannot uproot their own plant.");
+            Object.Destroy(plant.gameObject); yield return null;
+            plant = PaetePlant.Restore(near, enemy, 1, 3);
+            yield return null;
+            Assert.That(prompt.text, Does.Not.Contain("pull it out"), "The initial protected period has no available pull action.");
+            Object.Destroy(plant.gameObject); yield return null;
+            plant = PaetePlant.Restore(local.transform.position + Vector3.forward * (PaeteRules.PlantPullReach + .1f),
+                enemy, PaeteRules.PlantRootedSeconds + 1, 3);
+            yield return null;
+            Assert.That(prompt.text, Does.Not.Contain("pull it out"), "The host's network tolerance is not local interaction reach.");
+            plant.transform.position = near;
+            yield return null;
+            Assert.That(prompt.text, Does.Contain("pull it out"));
+            local.Intent.Set(Verb.Interact, true);
+            yield return new WaitForSeconds(.35f);
+            Assert.Greater(local.PullingPlantProgress, 0);
+            Assert.AreEqual(local.PullingPlantProgress, progress.rectTransform.anchorMax.x, .05f);
+            local.Intent.Set(Verb.Interact, false);
+            yield return null; yield return null;
+            Assert.AreEqual(0, local.PullingPlantProgress, .001f, "Unlike root escape, releasing an uproot resets its progress.");
+            Assert.IsFalse(progress.enabled);
+            yield return TumpUiCapture.Capture("CourtHud-pull-available", canvas, 1280, 720, false, true, checkActionBounds: true);
+            local.Intent.Set(Verb.Interact, true);
+            float deadline = Time.time + PaeteRules.PlantPullSeconds + .5f;
+            while (plant != null && !plant.IsPulled && Time.time < deadline) yield return null;
+            local.Intent.Set(Verb.Interact, false); yield return null;
+            Assert.IsTrue(plant == null || plant.IsPulled);
+            Assert.That(prompt.text, Does.Not.Contain("pull it out"));
+            Assert.IsFalse(progress.transform.parent.gameObject.activeSelf);
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator ReadyUpUsesLargeLiveXeluBindingsAndClearsAfterTheReadyWindow()
+        {
+            var actions = Resources.Load<InputActionAsset>("TumbangPreso");
+            string overrides = actions.SaveBindingOverridesAsJson();
+            var device = LastInputDevice.Current;
+            bool touch = TouchInput.Active, force = TouchHud.ForceVisible;
+            int mip = QualitySettings.globalTextureMipmapLimit;
+            var keys = InputSystem.AddDevice<Keyboard>(); var pad = InputSystem.AddDevice<Gamepad>();
+            QualitySettings.globalTextureMipmapLimit = 2;
+            try
+            {
+                TouchInput.Active = false; TouchHud.ForceVisible = false;
+                yield return MapRetrievalProbe.Load(SceneFlow.Eskinita, GameMode.HeroStrike);
+                Hud.Instance.ShowReadyPrompt(true);
+                var hud = Object.FindAnyObjectByType<TumpMatchReadout>();
+                var prompt = hud.Canvas.GetComponentsInChildren<Text>(true).First(t => t.name == "ActionPrompt");
+                var detail = hud.Canvas.GetComponentsInChildren<Text>(true).First(t => t.name == "ActionDetail");
+                var glyph = hud.Canvas.GetComponentsInChildren<Image>(true).First(t => t.name == "ActionBindingGlyph");
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.KeyboardMouse });
+                Assert.IsNull(Rebinding.TryRebind(actions, "ReadyUp", keys.f10Key));
+                yield return null;
+                Assert.AreEqual("Ready Up", prompt.text); Assert.IsEmpty(detail.text);
+                Assert.IsTrue(glyph.enabled); Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("ReadyUp"), true), glyph.sprite);
+                Assert.That(Hud.KeyLabelFor("ReadyUp"), Does.Contain("F10"));
+                Assert.AreEqual(58, glyph.rectTransform.rect.height);
+                foreach (var shape in new[] { new Vector2Int(960, 540), new Vector2Int(1600, 680) })
+                    yield return TumpUiCapture.Capture("Feedback-ready-up-" + shape.x + "x" + shape.y, hud.Canvas, shape.x, shape.y, false, true);
+                Assert.IsNull(Rebinding.TryRebind(actions, "ReadyUp", pad.rightStickButton));
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.Gamepad });
+                yield return null;
+                Assert.IsTrue(glyph.enabled); Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("ReadyUp"), true), glyph.sprite);
+                Assert.AreEqual("Ready Up", prompt.text); Assert.IsEmpty(detail.text);
+                TouchInput.Active = true;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.Touch });
+                yield return null;
+                Assert.AreEqual("Ready Up", prompt.text); Assert.IsFalse(glyph.enabled); Assert.IsEmpty(detail.text);
+                TouchInput.Active = false;
+                Hud.Instance.ShowReadyPrompt(false); yield return null;
+                Assert.IsFalse(glyph.enabled); Assert.That(prompt.text, Does.Not.Contain("Ready Up"));
+                // The prompt is sized to its words by `SizePromptPlate` (a plate that fits, not a fixed 1100 strip), and never wider than the strip.
+                Assert.Less(prompt.rectTransform.rect.width, 1100f, "Non-ready action prompts are sized to their words again.");
+                Hud.Instance.EnterSpectatorMode(); yield return null;
+                Assert.IsFalse(prompt.gameObject.activeInHierarchy);
+            }
+            finally
+            {
+                // Loading an empty snapshot changes nothing, so clear the test's own rebinds first.
+                actions.RemoveAllBindingOverrides(); if (!string.IsNullOrEmpty(overrides)) actions.LoadBindingOverridesFromJson(overrides);
+                Rebinding.Invalidate(); Rebinding.Save(actions);
+                TouchInput.Active = touch; TouchHud.ForceVisible = force;
+                InputSystem.RemoveDevice(keys); InputSystem.RemoveDevice(pad);
+                QualitySettings.globalTextureMipmapLimit = mip;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { device });
+            }
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator LargerPowerControlsPreserveMarginsBindingsAndFinalizedKitText()
+        {
+            int mip = QualitySettings.globalTextureMipmapLimit;
+            float hudScale = SettingsStore.Current.HudScale; bool larger = SettingsStore.Current.LargerText;
+            var device = LastInputDevice.Current; bool touch = TouchInput.Active;
+            QualitySettings.globalTextureMipmapLimit = 2;
+            SettingsStore.Current.HudScale = 1; SettingsStore.Current.LargerText = false;
+            try
+            {
+                TouchInput.Active = false;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.KeyboardMouse });
+                yield return MapRetrievalProbe.Load(SceneFlow.Eskinita, GameMode.HeroStrike);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                var system = local.GetComponent<HeroAbilitySystem>();
+                var readout = Object.FindAnyObjectByType<TumpPowerReadout>();
+                var hud = Object.FindAnyObjectByType<TumpMatchReadout>();
+                var deck = (RectTransform)hud.Canvas.transform.HudFind("PowerSeals");
+                // 2026-10-20: the identity plate shows the baked icon of this seat's own tsinelas.
+                yield return new WaitForSecondsRealtime(.6f);
+                var objectIcon = hud.Canvas.GetComponentsInChildren<Image>(true).First(i => i.name == "VitalsObject");
+                Assert.IsTrue(objectIcon.isActiveAndEnabled && objectIcon.sprite != null,
+                    "The identity plate must show the equipped tsinelas' own icon, not the drawn fallback.");
+                // 2026-10-20 overhaul: the ultimate is its own group at the bottom centre.
+                var ultimate = (RectTransform)hud.Canvas.transform.HudFind("UltimateSeal");
+                Assert.IsNotNull(ultimate, "The ultimate is its own bottom-centre group.");
+                System.Collections.Generic.IEnumerable<Image> Glyphs(bool inactive) => deck.GetComponentsInChildren<Image>(inactive)
+                    .Concat(ultimate.GetComponentsInChildren<Image>(inactive)).Where(i => i.name == "BindingGlyph");
+                foreach (string hero in new[] { "paete", "phaister", "zack" })
+                {
+                    system.BindHero(hero);
+                    yield return new WaitForSecondsRealtime(TumpPowerReadout.RoleSwapSeconds + .1f);
+                    var kit = system.Kit;
+                    var skills = new[] { kit.Skill1, kit.Skill2, kit.Ultimate };
+                    var names = skills.Select(a => a.EffectiveName).ToArray();
+                    var descriptions = skills.Select(a => a.EffectiveDescription).ToArray();
+                    yield return null;
+                    Assert.AreEqual(Vector3.one * 1.25f, deck.localScale);
+                    Assert.AreEqual(new Vector2(-22, 5), deck.anchoredPosition);
+                    Assert.AreEqual(TumpPowerReadout.SkillDeckWidth * 1.25f, readout.DeckRect().width, .1f);
+                    Assert.AreEqual(new Vector2(.5f, 0), ultimate.anchorMin, "Keyboard and pad keep the ultimate at the bottom centre.");
+                    Assert.AreEqual(Vector3.one * 1.25f, ultimate.localScale);
+                    Assert.IsFalse(readout.DeckRect().Overlaps(readout.UltimateRect()), "The skills and the ultimate must not overlap.");
+                    CollectionAssert.AreEqual(names, skills.Select(a => a.EffectiveName).ToArray());
+                    CollectionAssert.AreEqual(descriptions, skills.Select(a => a.EffectiveDescription).ToArray());
+                    var glyphs = Glyphs(false).ToArray();
+                    Assert.AreEqual(3, glyphs.Length); Assert.IsTrue(glyphs.All(g => g.enabled && g.sprite != null));
+                    if (hero == "paete")
+                    {
+                        var sandbox = hud.Canvas.transform.HudFind("SandboxState") as RectTransform;
+                        var hint = deck.Find("PowerInfoBinding") as RectTransform;
+                        var corners = new Vector3[4]; sandbox.GetWorldCorners(corners); float bottom = corners[0].y;
+                        hint.GetWorldCorners(corners); Assert.Greater(bottom, corners[1].y, "Practice status must clear the enlarged power hints.");
+                        foreach (var shape in new[] { new Vector2Int(960, 540), new Vector2Int(1600, 680) })
+                            yield return TumpUiCapture.Capture("Feedback-larger-powers-" + shape.x + "x" + shape.y, hud.Canvas, shape.x, shape.y, false, true);
+                    }
+                }
+                SettingsStore.Current.HudScale = 1.2f; yield return null;
+                Assert.AreEqual(1.5f, deck.localScale.x, .001f);
+                Assert.AreEqual(new Vector2(-22, 5), deck.anchoredPosition);
+                TouchInput.Active = true;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.Touch });
+                yield return null;
+                Assert.AreEqual(new Vector2(.5f, 0), deck.anchorMin);
+                Assert.AreEqual(new Vector2(0, 34), deck.anchoredPosition);
+                Assert.IsTrue(Glyphs(true).All(i => !i.enabled));
+                Assert.AreEqual(TumpPowerReadout.TouchDeckWidth * 1.5f, readout.DeckRect().width, .1f, "Touch is one centred row around the ultimate.");
+                Assert.IsTrue(readout.DeckRect().Contains(readout.UltimateRect().center), "On touch the ultimate sits in the row's middle.");
+                readout.Tick(system, false); Assert.IsFalse(readout.DeckVisible);
+            }
+            finally
+            {
+                QualitySettings.globalTextureMipmapLimit = mip;
+                SettingsStore.Current.HudScale = hudScale; SettingsStore.Current.LargerText = larger;
+                TouchInput.Active = touch;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { device });
+            }
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator DeviceChangesThenHudScalingKeepTheAuthoredPowerMargins()
+        {
+            int mip = QualitySettings.globalTextureMipmapLimit;
+            float scale = SettingsStore.Current.HudScale; bool larger = SettingsStore.Current.LargerText;
+            var device = LastInputDevice.Current; bool touch = TouchInput.Active;
+            try
+            {
+                QualitySettings.globalTextureMipmapLimit = 2;
+                SettingsStore.Current.HudScale = 1; SettingsStore.Current.LargerText = false;
+                TouchInput.Active = false;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.KeyboardMouse });
+                yield return MapRetrievalProbe.Load(SceneFlow.Eskinita, GameMode.HeroStrike);
+                var hud = Object.FindAnyObjectByType<TumpMatchReadout>();
+                var deck = (RectTransform)hud.Canvas.transform.HudFind("PowerSeals");
+                var scores = (RectTransform)hud.Canvas.transform.HudFind("MatchScores");
+                Vector2 scorePosition = scores.anchoredPosition;
+                foreach (bool useTouch in new[] { true, false, true, false })
+                {
+                    TouchInput.Active = useTouch;
+                    typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { useTouch ? InputDeviceKind.Touch : InputDeviceKind.KeyboardMouse });
+                    yield return null; yield return null;
+                    Vector2 expected = useTouch ? new Vector2(0, 34) : new Vector2(-22, 5);
+                    Assert.AreEqual(expected, deck.anchoredPosition);
+                    foreach (float next in new[] { 1.2f, 1f })
+                    {
+                        SettingsStore.Current.HudScale = next;
+                        yield return null; yield return null;
+                        Assert.AreEqual(expected, deck.anchoredPosition, "Scaling after a device switch restored a stale power anchor.");
+                        Assert.AreEqual(1.25f * next, deck.localScale.x, .001f);
+                    }
+                    Assert.AreEqual(scorePosition, scores.anchoredPosition, "Rebasing powers must not accumulate offsets in other groups.");
+                }
+            }
+            finally
+            {
+                QualitySettings.globalTextureMipmapLimit = mip;
+                SettingsStore.Current.HudScale = scale; SettingsStore.Current.LargerText = larger;
+                TouchInput.Active = touch;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { device });
+            }
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator RetrieveAndResetUseTheirLiveGlyphsAndKeepRealActions()
+        {
+            var actions = Resources.Load<InputActionAsset>("TumbangPreso");
+            string overrides = actions.SaveBindingOverridesAsJson(); var device = LastInputDevice.Current;
+            bool touch = TouchInput.Active, toggle = SettingsStore.Current.ToggleRestore;
+            int mip = QualitySettings.globalTextureMipmapLimit; QualitySettings.globalTextureMipmapLimit = 2;
+            var keys = InputSystem.AddDevice<Keyboard>(); var pad = InputSystem.AddDevice<Gamepad>();
+            try
+            {
+                TouchInput.Active = false; SettingsStore.Current.ToggleRestore = false;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.KeyboardMouse });
+                // The can reset needs a defender, and the other seats exist only when bots are on.
+                Settings.SettingsStore.Current.AiDifficulty = 1; AIController.BotsEnabled = true;
+                yield return MapRetrievalProbe.Load(SceneFlow.Eskinita);
+                actions.RemoveAllBindingOverrides(); Rebinding.Invalidate();
+                Hud.Instance.ShowReadyPrompt(false);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat); local.Intent.Parked = false;
+                var shoe = local.GetComponent<Carrier>().Held; Assert.IsNotNull(shoe);
+                Assert.IsTrue(shoe.HostDisarm()); shoe.HostScatter(local.transform.position + Vector3.forward * .4f - shoe.transform.position);
+                var hud = Object.FindAnyObjectByType<TumpMatchReadout>();
+                var text = hud.Canvas.GetComponentsInChildren<Text>().First(t => t.name == "ActionPrompt");
+                var glyph = hud.Canvas.GetComponentsInChildren<Image>(true).First(i => i.name == "ActionBindingGlyph");
+                Assert.IsNull(Rebinding.TryRebind(actions, "Grab", keys.f10Key));
+                yield return new WaitForSeconds(.25f);
+                Assert.IsTrue(shoe.CanBeGrabbedBy(local)); Assert.AreEqual("Retrieve Slipper", text.text);
+                Assert.IsTrue(glyph.enabled); Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("Grab"), true), glyph.sprite);
+                Assert.That(Hud.KeyLabelFor("Grab"), Does.Contain("F10"));
+                yield return TumpUiCapture.Capture("Feedback-retrieve-xelu", hud.Canvas, 960, 540, false, true);
+                // Write the synthetic edge after the physics snapshot, in the same window
+                // as PlayerInputReader.Update, so Carrier.Update can observe the press.
+                yield return new WaitForFixedUpdate();
+                local.Intent.Set(Verb.Grab, true); yield return new WaitForSeconds(.15f); local.Intent.Set(Verb.Grab, false);
+                Assert.IsTrue(local.HoldingSlipper, "The pictured retrieve action must still pick up the real shoe.");
+                yield return null; Assert.IsFalse(glyph.enabled); Assert.That(text.text, Does.Not.Contain("Retrieve Slipper"));
+                var defender = GameServices.Round.Players.First(p => p.IsDefender); defender.Intent.Parked = false;
+                var can = GameServices.Round.Lata;
+                float until = Time.time + 4; while (can.IsProtected && Time.time < until) yield return null;
+                can.HostKnockDown(local.PlayerSlot); Assert.IsFalse(can.IsUpright);
+                defender.Teleport(can.transform.position + Vector3.back * .7f); Hud.Instance.Bind(defender);
+                Assert.IsNull(Rebinding.TryRebind(actions, "Grab", pad.rightStickButton));
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.Gamepad });
+                yield return null;
+                Assert.AreEqual("Reset Can", text.text); Assert.IsTrue(glyph.enabled);
+                Assert.AreSame(InputGlyphs.For(Hud.KeyLabelFor("Grab"), true), glyph.sprite);
+                yield return TumpUiCapture.Capture("Feedback-reset-xelu", hud.Canvas, 1600, 680, false, true);
+                defender.Intent.Set(Verb.Grab, true); yield return new WaitForSeconds(.2f);
+                Assert.Greater(defender.GetComponent<Carrier>().ChannelRatio, 0); Assert.AreEqual("Resetting Can", text.text);
+                Assert.IsFalse(glyph.enabled, "The old idle glyph must not leak into channel feedback.");
+                yield return TumpUiCapture.Capture("Feedback-resetting-can-caption", hud.Canvas, 960, 540, false, true);
+                defender.Intent.Set(Verb.Grab, false); yield return null; yield return new WaitForFixedUpdate(); yield return null;
+                Assert.AreEqual("Reset Can", text.text); Assert.IsTrue(glyph.enabled);
+                TouchInput.Active = true;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { InputDeviceKind.Touch });
+                yield return null; Assert.AreEqual("Reset Can", text.text); Assert.IsFalse(glyph.enabled);
+                defender.Intent.Set(Verb.Grab, true); until = Time.time + 4;
+                while (!can.IsUpright && Time.time < until) yield return null;
+                defender.Intent.Set(Verb.Grab, false); Assert.IsTrue(can.IsUpright); yield return null;
+                Assert.That(text.text, Does.Not.Contain("Reset Can")); Assert.IsFalse(glyph.enabled);
+            }
+            finally
+            {
+                // Loading an empty snapshot changes nothing, so clear the test's own rebinds first.
+                actions.RemoveAllBindingOverrides(); if (!string.IsNullOrEmpty(overrides)) actions.LoadBindingOverridesFromJson(overrides);
+                Rebinding.Invalidate(); Rebinding.Save(actions);
+                InputSystem.RemoveDevice(keys); InputSystem.RemoveDevice(pad);
+                TouchInput.Active = touch; SettingsStore.Current.ToggleRestore = toggle; QualitySettings.globalTextureMipmapLimit = mip;
+                typeof(LastInputDevice).GetMethod("Set", BindingFlags.Static | BindingFlags.NonPublic).Invoke(null, new object[] { device });
+            }
+        }
+
+        [UnityTest,Timeout(90000)]
+        public IEnumerator RevisedHudSeparatesStatusesWarningActionAndFitsFourRounds()
+        {
+            var settings=SettingsStore.Current;float scale=settings.HudScale;var rules=SceneFlow.SelectedRules.Clone();
+            try
+            {
+                yield return Open(GameMode.HeroStrike);
+                var local=GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled=false;local.Intent.Clear();local.enabled=false;
+                GameServices.Round.enabled=false;
+                local.ApplyWhirled(30);local.ApplyChilled(30);local.ApplyRooted(30);
+                var idle=new float[4];idle[local.PlayerSlot]=8;GameServices.Round.ApplyNetworkTournamentState(0,idle);
+                var four=SceneFlow.SelectedRules.Clone();four.Rounds=4;SceneFlow.SetSelectedRules(four);
+                var view=Object.FindFirstObjectByType<TumpMatchReadout>();var root=(RectTransform)view.Canvas.transform;
+                foreach(float size in new[]{1f,1.2f})
+                {
+                    settings.HudScale=size;view.Tick(local,false,false,false,false);yield return null;
+                    Assert.AreEqual("DO NOT IDLE - RETRIEVE YOUR SLIPPER",view.WarningText);
+                    Assert.AreEqual(3,root.GetComponentsInChildren<RectTransform>().Count(x=>x.name.StartsWith("StatusChip")));
+                    Assert.AreEqual(380,((RectTransform)root.HudFind("RoundClock")).rect.width,.1f,"The timer is the 380 wide track of the live HUD.");
+                    // The bar is authored at its real size (UI revamp 2026-10-06); only the reading scale enlarges it.
+                    Assert.AreEqual(size,root.HudFind("MatchScores").localScale.x,.001f);
+                    Assert.IsFalse(root.GetComponentsInChildren<Text>(true).First(x=>x.name=="PowerInfoBinding").enabled);
+                    foreach(var viewport in new[]{new Vector2Int(960,540),new Vector2Int(1600,680)})
+                    {
+                        var match=GameServices.Match;
+                        typeof(MatchDirector).GetMethod("PresentHostMoment",BindingFlags.Instance|BindingFlags.NonPublic)
+                            .Invoke(match,new object[]{local.PlayerSlot,MatchMomentKind.FirstKnockdown,1,0});
+                        yield return TumpUiCapture.Capture("HarryHud-states-"+size+"-"+viewport.x+"x"+viewport.y,view.Canvas,viewport.x,viewport.y,false,true,
+                            inspectViewport:()=>
+                            {
+                                var action=HudRevisionBounds(root,(RectTransform)root.HudFind("ContextualAction/PromptPlate"));
+                                var warning=HudRevisionBounds(root,(RectTransform)root.HudFind("WarningMessage"));
+                                var progress=HudRevisionBounds(root,(RectTransform)root.HudFind("ContextualAction/RecoveryProgress"));
+                                Assert.IsFalse(action.Overlaps(warning));
+                                var shownChips = root.GetComponentsInChildren<RectTransform>().Where(x => x.name.StartsWith("StatusChip")).ToArray();
+                                for(int i=0;i<shownChips.Length;i++)
+                                {
+                                    var chip=HudRevisionBounds(root,shownChips[i]);
+                                    Assert.IsFalse(chip.Overlaps(action));Assert.IsFalse(chip.Overlaps(warning));
+                                    Assert.GreaterOrEqual(chip.xMin,root.rect.xMin);Assert.GreaterOrEqual(chip.yMin,root.rect.yMin);
+                                    if(i>0)Assert.IsFalse(chip.Overlaps(HudRevisionBounds(root,shownChips[i-1])));
+                                }
+                            });
+                    }
+                }
+                local.ClearStatuses();
+                GameServices.Round.ApplyNetworkTournamentState(0,new float[4]);view.Tick(local,false,false,false,false);
+                Assert.AreEqual("",view.WarningText);
+            }
+            finally{settings.HudScale=scale;SceneFlow.SetSelectedRules(rules);}
+        }
+
+        [UnityTest,Timeout(60000)]
+        public IEnumerator RequirementRefusalReachesWarningWithoutCastingAndFeedStaysSeparate()
+        {
+            float scale=SettingsStore.Current.HudScale;
+            try
+            {
+                yield return Open(GameMode.HeroStrike);
+                var round=GameServices.Round;var local=round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled=false;local.Intent.Clear();local.Intent.Parked=false;
+                local.CharacterIndex=Roster.IndexIn(Roster.HeroPeople,"rafi");
+                var powers=local.AbilitySystem;powers.BindHero("rafi");powers.enabled=false;
+                local.GetComponent<Carrier>().Held?.HostDisarm();local.GetComponent<Carrier>().enabled=false;
+                local.enabled=false;round.enabled=false;Assert.IsTrue(local.CanAct());
+                var update=typeof(HeroAbilitySystem).GetMethod("Update",BindingFlags.Instance|BindingFlags.NonPublic);
+                local.Intent.Set(Verb.Skill2,true);update.Invoke(powers,null);
+                yield return new WaitForSeconds(HeroAbilitySystem.InputBufferWindow+.05f);
+                update.Invoke(powers,null);
+                Assert.AreEqual(HeroKit.CastOutcome.CannotAct,powers.LastAnswer(HeroAbilitySystem.Slot.Skill2));
+                Assert.IsFalse(powers.Kit.Skill2.IsActive);Assert.AreEqual(0,powers.Kit.Skill2.CooldownRemaining);
+                var view=Object.FindFirstObjectByType<TumpMatchReadout>();view.Tick(local,false,false,false,false);
+                Assert.AreEqual("CANNOT CAST - ABILITY MUST MEET REQUIREMENTS",view.WarningText);
+                SettingsStore.Current.HudScale=1.2f;yield return null;
+                foreach(var size in new[]{new Vector2Int(960,540),new Vector2Int(1600,680)})
+                {
+                    // Repeating this unsuccessful input supplies a fresh real refusal after
+                    // the first view's capture, without awarding or activating anything.
+                    local.Intent.Set(Verb.Skill2,false);update.Invoke(powers,null);
+                    local.Intent.Set(Verb.Skill2,true);update.Invoke(powers,null);
+                    yield return new WaitForSeconds(HeroAbilitySystem.InputBufferWindow+.05f);update.Invoke(powers,null);
+                    Visual.MatchFlair.Play(Visual.MatchFlair.Kind.LataDown,2,-1,round.Lata.transform.position);
+                    Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Tag,0,3,round.Lata.transform.position);
+                    Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Block,2,1,round.Lata.transform.position);
+                    yield return TumpUiCapture.Capture("HarryHud-refusal-feed-"+size.x+"x"+size.y,view.Canvas,size.x,size.y,false,true,
+                        inspectViewport:()=>
+                        {
+                            var root=(RectTransform)view.Canvas.transform;
+                            // The notice is measured by what is drawn: its title, its two marks and its reason tag. The soft band behind it fades out well beyond them.
+                            var warningRoot=(RectTransform)root.HudFind("WarningMessage");Rect warning=default;bool first=true;
+                            foreach(string part in new[]{"Title","MarkLeft","MarkRight","WarningReasonPlate"})
+                            {
+                                var bounds=HudRevisionBounds(root,(RectTransform)warningRoot.Find(part));
+                                if(first){warning=bounds;first=false;}else warning=Rect.MinMaxRect(Mathf.Min(warning.xMin,bounds.xMin),Mathf.Min(warning.yMin,bounds.yMin),Mathf.Max(warning.xMax,bounds.xMax),Mathf.Max(warning.yMax,bounds.yMax));
+            }
+                            foreach(var plate in root.HudFind("MatchEventFeed").GetComponentsInChildren<Image>())
+                                if(plate.name=="EventPlate")Assert.IsFalse(warning.Overlaps(HudRevisionBounds(root,plate.rectTransform)));
+                        });
+                }
+                local.Intent.Set(Verb.Skill2,false);update.Invoke(powers,null);
+                var shoe=Object.FindObjectsByType<Slipper>(FindObjectsInactive.Include).First(s=>s.OwnerSlot==local.PlayerSlot);
+                shoe.HostForceEquip(local);local.Intent.Set(Verb.Skill2,true);update.Invoke(powers,null);
+                Assert.AreEqual(HeroKit.CastOutcome.Cast,powers.LastAnswer(HeroAbilitySystem.Slot.Skill2));
+                view.Tick(local,false,false,false,false);Assert.AreEqual("",view.WarningText,"A successful corrected cast clears its old refusal");
+            }
+            finally{SettingsStore.Current.HudScale=scale;}
+        }
+
+        [UnityTest, Timeout(60000)]
+        public IEnumerator CastRefusalsExplainCooldownAndRemainingObjectivePoints()
+        {
+            yield return Open(GameMode.HeroStrike);
+            var round=GameServices.Round;var local=round.PlayerAt(GameLaunch.SoloSeat);
+            local.GetComponent<PlayerInputReader>().enabled=false;
+            local.GetComponent<Carrier>().enabled=false;local.enabled=false;round.enabled=false;
+            local.Intent.Clear();local.Intent.Parked=false;Assert.IsTrue(local.CanAct());
+            var powers=local.AbilitySystem;powers.BindHero("dante");powers.enabled=false;
+            var update=typeof(HeroAbilitySystem).GetMethod("Update",BindingFlags.Instance|BindingFlags.NonPublic);
+            var view=Object.FindFirstObjectByType<TumpMatchReadout>();
+
+            powers.Kit.Skill1.ApplyNetworkSnapshot(5,0);
+            local.Intent.Set(Verb.Skill1,true);update.Invoke(powers,null);
+            Assert.AreEqual(HeroKit.CastOutcome.Cooling,powers.LastAnswer(HeroAbilitySystem.Slot.Skill1));
+            view.Tick(local,false,false,false,false);
+            Assert.AreEqual("CANNOT CAST - ABILITY IS ON COOLDOWN",view.WarningText);
+
+            local.Intent.Set(Verb.Skill1,false);update.Invoke(powers,null);yield return null;
+            powers.Kit.AddUltimateCharge(powers.Kit.UltimateCost-3);
+            local.Intent.Set(Verb.Ultimate,true);update.Invoke(powers,null);
+            Assert.AreEqual(HeroKit.CastOutcome.NoCharge,powers.LastAnswer(HeroAbilitySystem.Slot.Ultimate));
+            view.Tick(local,false,false,false,false);
+            Assert.AreEqual("CANNOT CAST - 3 MORE OBJECTIVE POINTS REQUIRED",view.WarningText);
+            powers.Kit.AddUltimateCharge(2);view.Tick(local,false,false,false,false);
+            Assert.AreEqual("CANNOT CAST - 1 MORE OBJECTIVE POINTS REQUIRED",view.WarningText);
+            powers.Kit.AddUltimateCharge(1);view.Tick(local,false,false,false,false);
+            Assert.AreEqual("",view.WarningText,"A filled meter must not show zero points required.");
+
+            local.Intent.Set(Verb.Ultimate,false);update.Invoke(powers,null);yield return null;
+            powers.Kit.Skill1.ApplyNetworkSnapshot(5,0);
+            local.Intent.Set(Verb.Skill1,true);update.Invoke(powers,null);
+            view.Tick(local,false,false,false,false);
+            Assert.AreEqual("CANNOT CAST - ABILITY IS ON COOLDOWN",view.WarningText);
+            local.Intent.Set(Verb.Skill1,false);update.Invoke(powers,null);yield return null;
+            powers.Kit.Skill1.ApplyNetworkSnapshot(0,0);
+            local.Intent.Set(Verb.Skill1,true);update.Invoke(powers,null);
+            Assert.AreEqual(HeroKit.CastOutcome.Cast,powers.LastAnswer(HeroAbilitySystem.Slot.Skill1));
+            view.Tick(local,false,false,false,false);
+            Assert.AreEqual("",view.WarningText,"A successful cast clears cooldown refusals too.");
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator ScoreFeedReflowsWithoutResettingExpiryAndHonoursReducedMotion()
+        {
+            bool reduced = SettingsStore.Current.ReducedUiMotion;
+            try
+            {
+                yield return Open(GameMode.Classic);
+                SettingsStore.Current.ReducedUiMotion = false;
+                var feed = Object.FindFirstObjectByType<MatchEventFeed>();
+                Assert.IsNotNull(feed);
+                var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                typeof(MatchEventFeed).GetMethod("Clear", flags).Invoke(feed, null);
+                var at = GameServices.Round.Lata.transform.position;
+                Visual.MatchFlair.Play(Visual.MatchFlair.Kind.LataDown, 1, -1, at);
+                yield return new WaitForSecondsRealtime(.22f);
+                var first = feed.Entry(0);
+                var itemsField = typeof(MatchEventFeed).GetField("_items", flags);
+                var items = (System.Array)itemsField.GetValue(feed);
+                float firstExpiry = (float)items.GetValue(0).GetType().GetField("Expires").GetValue(items.GetValue(0));
+                var row0 = (RectTransform)feed.transform.Find("Event0");
+                float oldY = row0.anchoredPosition.y;
+                Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Tag, 0, 2, at);
+                var row1 = (RectTransform)feed.transform.Find("Event1");
+                Assert.AreEqual(oldY, row1.anchoredPosition.y, .1f, "Existing entry must start from its current position.");
+                Assert.AreEqual(first, feed.Entry(1));
+                yield return new WaitForSecondsRealtime(.08f);
+                Assert.That(row1.anchoredPosition.y, Is.LessThan(oldY).And.GreaterThan(-70));
+                float interruptedY = row1.anchoredPosition.y;
+                Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Block, 3, 2, at);
+                var row2 = (RectTransform)feed.transform.Find("Event2");
+                Assert.AreEqual(interruptedY, row2.anchoredPosition.y, .1f, "An interrupted insertion must continue from the visible position.");
+                items = (System.Array)itemsField.GetValue(feed);
+                Assert.AreEqual(firstExpiry, (float)items.GetValue(2).GetType().GetField("Expires").GetValue(items.GetValue(2)));
+                Assert.AreEqual(3, feed.Count);
+                yield return new WaitForSecondsRealtime(.22f);
+                Assert.AreEqual(-70, row1.anchoredPosition.y, .1f); Assert.AreEqual(-140, row2.anchoredPosition.y, .1f);
+                var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+                yield return TumpUiCapture.Capture("HarryHud-feed-stack-960x540", view.Canvas, 960, 540, false, true);
+                SettingsStore.Current.ReducedUiMotion = true;
+                Visual.MatchFlair.Play(Visual.MatchFlair.Kind.Tag, 0, 1, at);
+                Assert.AreEqual(3, feed.Count);
+                Assert.AreEqual(0, row0.anchoredPosition.y, .001f); Assert.AreEqual(-70, row1.anchoredPosition.y, .001f);
+                items = (System.Array)itemsField.GetValue(feed);
+                var newest = items.GetValue(0); var type = newest.GetType();
+                float born = (float)type.GetField("Born").GetValue(newest);
+                float expiry = (float)type.GetField("Expires").GetValue(newest);
+                Assert.AreEqual(3, expiry - born, .001f);
+                typeof(MatchEventFeed).GetMethod("Paint", flags).Invoke(feed, new object[] { expiry + .01f });
+                Assert.Zero(feed.Count, "Every entry must expire without a new event.");
+            }
+            finally { SettingsStore.Current.ReducedUiMotion = reduced; }
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator DenseStatusesRetainHauntedTimersAndReflowWithoutOverlap()
+        {
+            var settings = SettingsStore.Current; float originalScale = settings.HudScale; bool reduced = settings.ReducedUiMotion;
+            try
+            {
+                yield return Open(GameMode.HeroStrike);
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled = false; local.Intent.Clear(); local.enabled = false;
+                GameServices.Round.enabled = false;
+                local.ApplyWhirled(30); local.ApplyChilled(30); local.ApplyRooted(30);
+                local.ApplyConcussed(30); local.ApplyFeared(Vector3.zero,30); local.ApplyDisoriented(30);
+                local.ApplyVulnerable(30); local.ApplyDrained(30); local.ApplyHexed(30); local.ApplyHaunted();
+                var idle = new float[4]; idle[local.PlayerSlot] = 8; GameServices.Round.ApplyNetworkTournamentState(0,idle);
+                var view = Object.FindFirstObjectByType<TumpMatchReadout>(); var root = (RectTransform)view.Canvas.transform;
+                var live = new System.Collections.Generic.List<StatusKind>(); StatusIcons.Live(local,live);
+                Assert.AreEqual(10,live.Count); Assert.Contains(StatusKind.Haunted,live);
+                Assert.IsNotNull(StatusIcons.For(StatusKind.Haunted), "Haunted must import and bind its own icon.");
+                settings.ReducedUiMotion = true;
+                foreach(float scale in new[]{1f,1.2f})
+                foreach(var size in new[]{new Vector2Int(960,540),new Vector2Int(1600,680)})
+                {
+                    settings.HudScale = scale; view.Tick(local,false,false,false,false); yield return null;
+                    yield return TumpUiCapture.Capture("HarryHud-dense-status-"+scale+"-"+size.x+"x"+size.y,view.Canvas,size.x,size.y,false,true,
+                        inspectViewport:()=>
+                        {
+                            view.Tick(local,false,false,false,false);
+                            typeof(TumpMatchReadout).GetMethod("SizePromptPlate",BindingFlags.Instance|BindingFlags.NonPublic).Invoke(view,null);
+                            var chips = root.GetComponentsInChildren<RectTransform>().Where(x=>x.name.StartsWith("StatusChip")).ToArray();
+                            Assert.AreEqual(10,chips.Length);
+                            var warning = HudRevisionBounds(root,(RectTransform)root.HudFind("WarningMessage"));
+                            var action = HudRevisionBounds(root,(RectTransform)root.HudFind("ContextualAction/PromptPlate"));
+                            foreach(var chip in chips)
+                            {
+                                var bounds = HudRevisionBounds(root,chip);
+                                Assert.IsTrue(root.rect.Contains(bounds.min)&&root.rect.Contains(bounds.max),chip.name+" must stay on screen");
+                                Assert.IsFalse(bounds.Overlaps(warning),chip.name+" overlaps warning");
+                                if(root.HudFind("ContextualAction/PromptPlate").GetComponent<HudCard>().enabled)
+                                    Assert.IsFalse(bounds.Overlaps(action),chip.name+" overlaps action");
+                                foreach(var other in chips)if(other!=chip)Assert.IsFalse(bounds.Overlaps(HudRevisionBounds(root,other)));
+                            }
+                        });
+                }
+                local.ClearStatuses(); local.ClearStun(); local.ApplyWhirled(3); local.ApplyChilled(3); local.ApplyHaunted(1);
+                settings.HudScale=1; settings.ReducedUiMotion=false;
+                view.Tick(local,false,false,false,false); yield return new WaitForSecondsRealtime(.22f); view.Tick(local,false,false,false,false);
+                var haunted = root.GetComponentsInChildren<Text>(true).First(x=>x.name=="StatusName"&&x.text==StatusIcons.Name(StatusKind.Haunted).ToUpperInvariant()).transform.parent as RectTransform;
+                var before = haunted.anchoredPosition;
+                local.ApplyHaunted(1); view.Tick(local,false,false,false,false);
+                Assert.AreEqual(before,haunted.anchoredPosition,"Refreshing the same effect must not restart entry animation");
+                local.ApplyNetworkStatuses(0,3,0,.5f); view.Tick(local,false,false,false,false);
+                Assert.AreEqual(before,haunted.anchoredPosition,"Reflow begins at the existing position");
+                yield return new WaitForSecondsRealtime(.22f); view.Tick(local,false,false,false,false);
+                Assert.Less(haunted.anchoredPosition.x,before.x,"The ring slides left into the gap.");
+                Assert.AreEqual(.5f/StatusRules.HauntedSeconds,haunted.GetComponentInChildren<HudRing>().Fill,.001f);
+                local.ApplyNetworkStatuses(0,0,0,0); view.Tick(local,false,false,false,false);
+                Assert.IsFalse(haunted.gameObject.activeSelf,"Expired statuses disappear from actual shared timers");
+            }
+            finally { settings.HudScale=originalScale; settings.ReducedUiMotion=reduced; }
+        }
+
+        private static Rect HudRevisionBounds(RectTransform root,RectTransform target)
+        {
+            var points=new Vector3[4];target.GetWorldCorners(points);
+            Vector2 min=new Vector2(float.PositiveInfinity,float.PositiveInfinity),max=new Vector2(float.NegativeInfinity,float.NegativeInfinity);
+            foreach(var point in points){Vector2 p=root.InverseTransformPoint(point);min=Vector2.Min(min,p);max=Vector2.Max(max,p);}
+            return Rect.MinMaxRect(min.x,min.y,max.x,max.y);
+        }
+
+        [UnityTest, Timeout(90000)]
+        public IEnumerator WarningStripIsThinSingleLineAndMatchesActionOpacity()
+        {
+            float oldScale = SettingsStore.Current.HudScale;
+            try
+            {
+                yield return Open(GameMode.Classic);
+                yield return new WaitForSeconds(1.4f);
+                var round = GameServices.Round; round.enabled = false;
+                var local = round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled = false;
+                local.GetComponent<Carrier>().enabled = false;
+                local.enabled = false; local.Intent.Clear();
+                local.Teleport(new Vector3(0, .1f, 2));
+                local.Intent.Set(Verb.SpecialAbility, true);
+                var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+                var root = (RectTransform)view.Canvas.transform;
+                foreach (float scale in new[] { 1f, 1.2f })
+                {
+                    SettingsStore.Current.HudScale = scale;
+                    view.Tick(local, false, false, false, false);
+                    Assert.That(view.WarningText, Does.Contain("OUTSIDE DANGER ZONE"));
+                    foreach (var size in new[] { new Vector2Int(960, 540), new Vector2Int(1600, 680) })
+                    {
+                        Canvas.ForceUpdateCanvases();
+                        var warning = (RectTransform)root.HudFind("WarningMessage");
+                        // Live HUD: painted lettering on a soft band with the reason on a cream tag beneath.
+                        var title = (RectTransform)warning.Find("Title");
+                        Assert.AreEqual("CANNOT THROW", title.GetComponent<Text>().text);
+                        Assert.AreEqual(InGameTypography.Clock, title.GetComponent<Text>().font);
+                        Assert.IsNotNull(title.GetComponent<PaintedLetters>(), "The words are painted lettering.");
+                        var reason=warning.Find("WarningReasonPlate/WarningReason").GetComponent<Text>();
+                        Assert.AreEqual(FontStyle.Normal,reason.fontStyle);
+                        Assert.IsNotNull(warning.Find("MarkLeft"));Assert.IsNotNull(warning.Find("MarkRight"));
+                        Assert.AreEqual("MUST BE OUTSIDE DANGER ZONE", warning.Find("WarningReasonPlate/WarningReason").GetComponent<Text>().text);
+                        yield return TumpUiCapture.Capture("Warning-strip-" + scale + "-" + size.x,
+                            view.Canvas, size.x, size.y, false, false, inspectViewport: () =>
+                            {
+                                var text = title.GetComponentInChildren<Text>();
+                                Assert.AreEqual(1, text.cachedTextGenerator.lineCount, "The warning should fit one readable line.");
+                                Assert.GreaterOrEqual(text.fontSize, 28);
+                                Assert.LessOrEqual(text.preferredWidth, text.rectTransform.rect.width + 1);
+                                var bounds = HudRevisionBounds(root, warning);
+                                Assert.GreaterOrEqual(bounds.xMin, root.rect.xMin);
+                                Assert.LessOrEqual(bounds.xMax, root.rect.xMax);
+                            });
+                    }
+                }
+                view.Tick(local, true, false, false, false);
+                Assert.AreEqual("", view.WarningText);
+            }
+            finally { SettingsStore.Current.HudScale = oldScale; }
+        }
+
+        [UnityTest,Timeout(60000)]
+        public IEnumerator ReturningWarningRestartsItsShakeWithoutRepeatingEveryTick()
+        {
+            yield return Open(GameMode.Classic);yield return new WaitForSeconds(1.4f);
+            var round=GameServices.Round;round.enabled=false;
+            var local=round.PlayerAt(GameLaunch.SoloSeat);
+            local.GetComponent<PlayerInputReader>().enabled=false;
+            local.GetComponent<Carrier>().enabled=false;local.enabled=false;local.Intent.Clear();
+            local.Teleport(new Vector3(0,.1f,2));local.Intent.Set(Verb.SpecialAbility,true);
+            var view=Object.FindFirstObjectByType<TumpMatchReadout>();
+            var stamp=typeof(TumpMatchReadout).GetField("_warningShookAt",BindingFlags.Instance|BindingFlags.NonPublic);
+            view.Tick(local,false,false,false,false);
+            string words=view.WarningText;Assert.That(words,Does.Contain("OUTSIDE DANGER ZONE"));
+            float first=(float)stamp.GetValue(view);
+            var root=view.Canvas.transform.HudFind("WarningMessage");
+            float reading=Mathf.Max(GameSettings.ValidHudScale(SettingsStore.Current.HudScale),SettingsStore.Current.LargerText?1.2f:1f);
+            Assert.AreEqual(reading,root.localScale.x,.001f);
+            yield return null;view.Tick(local,false,false,false,false);
+            Assert.AreEqual(first,(float)stamp.GetValue(view),"A continuous warning must not restart every tick.");
+            view.Tick(local,true,false,false,false);Assert.AreEqual("",view.WarningText);
+            yield return null;view.Tick(local,false,false,false,false);
+            Assert.AreEqual(words,view.WarningText);
+            Assert.Greater((float)stamp.GetValue(view),first,"The same warning returning must restart its shake.");
+        }
+
+        [UnityTest,Timeout(60000)]
+        public IEnumerator RevisedWarningsFollowRefusedInputsAndHideForSpectators()
+        {
+            yield return Open(GameMode.Classic);yield return new WaitForSeconds(1.4f);
+            var round=GameServices.Round;round.enabled=false;
+            var local=round.PlayerAt(GameLaunch.SoloSeat);local.GetComponent<PlayerInputReader>().enabled=false;
+            local.GetComponent<Carrier>().enabled=false;local.enabled=false;local.Intent.Clear();
+            var view=Object.FindFirstObjectByType<TumpMatchReadout>();
+            local.Teleport(new Vector3(0,.1f,2));local.Intent.Set(Verb.SpecialAbility,true);
+            view.Tick(local,false,false,false,false);Assert.That(view.WarningText,Does.Contain("OUTSIDE DANGER ZONE"));
+            local.Intent.Clear();yield return new WaitForSecondsRealtime(1.3f);
+            view.Tick(local,false,false,false,false);Assert.AreEqual("",view.WarningText);
+            local.Teleport(new Vector3(0,.1f,-8));round.Lata.HostKnockDown(2);Assert.IsFalse(round.Lata.IsUpright);
+            local.Intent.Set(Verb.SpecialAbility,true);view.Tick(local,false,false,false,false);
+            // Protocol 146: a downed can no longer forbids a throw, so the thrower gets no refusal for it.
+            Assert.AreEqual("",view.WarningText);
+            var defender=round.PlayerAt(GameServices.Match.DefenderSlot);defender.Intent.Parked=false;defender.Intent.Set(Verb.SpecialAbility,true);
+            view.Tick(defender,false,false,false,false);Assert.AreEqual("CANNOT TAG - CAN MUST BE UPRIGHT FIRST",view.WarningText);
+            local.Intent.Clear();local.Intent.Set(Verb.Sprint,true);local.Stamina.ApplyNetworkSnapshot(0,0,2.5f);
+            view.Tick(local,false,false,false,false);Assert.That(view.WarningText,Does.StartWith("CANNOT RUN"));
+            view.Tick(local,true,false,false,false);Assert.AreEqual("",view.WarningText);
+        }
+
+        [UnityTest,Timeout(90000)]
+        public IEnumerator TimedRecoveryShowsStateWithoutMashPromptsOrPressCounts()
+        {
+            int quality=QualitySettings.GetQualityLevel(),mip=QualitySettings.globalTextureMipmapLimit;
+            try
+            {
+                QualitySettings.SetQualityLevel(0,true);QualitySettings.globalTextureMipmapLimit=2;
+                yield return Open(GameMode.HeroStrike);
+                var local=GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                local.GetComponent<PlayerInputReader>().enabled=false;local.enabled=false;local.Intent.Clear();
+                var view=Object.FindFirstObjectByType<TumpMatchReadout>();Assert.IsNotNull(view);
+                local.ApplyStagger(2.5f,StunElement.Ice,9);view.Tick(local,false,false,false,false);
+                Assert.IsTrue(local.IsFrozen);Assert.IsFalse(local.CanAct());
+                Assert.IsTrue(view.Canvas.GetComponentsInChildren<Text>().Any(t=>t.isActiveAndEnabled&&t.name=="StatusName"&&t.text==StatusIcons.Name(StatusKind.Frozen)));
+                var actionRoot=(RectTransform)typeof(TumpMatchReadout).GetField("_promptRoot",BindingFlags.Instance|BindingFlags.NonPublic).GetValue(view);
+                Assert.IsFalse(actionRoot.gameObject.activeSelf,"Timed Frozen is represented by its status indicator only.");
+                NoMashText(view);
+                yield return TumpUiCapture.Capture("Timed-recovery-Frozen",view.Canvas,960,540,false,true);
+                local.ClearStun();local.ApplyTrip(2.5f);view.Tick(local,false,false,false,false);
+                Assert.IsTrue(view.Canvas.GetComponentsInChildren<Text>().Any(t=>t.isActiveAndEnabled&&t.text=="Getting up"));
+                NoMashText(view);
+                local.ApplyNetworkState(0,0,StunElement.None,6,9,1.25f,2.5f,9,1.7f,100,0,0);
+                view.Tick(local,false,false,false,false);
+                var progress=(Image)typeof(TumpMatchReadout).GetField("_progress",BindingFlags.Instance|BindingFlags.NonPublic).GetValue(view);
+                Assert.AreEqual(.5f,progress.rectTransform.anchorMax.x,.001f,"The recovery bar measures time, never old press counts.");
+                Assert.AreEqual(0,local.MashPresses);NoMashText(view);
+                yield return TumpUiCapture.Capture("Timed-recovery-get-up",view.Canvas,960,540,false,true);
+            }
+            finally {QualitySettings.SetQualityLevel(quality,true);QualitySettings.globalTextureMipmapLimit=mip;}
+        }
+
+        private static void NoMashText(TumpMatchReadout view)
+        {
+            foreach(var text in view.Canvas.GetComponentsInChildren<Text>())
+            {
+                if(!text.isActiveAndEnabled)continue;
+                string value=text.text.ToLowerInvariant();
+                Assert.IsFalse(value.Contains("mash")||value.Contains("presses")||value.Contains("shatter the ice"),text.name+": "+text.text);
+            }
+        }
+
+        private sealed class ClockToastObserver : INetProvider
+        {
+            public bool IsHost => false; public bool IsNetworked => true;
+            public int LocalSlot => 1; public int LocalPeerId => 1; public bool IsSeatlessReferee => false;
+        }
+
+        private static Net.MatchRpc ToastClockReceiver()
+        {
+            var root = new GameObject("HUD clock receiver"); root.SetActive(false);
+            var router = root.AddComponent<Net.MatchRpc>();
+            typeof(Net.MatchRpc).GetProperty("PresentationMatchId").SetValue(router, 321L);
+            return router;
+        }
+
+        private static void DeliverToastClock(Net.MatchRpc router, long sequence, float scale)
+        {
+            var message = new Net.MatchClockMessage { Match = 321, Round = GameServices.Match.RoundNumber, Sequence = sequence, Scale = scale };
+            using var writer = new Unity.Netcode.FastBufferWriter(Net.MatchClockMessage.WireBytes, Unity.Collections.Allocator.Temp);
+            writer.WriteNetworkSerializable(message);
+            using var reader = new Unity.Netcode.FastBufferReader(writer, Unity.Collections.Allocator.Temp);
+            typeof(Net.MatchRpc).GetMethod("OnSyncTimeMsg", BindingFlags.NonPublic | BindingFlags.Instance)
+                .Invoke(router, new object[] { 0UL, reader });
+        }
+
+        private static Text ClockToast(TumpMatchReadout view)
+            => view.Canvas.GetComponentsInChildren<Text>(true).First(text => text.name == "MatchToast");
+
+        [UnityTest]
+        public IEnumerator InitialNormalClockDoesNotAnnounceAResume()
+        {
+            yield return Open(GameMode.Classic);
+            var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+            view.Toast("Fixture settling", .01f); yield return new WaitForSecondsRealtime(.1f);
+            var before = NetAuthority.Provider; var router = ToastClockReceiver();
+            try
+            {
+                NetAuthority.Provider = new ClockToastObserver(); DeliverToastClock(router, 1, 1);
+                Assert.IsFalse(ClockToast(view).enabled, "A normal clock snapshot must not announce a spectator resume.");
+            }
+            finally { NetAuthority.Provider = before; Object.Destroy(router.gameObject); }
+        }
+
+        [UnityTest]
+        public IEnumerator RepeatedResumeSnapshotsDoNotRenewTheToast()
+        {
+            yield return Open(GameMode.Classic);
+            var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+            var before = NetAuthority.Provider; var router = ToastClockReceiver(); float scale = Time.timeScale;
+            try
+            {
+                NetAuthority.Provider = new ClockToastObserver();
+                DeliverToastClock(router, 1, 0); DeliverToastClock(router, 2, 1);
+                Assert.AreEqual("BACK TO ACTION", ClockToast(view).text);
+                for (int i = 0; i < 8; i++) { yield return new WaitForSecondsRealtime(.15f); DeliverToastClock(router, 3+i, 1); }
+                yield return new WaitForSecondsRealtime(.3f);
+                Assert.IsFalse(ClockToast(view).enabled, "Repeated accepted normal snapshots restarted the resume banner.");
+            }
+            finally { PresentationClock.RequestScale(scale); NetAuthority.Provider = before; Object.Destroy(router.gameObject); }
+        }
+
+        [UnityTest]
+        public IEnumerator RealPauseSlowAndResumeChangesStillAnnounce()
+        {
+            yield return Open(GameMode.Classic);
+            var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+            var before = NetAuthority.Provider; var router = ToastClockReceiver(); float scale = Time.timeScale;
+            try
+            {
+                NetAuthority.Provider = new ClockToastObserver(); DeliverToastClock(router, 1, 0);
+                Assert.AreEqual("PAUSED BY A SPECTATOR", ClockToast(view).text); Assert.IsTrue(ClockToast(view).enabled);
+                DeliverToastClock(router, 2, .5f); Assert.IsTrue(ClockToast(view).text.StartsWith("SLOW MOTION"));
+                DeliverToastClock(router, 3, 1); Assert.AreEqual("BACK TO ACTION", ClockToast(view).text);
+                Assert.IsTrue(ClockToast(view).enabled);
+            }
+            finally { PresentationClock.RequestScale(scale); NetAuthority.Provider = before; Object.Destroy(router.gameObject); }
+        }
+
+        [UnityTest]
+        public IEnumerator OrdinaryNativeToastStillExpiresWhilePaused()
+        {
+            yield return Open(GameMode.Classic);
+            // The scale to go back to is the clock's own, not `Time.timeScale`: the ready gate may still be holding it at 0.
+            var view = Object.FindFirstObjectByType<TumpMatchReadout>(); float scale = PresentationClock.RequestedScale;
+            try
+            {
+                Time.timeScale = 0; view.Toast("Ordinary paused toast", .2f);
+                yield return new WaitForSecondsRealtime(.35f);
+                Assert.IsFalse(ClockToast(view).enabled);
+            }
+            finally { PresentationClock.RequestScale(scale); }
+        }
+
+        [UnityTest, Timeout(120000)]
+        public IEnumerator OvertakingPlateSwingsOverTheOneItPassed()
+        {
+            bool reduced = SettingsStore.Current.ReducedUiMotion; int solo = GameLaunch.SoloSeat;
+            try
+            {
+                Settings.SettingsStore.Current.AiDifficulty = 1; AIController.BotsEnabled = true;
+                GameLaunch.SoloSeat = (MatchRules.DefenderSlotFor(1) + 1) % 4;
+                yield return UiArtboardShots.Match("Eskinita", GameMode.HeroStrike);
+                SettingsStore.Current.ReducedUiMotion = false;
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+                var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                int other = -1;
+                for (int seat = 0; seat < 4; seat++)
+                    if (seat != local.PlayerSlot && GameServices.Round.PlayerAt(seat) != null && other < 0) other = seat;
+                if (other < 0) Assert.Ignore("This profile builds no other seats, so nobody can overtake.");
+                var scores = (Scoreboard)typeof(MatchDirector).GetField("_scores", flags).GetValue(GameServices.Match);
+                var scoreAt = typeof(TumpMatchReadout).GetField("_scoreAt", flags);
+                var values = new int[4]; values[local.PlayerSlot] = 1000; values[other] = 500;
+                scores.SetAll(values); scoreAt.SetValue(view, 0f);
+                view.Tick(local, false, false, false, false);
+                yield return new WaitForSecondsRealtime(1.2f);
+                view.Tick(local, false, false, false, false); yield return null;
+
+                var plates = view.Canvas.transform.HudFind("OtherScores");
+                var climber = (RectTransform)plates.Find("ScorePlate" + other);
+                var passed = (RectTransform)plates.Find("ScorePlate" + local.PlayerSlot);
+                Assert.AreEqual(-220, climber.anchoredPosition.y, .5f, "Second before the overtake.");
+
+                values[other] = 1500; scores.SetAll(values); scoreAt.SetValue(view, 0f);
+                view.Tick(local, false, false, false, false);
+                float furthest = 0, pushed = 0; bool between = false;
+                float until = Time.realtimeSinceStartup + 1.2f;
+                while (Time.realtimeSinceStartup < until)
+                {
+                    yield return null;
+                    furthest = Mathf.Max(furthest, climber.anchoredPosition.x);
+                    pushed = Mathf.Min(pushed, passed.anchoredPosition.x);
+                    float y = climber.anchoredPosition.y;
+                    between |= y > -215 && y < -155;
+                }
+                Assert.IsTrue(between, "The plate travels between the rows instead of jumping.");
+                Assert.Greater(furthest, 15, "The overtaker swings out to the right.");
+                Assert.Less(pushed, -3, "The one passed is pushed back against the edge.");
+                Assert.AreEqual(-150, climber.anchoredPosition.y, .5f, "It lands first.");
+                Assert.AreEqual(-220, passed.anchoredPosition.y, .5f, "And the one passed lands second.");
+                Assert.AreEqual(0, climber.anchoredPosition.x, .5f, "Flush with the edge again.");
+                Assert.AreEqual(1, climber.localScale.x, .001f, "Back to its size.");
+            }
+            finally { SettingsStore.Current.ReducedUiMotion = reduced; GameLaunch.SoloSeat = solo; }
+        }
+
+        [UnityTest, Timeout(120000)]
+        public IEnumerator PlatesIncludingYoursSlideInWhenAnySeatScoresAndTabListsEveryone()
+        {
+            bool reduced = SettingsStore.Current.ReducedUiMotion; int solo = GameLaunch.SoloSeat;
+            try
+            {
+                // The other seats are built only when bots are on, and that follows the saved difficulty.
+                Settings.SettingsStore.Current.AiDifficulty = 1; AIController.BotsEnabled = true;
+                // A live round (past the opening and the role card), the way the capture pass stages it.
+                GameLaunch.SoloSeat = (MatchRules.DefenderSlotFor(1) + 1) % 4;
+                yield return UiArtboardShots.Match("Eskinita", GameMode.HeroStrike);
+                SettingsStore.Current.ReducedUiMotion = true;
+                var local = GameServices.Round.PlayerAt(GameLaunch.SoloSeat);
+                var view = Object.FindFirstObjectByType<TumpMatchReadout>();
+                var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                int others = 0, other = -1;
+                for (int seat = 0; seat < 4; seat++)
+                    if (seat != local.PlayerSlot && GameServices.Round.PlayerAt(seat) != null) { others++; if (other < 0) other = seat; }
+                if (others == 0) Assert.Ignore("This profile builds no other seats (practice with no bots), so there are no other scores to show.");
+                var scoreAt = typeof(TumpMatchReadout).GetField("_scoreAt", flags);
+                view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.5f);
+                view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(3.2f);
+                view.Tick(local, false, false, false, false); yield return null;
+                Assert.AreEqual(0, view.BoardPlatesShown, "Nothing has scored: the other scores stay away.");
+                Assert.IsFalse(view.Canvas.transform.HudFind("MatchScores").gameObject.activeSelf, "The old four-chip row is retired in play.");
+
+                int scoreBefore = GameServices.Match.ScoreFor(other);
+                GameServices.Match.AddScore(other, ScoreEvent.LataKnocked);
+                int won = GameServices.Match.ScoreFor(other) - scoreBefore;
+                scoreAt.SetValue(view, 0f); view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.5f);
+                view.Tick(local, false, false, false, false); yield return null;
+                Assert.AreEqual(others + 1, view.BoardPlatesShown, "Another seat scoring brings in every plate, yours too.");
+                var plates = view.Canvas.transform.HudFind("OtherScores");
+                Assert.IsNotNull(plates);
+                var mine = (RectTransform)plates.Find("ScorePlate" + local.PlayerSlot);
+                Assert.IsTrue(mine.gameObject.activeSelf, "Your own score sits among the others, to compare.");
+                Assert.IsTrue(mine.Find("You").GetComponent<Image>().enabled, "Your own plate has the lime line.");
+                Assert.Less(mine.anchoredPosition.y, -150 + .5f - 1, "You rank below the seat that just scored.");
+                var first = (RectTransform)plates.Find("ScorePlate" + other);
+                Assert.AreEqual(0, first.anchoredPosition.x, .5f, "Flush with the screen edge.");
+                Assert.AreEqual(-150, first.anchoredPosition.y, .5f, "The leader is the first plate.");
+                Assert.IsTrue(first.Find("Points").gameObject.activeSelf, "The points just won sit on the green tag.");
+                Assert.AreEqual("+" + won, first.Find("Points/Label").GetComponent<Text>().text);
+                Assert.AreEqual(HudBadge.Glyph.Crown, first.Find("LeaderCrown").GetComponent<HudBadge>().Kind, "The unique leader wears the crown.");
+
+                // Three seconds later they leave.
+                typeof(TumpMatchReadout).GetField("_boardPopUntil", flags).SetValue(view, Time.unscaledTime - .1f);
+                view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.5f); view.Tick(local, false, false, false, false); yield return null;
+                Assert.AreEqual(0, view.BoardPlatesShown, "And slide out again.");
+
+                // Your own points bring the plates in as well.
+                GameServices.Match.AddScore(local.PlayerSlot, ScoreEvent.LataKnocked);
+                scoreAt.SetValue(view, 0f); view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.5f);
+                view.Tick(local, false, false, false, false); yield return null;
+                Assert.AreEqual(others + 1, view.BoardPlatesShown, "Your own score moving brings in every plate.");
+                typeof(TumpMatchReadout).GetField("_boardPopUntil", flags).SetValue(view, Time.unscaledTime - .1f);
+                view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.5f); view.Tick(local, false, false, false, false); yield return null;
+
+                // Holding the table shows every seat that is in the match, yours too.
+                view.HoldBoardForCapture(true);
+                view.Tick(local, false, false, false, false); yield return new WaitForSecondsRealtime(.6f); view.Tick(local, false, false, false, false); yield return null;
+                Assert.AreEqual(others + 1, view.BoardPlatesShown, "Tab lists everyone.");
+                Assert.IsTrue(plates.Find("ScorePlate" + local.PlayerSlot + "/You").GetComponent<Image>().enabled, "Your own plate has the lime line.");
+                view.HoldBoardForCapture(false);
+            }
+            finally { SettingsStore.Current.ReducedUiMotion = reduced; GameLaunch.SoloSeat = solo; }
+        }
+
+        private static IEnumerator Open(GameMode mode)
+        {
+            // The match installer builds the other seats only when bots are on, and it reads that from the saved difficulty.
+            Settings.SettingsStore.Current.AiDifficulty = 1; AIController.BotsEnabled = true;
+            SceneFlow.Networked = false; SceneFlow.SetSelectedRules(CustomGameRules.Defaults(mode));
+            yield return SceneManager.LoadSceneAsync("Eskinita"); yield return new WaitForSecondsRealtime(.4f);
+            foreach (var brain in Object.FindObjectsByType<AIController>(FindObjectsSortMode.None)) brain.enabled = false;
+            Object.FindFirstObjectByType<ReadyGate>().StartLocalCountdown();
+            yield return new WaitForSecondsRealtime(3.7f);
+            // Since 2239d8d1b the Arena's full opening plays and the role card follows it, so the round is not live at 3.7 s.
+            float live = Time.realtimeSinceStartup + 40;
+            while ((Map.ArenaIntro.HidesUi || RoleSwapCard.Showing || !GameServices.Round.RoundActive) && Time.realtimeSinceStartup < live) yield return null;
+            yield return new WaitForSecondsRealtime(.5f);
+            Assert.IsNotNull(Hud.Instance);
+            Assert.AreEqual(4,GameServices.Match.TotalRounds,"Normal matches must start with the four-round default.");
+            TumpUiCapture.StageHudReview(GameServices.Round.PlayerAt(GameLaunch.SoloSeat));
+            yield return null;
+        }
+    }
+}

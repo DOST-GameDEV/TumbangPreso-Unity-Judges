@@ -1,0 +1,128 @@
+using System.Collections;
+using TumbangPreso.Abilities;
+using Unity.Collections;
+using Unity.Netcode;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+
+namespace TumbangPreso.Net
+{
+    public sealed partial class MatchRpc
+    {
+        private bool _preparationFollowupPending;
+        private long _preparationFollowupTicket, _preparationFollowupMatch;
+        private NetworkManager _preparationFollowupNetwork;
+        private CustomMessagingManager _preparationFollowupMessages;
+        private ulong _preparationFollowupClient;
+        private int _preparationFollowupRound;
+        private ulong _preparationFollowupScene;
+
+        private bool PreparationRefreshScopeMatches(int round)
+            => _nm != null && _nm == _preparationFollowupNetwork
+                && ReferenceEquals(_nm.CustomMessagingManager, _preparationFollowupMessages)
+                && _nm.LocalClientId == _preparationFollowupClient
+                && round == _preparationFollowupRound && GameServices.Match?.RoundNumber == round
+                && PresentationMatchId == _preparationFollowupMatch
+                && SceneManager.GetActiveScene().handle.GetRawData() == _preparationFollowupScene;
+
+        private void CancelPreparationRefresh()
+        {
+            _preparationFollowupTicket++;
+            _preparationFollowupPending = false;
+            _preparationFollowupNetwork = null;
+            _preparationFollowupMessages = null;
+        }
+
+        private bool CompletePreparationRefresh(long ticket, int round)
+        {
+            if (ticket != _preparationFollowupTicket) return false;
+            _preparationFollowupPending = false;
+            return isActiveAndEnabled && _nm != null && _nm.IsConnectedClient && !_nm.ShutdownInProgress
+                && _nm.CustomMessagingManager != null && PreparationRefreshScopeMatches(round);
+        }
+        private static HeroAbility PreparationAbility(HeroKit kit,int kind)
+        {
+            if(kit==null)return null;
+            switch((HeroAbilitySystem.Slot)kind)
+            {
+                case HeroAbilitySystem.Slot.Skill1:return kit.Skill1;
+                case HeroAbilitySystem.Slot.Skill2:return kit.Skill2;
+                case HeroAbilitySystem.Slot.Ultimate:return kit.Ultimate;
+                default:return null;
+            }
+        }
+        private void SendPreparationSnapshot(int seat,ulong peer)
+        {
+            if(!NetAuthority.IsHost || GameServices.Match==null || _nm?.CustomMessagingManager==null || peer==_nm.LocalClientId)return;
+            var kit=Unit(seat)?.AbilitySystem?.Kit;if(kit==null)return;
+            foreach(var slot in new[]{HeroAbilitySystem.Slot.Skill1,HeroAbilitySystem.Slot.Skill2,HeroAbilitySystem.Slot.Ultimate})
+            {
+                var ability=PreparationAbility(kit,(int)slot);
+                if(ability?.SupportsPendingSnapshot!=true)continue;
+                bool pending=ability.CapturePendingPreparation(out var context,out float remaining);
+                using var writer=new FastBufferWriter(192,Allocator.Temp);
+                writer.WriteValueSafe(seat);writer.WriteValueSafe(GameServices.Match.RoundNumber);
+                writer.WriteValueSafe(kit.HeroId);writer.WriteValueSafe((int)slot);
+                writer.WriteValueSafe(pending?remaining:0);writer.WriteValueSafe(pending?ability.HeldSecondsOnCast:0);
+                writer.WriteValueSafe((float)_nm.ServerTime.Time);
+                writer.WriteValueSafe(pending?context.Position:Vector3.zero);
+                writer.WriteValueSafe(pending?context.Forward:Vector3.forward);
+                writer.WriteValueSafe(pending?context.AimPoint:Vector3.zero);
+                _nm.CustomMessagingManager.SendNamedMessage("CastPreparation",peer,writer,NetworkDelivery.ReliableSequenced);
+            }
+        }
+        private void OnCastPreparationMsg(ulong sender,FastBufferReader reader)
+        {
+            if(NetAuthority.IsHost || !FromHost(sender) || !ValidCastPreparationFrame(ref reader))return;
+            reader.ReadValueSafe(out int seat);reader.ReadValueSafe(out int round);
+            reader.ReadValueSafe(out string hero);reader.ReadValueSafe(out int kind);
+            reader.ReadValueSafe(out float remaining);reader.ReadValueSafe(out float held);
+            reader.ReadValueSafe(out float sentAt);reader.ReadValueSafe(out Vector3 position);
+            reader.ReadValueSafe(out Vector3 forward);reader.ReadValueSafe(out Vector3 aim);
+            if(!ValidSlot(seat) || GameServices.Match==null || GameServices.Match.RoundNumber!=round
+                || !Finite(remaining) || !Finite(held) || !Finite(sentAt) || !Finite(position) || !Finite(forward) || !Finite(aim)
+                || remaining<0 || held<0)return;
+            var system=Unit(seat)?.AbilitySystem;var ability=PreparationAbility(system?.Kit,kind);
+            if(system?.Kit?.HeroId!=hero || ability?.SupportsPendingSnapshot!=true || remaining>ability.Windup+.0001f)return;
+            float age=Mathf.Max(0,(float)_nm.ServerTime.Time-sentAt);
+            float live=Mathf.Max(0,remaining-age);
+            using(NetCue.SuppressRelay())system.RestoreJoiningPreparation((HeroAbilitySystem.Slot)kind,position,forward,aim,held,live);
+            // Contact may have happened after the host captured this pre-impact
+            // batch. Ask for current fields instead of replaying an expired hit.
+            if(remaining>0 && live<=0)
+            {
+                Debug.Log($"[CastPreparation] expired in transit seat={seat} kind={kind} remaining={remaining:F4} age={age:F4}");
+                StartCoroutine(RefreshAfterExpiredPreparation(round));
+            }
+        }
+        private static bool ValidCastPreparationFrame(ref FastBufferReader reader)
+        {
+            int start = reader.Position;
+            try
+            {
+                if (!reader.TryBeginRead(sizeof(int) * 2)) return false;
+                reader.Seek(start + sizeof(int) * 2);
+                if (!SkipWireString(ref reader)) return false;
+                const int tail = sizeof(int) + sizeof(float) * 3 + sizeof(float) * 9;
+                return reader.Length - reader.Position == tail && reader.TryBeginRead(tail);
+            }
+            finally { reader.Seek(start); }
+        }
+        private IEnumerator RefreshAfterExpiredPreparation(int round)
+        {
+            if (_nm == null || !_nm.IsConnectedClient || _nm.ShutdownInProgress || _nm.CustomMessagingManager == null || !isActiveAndEnabled) yield break;
+            if (_preparationFollowupPending && PreparationRefreshScopeMatches(round)) yield break;
+            long ticket = ++_preparationFollowupTicket;
+            _preparationFollowupPending=true;
+            _preparationFollowupNetwork = _nm;
+            _preparationFollowupMessages = _nm.CustomMessagingManager;
+            _preparationFollowupClient = _nm.LocalClientId;
+            _preparationFollowupRound = round;
+            _preparationFollowupMatch = PresentationMatchId;
+            _preparationFollowupScene = SceneManager.GetActiveScene().handle.GetRawData();
+            yield return new WaitForSecondsRealtime(SnapshotRequestInterval+.05f);
+            if(CompletePreparationRefresh(ticket, round))
+                RequestWorldSnapshot();
+        }
+    }
+}

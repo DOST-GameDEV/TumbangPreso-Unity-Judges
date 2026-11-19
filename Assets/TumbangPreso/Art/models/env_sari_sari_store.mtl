@@ -1,0 +1,31 @@
+# Authored by tools/author_neighborhood_models.py
+newmtl concrete
+Kd 0.62 0.61 0.54
+Ks 0.04 0.04 0.04
+Ns 18
+d 1
+illum 2
+newmtl timber
+Kd 0.43 0.29 0.16
+Ks 0.04 0.04 0.04
+Ns 18
+d 1
+illum 2
+newmtl dark
+Kd 0.15 0.17 0.145
+Ks 0.04 0.04 0.04
+Ns 18
+d 1
+illum 2
+newmtl tarp
+Kd 0.6 0.32 0.2
+Ks 0.04 0.04 0.04
+Ns 18
+d 1
+illum 2
+newmtl stripe
+Kd 0.84 0.7 0.38
+Ks 0.04 0.04 0.04
+Ns 18
+d 1
+illum 2

@@ -1,0 +1,865 @@
+using System.Collections.Generic;
+using TumbangPreso.InputLayer;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+namespace TumbangPreso.Settings
+{
+    /// <summary>
+    /// Which actions the player may rebind, what to call them, and the override store.
+    /// Converted from `settings_manager.gd`'s `REBINDABLE_ACTIONS` / `ACTION_LABELS` and the
+    /// rebind half of `settings_panel.gd`.
+    ///
+    /// ⚠️⚠️ A STALE ROW IN EITHER TABLE IS NOT COSMETIC. In Godot, rebinding walked every
+    /// listed action at boot and errored loudly on one that no longer existed (`bump`,
+    /// `guard_dash`). Here a missing action silently produces a dead row instead — which is
+    /// worse, because nobody notices. **If an action is renamed or deleted, fix these lists
+    /// in the same commit.**
+    ///
+    /// ⚠️ THE LIST ONCE HELD "grab" TWICE AND OMITTED "lunge" ENTIRELY — the taya's only
+    /// scoring verb had no rebind row at all. Both `lunge` and `emote_wheel` belong; they
+    /// arrived from different branches and taking either side alone drops the other's control
+    /// off the panel, which is a defect nobody would go looking for.
+    ///
+    /// ⚠⚠ ONE CONTROL, ONE ACTION, AND THE DEFAULTS NOW OBEY THAT RULE. `TryRebind` below
+    /// refuses a key that another action already holds, and names the action holding it. The
+    /// shipped defaults used to violate the rule the panel enforces: LEFT CLICK carried both
+    /// `SpecialAbility` and `Grab`, E carried `Grab`, `Lunge` AND `Skill1`, and Q carried both
+    /// `SpecialAbility` and `Skill2`. Whichever consumer ran first won, so throw felt like it
+    /// was not on left click even though it was bound there, and a hero's first skill fired out
+    /// of the pickup key. Rebinding anything onto E or Q was refused by our own asset.
+    ///
+    /// The owner's latest 2026-09-30 defaults: WASD, Run Left Shift, jump Space.
+    /// Throw / Tag left click; Retrieve / Reset right click; Interact / Ready F;
+    /// Shove / Lunge middle click; curve left wheel up, right wheel down.
+    /// ABILITIES: Signature E (`Skill1`), Role Ability Q (`Skill2`),
+    /// Ultimate X. INTERFACE: Scoreboard Tab, Ability Descriptions F1. COMMUNICATIONS: Emote
+    /// Wheel T. `Groups` below is laid out under the same five headings. It replaced Q/E/F for
+    /// the deck, X for a contextual pickup/shove/reset, G for interact, B for emotes and Z/C
+    /// for the curve (Z and C were themselves the fix for the arrow keys, 2026-08-27).
+    ///
+    /// Interact/Ready share a control in separate phases; older saved Lunge/Ready
+    /// pairs remain supported. PlayerInputReader requires release after Ready use.
+    /// `SettingsPanelTests` asserts the rest, so the collisions cannot come back quietly.
+    ///
+    /// ⚠️ THE CURVE IS A WHEEL NOTCH NOW: `PlayerInputReader.CurveInput` steps on each press edge
+    /// and still turns continuously for a held key, so a player who rebinds it to keys keeps the
+    /// old feel. Both curve rows stay rebindable, and every screen that teaches them reads the
+    /// live binding through `Hud.KeyLabel` (which prints WHEEL UP / WHEEL DOWN).
+    ///
+    /// ⚠️ TAB IS `SpectatorControls` (October 22, it was C) AND F IS `SpectatorFreeFly`, WHICH IS LEGAL RATHER THAN AN
+    /// OVERSIGHT. See `SpectatorContext`: a spectator has no body. `FindDuplicateBindings`
+    /// checks per context and passes.
+    ///
+    /// ⚠️⚠️ AND R IS THE ONE OVERLAP THAT WAS NOT LEGAL, WHICH IS WHY IT WAS THE ONE REPORTED.
+    /// 🧑 2026-08-29: *"theres a conflict, R for spectator map to replay and ready can u pls fix
+    /// that"*. `SpectatorReplay` is `Y` now; the other four overlaps stay exactly as they are.
+    ///
+    /// **The rule above is "a spectator has no body", and READY is the one gameplay action that
+    /// does not need one.** `ReadyGate` and `BufferSkipVote` both read `ReadyUp` from whoever
+    /// presses it regardless of role — `docs/TODO.md` § 78.6 is a whole entry about a spectator's
+    /// R reaching a quorum that excludes them — so a spectator pressing R fired the pre-round
+    /// ready, the buffer-skip vote AND the replay from one key. That is not an overlap the
+    /// context can separate, because both sides of it are live in the same context.
+    ///
+    /// ⚠️ THE SPECTATOR ACTION MOVED, NOT THE PLAYER ONE. R is taught on the ready prompt, in the
+    /// rebind panel under ROUND AND SCREEN and by the buffer-skip row; replay is an operator key
+    /// nobody is taught in a match. When two must part, the one with fewer readers moves.
+    /// </summary>
+    public static class Rebinding
+    {
+        // Latest owner layout restores the Interact/Ready row on F; the previous
+        // separate Hold Interact label remains retired.
+        /// <summary>Action names as they appear in the Input System asset or composite parts.</summary>
+        public static readonly string[] RebindableActions =
+        {
+            "MoveForward", "MoveBackward", "MoveLeft", "MoveRight",
+            "Sprint", "Jump", "Crouch",
+            "SpecialAbility", "Grab", "Lunge", "CurveLeft", "CurveRight",
+            "Skill1", "Skill2", "Ultimate", "Interact",
+            "ReadyUp", "CleanFeed", "Scoreboard", "AbilityInfo",
+            "EmoteWheel",
+            "Pause",
+            "ToggleFullscreen",
+
+            // § SPECTATOR AND BROADCAST. See `SpectatorContext` for why these may share a key
+            // with a gameplay action and nothing else may.
+            "SpectatorAutopilot", "SpectatorCycleTarget", "SpectatorFreeFly", "SpectatorPov",
+            "SpectatorDown", "SpectatorUp", "SpectatorSpeed", "SpectatorZoom", "SpectatorMark", "SpectatorRecall",
+            "SpectatorPause", "SpectatorReplay", "SpectatorControls",
+        };
+
+        /// <summary>
+        /// The actions that only exist while somebody is spectating.
+        ///
+        /// ⚠⚠ THIS SET IS WHAT LETS A SPECTATOR KEY SHARE A CONTROL WITH A GAMEPLAY ONE, AND
+        /// IT IS A REFINEMENT OF `CLAUDE.md` § 4'S RULE RATHER THAN A HOLE IN IT. That rule reads
+        /// *"one control, one action, in the input map"*, and what it protects against is a key
+        /// that does two things AT THE SAME TIME: the panel refuses such a binding, and a shipped
+        /// default that breaks it is a defect. **A spectator has no body, no seat and no
+        /// `CharacterMotor`.** While spectating, every gameplay action is inert; while playing,
+        /// none of these is reachable. The two sets can never both fire, so binding TAB to both
+        /// "hold for ability info" and "cycle spectator target" is not one key doing two things,
+        /// it is two mutually exclusive screens.
+        ///
+        /// ⚠⚠ AND THE ALTERNATIVE WAS WORSE. These nine keys were `Keyboard.current` reads
+        /// inside `SpectatorCamera` and `Hud` until 2026-08-27: not rebindable, not visible in the
+        /// panel, and not checked against anything. Giving them fresh non-clashing defaults would
+        /// have moved TAB, F, B and R for every existing spectator to satisfy a rule about
+        /// simultaneity that was never at risk. Naming the context is the honest fix.
+        ///
+        /// ⚠️ `CleanFeed` IS DELIBERATELY NOT IN HERE. Hiding the HUD is a PLAYER action that a
+        /// spectator also uses, it has always been in the map, and its H default clashes with
+        /// nothing.
+        /// </summary>
+        public static readonly string[] SpectatorContext =
+        {
+            "SpectatorAutopilot", "SpectatorCycleTarget", "SpectatorFreeFly", "SpectatorPov",
+            "SpectatorDown", "SpectatorUp", "SpectatorSpeed", "SpectatorZoom", "SpectatorMark", "SpectatorRecall",
+            "SpectatorPause", "SpectatorReplay", "SpectatorControls",
+        };
+
+        public static bool IsSpectatorAction(string action)
+            => System.Array.IndexOf(SpectatorContext, action) >= 0;
+
+        /// <summary>True when two actions can ever be pressed in the same screen.</summary>
+        public static bool ShareAContext(string a, string b)
+            => IsSpectatorAction(a) == IsSpectatorAction(b)
+               || SharedWhileWatching(a) || SharedWhileWatching(b);
+
+        private static bool SharedWhileWatching(string action)
+            => action == "CleanFeed" || action == "Pause" || action == "Sprint"
+               || action == "Move" || action == "MoveForward" || action == "MoveBackward"
+               || action == "MoveLeft" || action == "MoveRight";
+
+        /// <summary>
+        /// Contextual playing actions that share a key on purpose: Grab and Interact,
+        /// plus Interact/ReadyUp and older saved Lunge/ReadyUp pairs in separate phases.
+        /// `Grab` AND `Interact`
+        /// ARE THE OWNER'S ONE "INTERACT / USE" KEY. His default layout, 2026-09-27: *"Interact / Use
+        /// - F"*. `Grab` is the tap and the reset hold (pick up the tsinelas, raise the can) and
+        /// `Interact` is the free hold (break out of roots, pull out a plant); they were split on
+        /// 2026-09-25 only because `Grab` also shoved, and the shove has left for Shove / Lunge. Both
+        /// firing on one press is the point, not a clash: each only acts on its own thing in
+        /// front of you. They stay two rows so either can be moved alone, and a pad keeps its two
+        /// buttons.
+        /// </summary>
+        public static bool IsOneUseKey(string a, string b)
+            => (a == "Grab" && b == "Interact") || (a == "Interact" && b == "Grab")
+               || (a == "Lunge" && b == "ReadyUp") || (a == "ReadyUp" && b == "Lunge")
+               || (a == "Interact" && b == "ReadyUp") || (a == "ReadyUp" && b == "Interact")
+               // Crouch and the ready share B on a pad (2026-10-09): the ready is only live before a round, and the
+               // reader gives the press to it alone then (`InputCatalogue`, the Crouch row).
+               || (a == "Crouch" && b == "ReadyUp") || (a == "ReadyUp" && b == "Crouch");
+
+        /// <summary>True when binding one control to both actions would be two things on one press.</summary>
+        public static bool WouldClash(string a, string b) => ShareAContext(a, b) && !IsOneUseKey(a, b);
+
+        /// <summary>
+        /// Human-readable labels. Several are named for the JOB rather than the verb, because
+        /// one key genuinely does several jobs and the player cannot guess which from a name:
+        /// The owner's words since 2026-09-27 (his default layout's headings and names):
+        /// - THROW / TAG is one key doing two things by ROLE. An attacker charges and throws;
+        ///   the taya, who `can_throw()` refuses outright, jabs a tag (`Design.md` §4, §5.1).
+        /// - SHOVE / LUNGE is the other mouse button, also by role: the taya's dash tag, and an
+        ///   attacker's shove (or the retrieval slide when a loose tsinelas lies in reach ahead).
+        /// - INTERACT / USE is the pickup key: a tap picks the tsinelas up, a hold as the taya in
+        ///   the lata's ring runs the reset. INTERACT / USE: HOLD is its partner on the same key
+        ///   (break out of roots, pull out a plant); see `IsOneUseKey`.
+        /// </summary>
+        public static readonly Dictionary<string, string> ActionLabels = new Dictionary<string, string>
+        {
+            { "MoveForward", "Move Forward" },
+            { "MoveBackward", "Move Backward" },
+            { "MoveLeft", "Move Left" },
+            { "MoveRight", "Move Right" },
+            { "Move", "Move" },
+            { "SpecialAbility", "Throw / Tag" },
+            { "Grab", "Retrieve Slipper / Reset Can" },
+            { "Lunge", "Shove / Lunge" },
+            { "CurveLeft", "Curve Throw Left" },
+            { "CurveRight", "Curve Throw Right" },
+            { "Jump", "Jump" },
+            { "Sprint", "Run" },
+            { "Crouch", "Crouch / Slide" },
+            { "Skill1", "Signature Ability" },
+            { "Skill2", "Role Ability" },
+            { "Ultimate", "Ultimate Ability" },
+            { "ReadyUp", "Ready Up" },
+            { "Interact", "Interact / Ready" },
+            { "CleanFeed", "Hide HUD" },
+            { "Scoreboard", "Scoreboard" },
+            { "AbilityInfo", "Ability Descriptions" },
+            { "EmoteWheel", "Emote Wheel" },
+            { "Pause", "Pause / Match Menu" },
+            { "SpectatorDown", "Fly Down" },
+            { "SpectatorUp", "Fly Up" },
+            { "SpectatorSpeed", "Cycle Match Speed" },
+            { "SpectatorZoom", "Zoom / Camera Speed" },
+            { "ToggleFullscreen", "Fullscreen" },
+            { "SpectatorAutopilot", "Autopilot On / Off" },
+            { "SpectatorCycleTarget", "Next Player" },
+            { "SpectatorFreeFly", "Free Flight" },
+            { "SpectatorPov", "First / Third Person" },
+            { "SpectatorMark", "Save Camera Mark" },
+            { "SpectatorRecall", "Recall Camera Mark" },
+            { "SpectatorPause", "Tactical Pause" },
+            { "SpectatorReplay", "Instant Replay" },
+            { "SpectatorControls", "Show Spectator Controls" },
+        };
+
+        public static string LabelFor(string action)
+            => ActionLabels.TryGetValue(action, out string label) ? label : action;
+
+        /// <summary>Ready uses the shared Interact row; its action/legacy overrides remain valid.</summary>
+        public static string SettingsRowFor(string action)
+            => action == "ReadyUp" ? "Interact" : action;
+
+        /// <summary>
+        /// The controls list, cut into named groups in the order they should be shown.
+        ///
+        /// ⚠️⚠️ ONE FLAT LIST OF FOURTEEN ROWS IS WHAT THIS REPLACED, and it was rejected on
+        /// sight: *"can u also organize setttings better, separet diff controls to diff groups
+        /// bcz it feels overwhelming to look at now"*. Fourteen unlabelled rows is a wall. The
+        /// grouping is not decoration, it is what lets somebody scan for the one line they came
+        /// to change instead of reading all of them.
+        ///
+        /// ⚠️ THE GROUPS ARE BY WHEN YOU USE THEM, NOT BY DEVICE OR BY SUBSYSTEM, and since
+        /// 2026-09-27 they are the owner's own headings, in his order: MOVEMENT, ACTIONS, ABILITIES,
+        /// INTERFACE, COMMUNICATIONS. A player looking for the throw key does not think "mouse
+        /// buttons". Ready shares Interact; hide HUD, pause and fullscreen sit under INTERFACE.
+        ///
+        /// Every action's SettingsRowFor must appear in exactly one group. A row that
+        /// belongs to no group would vanish from the panel with no error, which is the same
+        /// silent failure the class note at the top warns about. `SettingsGroupsCoverEveryAction`
+        /// asserts it.
+        /// </summary>
+        public static readonly (string Title, string[] Actions)[] Groups =
+        {
+            ("MOVEMENT", new[] { "MoveForward", "MoveBackward", "MoveLeft", "MoveRight", "Sprint", "Jump", "Crouch" }),
+            ("ACTIONS", new[] { "SpecialAbility", "Lunge", "Grab", "CurveLeft", "CurveRight", "Interact" }),
+            ("ABILITIES", new[] { "Skill1", "Skill2", "Ultimate" }),
+            ("INTERFACE", new[] { "Scoreboard", "AbilityInfo", "CleanFeed", "Pause",
+                                  "ToggleFullscreen" }),
+            ("COMMUNICATIONS", new[] { "EmoteWheel" }),
+            ("SPECTATOR CAMERA", new[] { "SpectatorAutopilot", "SpectatorCycleTarget",
+                                         "SpectatorFreeFly", "SpectatorPov", "SpectatorDown", "SpectatorUp", "SpectatorZoom",
+                                         "SpectatorMark", "SpectatorRecall" }),
+            ("BROADCAST GALLERY", new[] { "SpectatorPause", "SpectatorSpeed", "SpectatorReplay",
+                                          "SpectatorControls" }),
+        };
+
+        /// <summary>
+        /// A short line under a group heading, for the two groups whose rows do more than one
+        /// job and cannot say so in a label.
+        /// </summary>
+        public static string BlurbFor(string title)
+        {
+            switch (title)
+            {
+                case "ACTIONS":
+                    // ⚠️ ONE LINE. The blurb draws in a 20 px row under the heading and does not
+                    // wrap; a second sentence was added here on 2026-08-26 and the screenshot in
+                    // `Logs/shots-runtime/SettingsPanel.png` cut it off mid-word. What the curve
+                    // rows do is in their own labels.
+                    return "Some keys change job with your role and what is in front of you.";
+                case "ABILITIES":
+                    return "Hero Strike only. Classic has no powers.";
+                case "SPECTATOR CAMERA":
+                    // ⚠️ IT SAYS THE SHARING IS DELIBERATE, because a player who reads the panel
+                    // top to bottom will otherwise see TAB and F listed twice and report it.
+                    return "Watching only. These may share a key with a playing control.";
+                case "BROADCAST GALLERY":
+                    return "Watching only. Autopilot never uses these.";
+                default:
+                    return null;
+            }
+        }
+
+        /// <summary>
+        /// Resolves an action name (including discrete composite movements like MoveForward)
+        /// into the underlying InputAction and binding index.
+        /// </summary>
+        public static bool ResolveActionAndBindingIndex(InputActionAsset asset, string actionName,
+            out InputAction action, out int bindingIndex)
+        {
+            action = null;
+            bindingIndex = -1;
+            if (asset == null || string.IsNullOrEmpty(actionName)) return false;
+
+            if (actionName == "MoveForward" || actionName == "MoveBackward" ||
+                actionName == "MoveLeft" || actionName == "MoveRight")
+            {
+                action = Find(asset, "Move");
+                if (action == null) return false;
+
+                string part = actionName == "MoveForward" ? "up" :
+                              actionName == "MoveBackward" ? "down" :
+                              actionName == "MoveLeft" ? "left" : "right";
+
+                for (int i = 0; i < action.bindings.Count; i++)
+                {
+                    var b = action.bindings[i];
+                    if (b.isPartOfComposite && string.Equals(b.name, part, System.StringComparison.OrdinalIgnoreCase))
+                    {
+                        bindingIndex = i;
+                        return true;
+                    }
+                }
+
+                bindingIndex = FirstKeyboardBinding(action);
+                return bindingIndex >= 0;
+            }
+
+            action = Find(asset, actionName);
+            if (action == null) return false;
+
+            bindingIndex = FirstKeyboardBinding(action);
+            return bindingIndex >= 0;
+        }
+
+        /// <summary>
+        /// Every binding index that belongs to <paramref name="actionName"/>, across all devices.
+        ///
+        /// ⚠️⚠️ THIS EXISTS BECAUSE `ResolveActionAndBindingIndex` RETURNS THE FIRST BINDING AND
+        /// AN ACTION NOW HAS SEVERAL. Before the gamepad pass every action held exactly one
+        /// control, so "the first binding" and "the binding" were the same sentence, and
+        /// `FindDuplicateBindings` was written against that. With a pad binding added beside each
+        /// keyboard one, the first-binding version checked the keyboard half and **silently
+        /// stopped checking the half that had just been added**, which is the one class of
+        /// failure this file's own class note says nobody notices.
+        ///
+        /// ⚠️ A COMPOSITE PART BELONGS TO ITS OWN DIRECTION, NOT TO THE WHOLE COMPOSITE. Asking
+        /// for MoveForward's bindings must not return MoveBackward's key, and it must not return
+        /// the pad's `leftStick` either: the stick is a plain binding on `Move` that no discrete
+        /// direction owns, so it is correctly nobody's and correctly never clashes.
+        /// </summary>
+        public static List<int> ResolveBindingIndices(InputActionAsset asset, string actionName,
+                                                      out InputAction action)
+        {
+            var found = new List<int>();
+            action = null;
+            if (asset == null || string.IsNullOrEmpty(actionName)) return found;
+
+            bool isMovePart = actionName == "MoveForward" || actionName == "MoveBackward"
+                              || actionName == "MoveLeft" || actionName == "MoveRight";
+
+            if (isMovePart)
+            {
+                action = Find(asset, "Move");
+                if (action == null) return found;
+
+                string part = actionName == "MoveForward" ? "up" :
+                              actionName == "MoveBackward" ? "down" :
+                              actionName == "MoveLeft" ? "left" : "right";
+
+                for (int i = 0; i < action.bindings.Count; i++)
+                {
+                    var b = action.bindings[i];
+                    if (b.isPartOfComposite
+                        && string.Equals(b.name, part, System.StringComparison.OrdinalIgnoreCase))
+                        found.Add(i);
+                }
+
+                return found;
+            }
+
+            action = Find(asset, actionName);
+            if (action == null) return found;
+
+            for (int i = 0; i < action.bindings.Count; i++)
+            {
+                var b = action.bindings[i];
+                if (b.isComposite || b.isPartOfComposite) continue;
+                if (string.IsNullOrEmpty(b.effectivePath)) continue;
+
+                found.Add(i);
+            }
+
+            return found;
+        }
+
+        /// <summary>
+        /// Every control bound twice across two different actions, as "path: ActionA, ActionB".
+        /// Empty means the map is clean.
+        ///
+        /// ⚠️⚠️ THE UNIT OF THE RULE IS A CONTROL PATH, WHICH ALREADY CARRIES THE DEVICE, SO A
+        /// KEYBOARD KEY AND A PAD BUTTON CAN NEVER COLLIDE WITH EACH OTHER. `&lt;Keyboard&gt;/f`
+        /// and `&lt;Gamepad&gt;/buttonNorth` are different strings, and no press produces both.
+        /// That is the honest reading of `CLAUDE.md` § 4's *"one control, one action, per
+        /// CONTEXT"*: what the rule forbids is two actions firing off ONE press, and the device
+        /// is part of what a press is. **The rule is therefore now checked per device and per
+        /// context at once, with no new concept**, which is the same narrowing
+        /// <see cref="SpectatorContext"/> records rather than a second exception beside it.
+        /// </summary>
+        public static List<string> FindDuplicateBindings(InputActionAsset asset)
+        {
+            var owners = new Dictionary<string, List<string>>();
+            var clashes = new List<string>();
+            if (asset == null) return clashes;
+
+            foreach (string action in RebindableActions)
+            {
+                var indices = ResolveBindingIndices(asset, action, out var a);
+                if (a == null) continue;
+
+                foreach (int index in indices)
+                {
+                    string path = a.bindings[index].effectivePath;
+                    if (string.IsNullOrEmpty(path)) continue;
+
+                    if (!owners.TryGetValue(path, out var list))
+                        owners[path] = list = new List<string>();
+
+                    if (!list.Contains(action)) list.Add(action);
+                }
+            }
+
+            // ⚠⚠ A CLASH IS TWO ACTIONS THAT CAN FIRE ON THE SAME SCREEN, NOT TWO ACTIONS ON
+            // THE SAME KEY. See `SpectatorContext`: a spectator has no body, so TAB meaning
+            // "ability info" while playing and "next player" while watching is two screens, not
+            // one key doing two things. Every pair inside one context is still a defect.
+            foreach (var pair in owners)
+            {
+                var conflicting = new List<string>();
+
+                foreach (string owner in pair.Value)
+                    foreach (string other in pair.Value)
+                        if (owner != other && WouldClash(owner, other)
+                            && !conflicting.Contains(owner))
+                            conflicting.Add(owner);
+
+                if (conflicting.Count > 1)
+                    clashes.Add(pair.Key + ": " + string.Join(", ", conflicting));
+            }
+
+            clashes.Sort();
+            return clashes;
+        }
+
+        private const string OverridesKey = "tumbangpreso.bindings";
+
+        /// <summary>
+        /// The display name of whatever is currently bound to <paramref name="action"/>.
+        /// </summary>
+        public static string DisplayNameFor(InputActionAsset asset, string action)
+        {
+            if (!ResolveActionAndBindingIndex(asset, action, out var a, out int bindingIndex))
+                return "-";
+
+            return InputControlPath.ToHumanReadableString(
+                a.bindings[bindingIndex].effectivePath,
+                InputControlPath.HumanReadableStringOptions.OmitDevice);
+        }
+
+        /// <summary>
+        /// What <paramref name="action"/> is bound to on ONE device, or "-" when it is on none.
+        ///
+        /// ⚠️⚠️ `docs/VISION.md` § 3: *"Key labels come from the live binding, never from a
+        /// literal. A screen that teaches the wrong key is worse than one that teaches none."*
+        /// That rule is the reason this overload exists rather than a glyph table: a player on a
+        /// pad must be told BUTTON SOUTH and a player on a keyboard SPACE, and both have to
+        /// follow a rebind. A table keyed by action would be a second place to forget, which is
+        /// the argument `HeroAbility.Glyph` won.
+        ///
+        /// ⚠️ IT RETURNS "-" RATHER THAN THE KEYBOARD BINDING WHEN A DEVICE HAS NONE. Falling
+        /// back would print SPACE on a pad prompt for `ToggleFullscreen`, which has no pad
+        /// binding on purpose (`ScreenInputCatalogue`), and teach a control that does not exist.
+        /// </summary>
+        public static string DisplayNameFor(InputActionAsset asset, string action, string device)
+        {
+            var indices = ResolveBindingIndices(asset, action, out var a);
+            if (a == null) return "-";
+
+            foreach (int index in indices)
+            {
+                string path = a.bindings[index].effectivePath;
+                if (DeviceOf(path) != device) continue;
+
+                return InputControlPath.ToHumanReadableString(
+                    path, InputControlPath.HumanReadableStringOptions.OmitDevice);
+            }
+
+            return "-";
+        }
+
+        /// <summary>The device prefix a gamepad binding carries. One place, so a typo cannot hide.</summary>
+        public const string GamepadDevice = "<Gamepad>";
+
+        /// <summary>The device prefix a touchscreen binding carries. See <see cref="PathIsFor"/>.</summary>
+        public const string TouchDevice = "<Touchscreen>";
+
+        /// <summary>
+        /// Whether <paramref name="path"/> is a control on <paramref name="device"/>.
+        ///
+        /// ⚠️⚠️ KEYBOARD AND MOUSE IS ONE DEVICE HERE, AND THE `string`-KEYED OVERLOAD CANNOT SAY
+        /// THAT. `DisplayNameFor(asset, action, "&lt;Keyboard&gt;")` matches a single prefix, so it
+        /// answers "-" for SPECIAL ABILITY and LUNGE, which are `&lt;Mouse&gt;/leftButton` and
+        /// `&lt;Mouse&gt;/rightButton`: **two of the most-used controls in the game would read as
+        /// unbound on the page that exists to show them.** A player has a pad or they have a
+        /// keyboard and a mouse; they do not have a keyboard and, separately, a mouse. The rebind
+        /// page is per DEVICE KIND for that reason and this is the predicate it is built on.
+        ///
+        /// ⚠️ TOUCH IS EXCLUDED FROM THE DESKTOP SIDE RATHER THAN FOLDED INTO IT, because the
+        /// thumb layer is not rebound here at all: it has its own screen, `TouchLayoutScreen`,
+        /// reached from a row in this very list, where a control is dragged and resized rather
+        /// than given a different path.
+        /// </summary>
+        public static bool PathIsFor(string path, InputDeviceKind device)
+        {
+            string prefix = DeviceOf(path);
+
+            if (device == InputDeviceKind.Gamepad) return prefix == GamepadDevice;
+            if (device == InputDeviceKind.Touch) return prefix == TouchDevice;
+
+            return prefix != GamepadDevice && prefix != TouchDevice;
+        }
+
+        /// <summary>
+        /// What <paramref name="action"/> is bound to on <paramref name="device"/>, or "-" when it
+        /// is bound on none. The overload the settings panel's device pages are built on.
+        /// </summary>
+        public static string DisplayNameFor(InputActionAsset asset, string action,
+                                            InputDeviceKind device)
+        {
+            var indices = ResolveBindingIndices(asset, action, out var a);
+            if (a == null) return "-";
+
+            foreach (int index in indices)
+            {
+                string path = a.bindings[index].effectivePath;
+                if (!PathIsFor(path, device)) continue;
+
+                return InputControlPath.ToHumanReadableString(
+                    path, InputControlPath.HumanReadableStringOptions.OmitDevice);
+            }
+
+            return "-";
+        }
+
+        /// <summary>
+        /// The raw control PATH <paramref name="action"/> resolves to on
+        /// <paramref name="device"/>, or "" when it has none there.
+        ///
+        /// ⚠️⚠️ THE PATH, NOT THE DISPLAY NAME, AND THE DIFFERENCE IS WHAT MAKES A DIAGRAM
+        /// POSSIBLE. `DisplayNameFor` runs `InputControlPath.ToHumanReadableString`, which is a
+        /// LOSSY, LOCALISED, LAYOUT-DEPENDENT string: on a DualSense the same binding comes back
+        /// as "Cross" and on an Xbox pad as "A". `InputLayer.ControllerMapScreen` has to know
+        /// which lump of plastic in its picture to draw a line to, and only the path says that.
+        ///
+        /// ⚠️ IT IS THE `effectivePath`, SO IT FOLLOWS A REBIND. A screen built on
+        /// `bindings[i].path` would draw the shipped default for ever and be wrong for exactly
+        /// the players who went looking for the screen.
+        /// </summary>
+        public static string PathFor(InputActionAsset asset, string action, InputDeviceKind device)
+        {
+            var indices = ResolveBindingIndices(asset, action, out var a);
+            if (a == null) return "";
+
+            foreach (int index in indices)
+            {
+                string path = a.bindings[index].effectivePath;
+                if (PathIsFor(path, device)) return path;
+            }
+
+            return "";
+        }
+
+        /// <summary>
+        /// The path of the ONE plain binding on <paramref name="actionName"/> for this device,
+        /// ignoring composites, for the two analogue actions no direction owns.
+        ///
+        /// ⚠️ `Move` AND `Look` ARE NOT IN `RebindableActions` AND STILL HAVE TO BE DRAWN. They
+        /// are the two most important controls on a pad and `PathFor` cannot reach them: `Move`'s
+        /// stick is *"correctly nobody's"* by `ResolveBindingIndices`' own note, and `Look` has no
+        /// rebind row at all. A controller diagram that left both sticks blank would be a diagram
+        /// of a pad the player is not holding.
+        /// </summary>
+        public static string PlainPathFor(InputActionAsset asset, string actionName,
+                                          InputDeviceKind device)
+        {
+            var action = Find(asset, actionName);
+            if (action == null) return "";
+
+            for (int i = 0; i < action.bindings.Count; i++)
+            {
+                var b = action.bindings[i];
+                if (b.isComposite || b.isPartOfComposite) continue;
+                if (!PathIsFor(b.effectivePath, device)) continue;
+
+                return b.effectivePath;
+            }
+
+            return "";
+        }
+
+        /// <summary>The four rows that are parts of the WASD composite rather than actions.</summary>
+        public static bool IsMovePart(string action) =>
+            action == "MoveForward" || action == "MoveBackward"
+            || action == "MoveLeft" || action == "MoveRight";
+
+        /// <summary>
+        /// What actually produces <paramref name="actionName"/> on <paramref name="device"/> when
+        /// the row has no binding of its own there, but something else does the job.
+        ///
+        /// ⚠️⚠️ THIS EXISTS BECAUSE THE GAMEPAD PAGE WOULD OTHERWISE SHOW FOUR DEAD ROWS, AND
+        /// THEY ARE THE FOUR MOST IMPORTANT ROWS IN THE LIST. `Move` carries a WASD composite for
+        /// the keyboard and a single plain `&lt;Gamepad&gt;/leftStick` binding for a pad, and
+        /// `ResolveBindingIndices` deliberately refuses to hand the stick to any one direction:
+        /// its own note says *"the stick is a plain binding on `Move` that no discrete direction
+        /// owns, so it is correctly nobody's and correctly never clashes."* **That is right for
+        /// the clash check and wrong for the reader**, because it makes MOVE FORWARD, MOVE
+        /// BACKWARD, MOVE LEFT and MOVE RIGHT all answer "-" on a pad, which reads as four broken
+        /// rows rather than as one stick doing all four jobs.
+        ///
+        /// ⚠️ IT IS A DISPLAY ANSWER AND NEVER A REBIND TARGET. `HasBindingFor` still says false
+        /// for these rows on a pad, so the panel shows the stick and refuses to rebind it from
+        /// here: rebinding one direction of a stick is not a thing, and writing an override
+        /// through this path would put one direction's control onto all four. `CLAUDE.md` § 6.3:
+        /// a control that does nothing must not look pressable, and the panel greys it.
+        /// </summary>
+        public static string SharedDisplayNameFor(InputActionAsset asset, string actionName,
+                                                  InputDeviceKind device)
+        {
+            if (asset == null || !IsMovePart(actionName)) return "";
+
+            var move = Find(asset, "Move");
+            if (move == null) return "";
+
+            for (int i = 0; i < move.bindings.Count; i++)
+            {
+                var b = move.bindings[i];
+
+                // The composite header and its four parts are the keyboard's answer; the plain
+                // binding beside them is the one control that does the whole job.
+                if (b.isComposite || b.isPartOfComposite) continue;
+                if (!PathIsFor(b.effectivePath, device)) continue;
+
+                return InputControlPath.ToHumanReadableString(
+                    b.effectivePath, InputControlPath.HumanReadableStringOptions.OmitDevice);
+            }
+
+            return "";
+        }
+
+        /// <summary>
+        /// Whether <paramref name="action"/> has anything bound on <paramref name="device"/>.
+        ///
+        /// ⚠️⚠️ THE REBIND SCREEN HAS TO ASK THIS BEFORE IT STARTS LISTENING, AND § 125.6 IS WHY.
+        /// `ScreenInputCatalogue` records a `null` pad path as a written-down answer rather than
+        /// an omission (`ToggleFullscreen` has none, because a phone has no window and a pad
+        /// player is not the player who alt-tabs). A row for such an action on the GAMEPAD page
+        /// has nothing to rebind, and starting a rebind on it would hand `TryRebind` a pad
+        /// control for an action with no pad binding. That is exactly the shape of the fault
+        /// § 125.6 records: *"targeting index 0 wrote the pad's path over the KEY, and Reset All
+        /// was the only way back."* <see cref="TryRebind"/> refuses that now as well, so this is
+        /// the polite half and that is the safe half.
+        /// </summary>
+        public static bool HasBindingFor(InputActionAsset asset, string action,
+                                         InputDeviceKind device)
+        {
+            var indices = ResolveBindingIndices(asset, action, out var a);
+            if (a == null) return false;
+
+            foreach (int index in indices)
+                if (PathIsFor(a.bindings[index].effectivePath, device)) return true;
+
+            return false;
+        }
+
+        /// <summary>
+        /// The action and the ONE binding index that <paramref name="device"/> owns, for a rebind
+        /// operation's <c>WithTargetBinding</c>.
+        ///
+        /// ⚠️ `ResolveActionAndBindingIndex` ANSWERS THE KEYBOARD ONE, ALWAYS. It calls
+        /// `FirstKeyboardBinding`, which was the whole binding when an action had one; a rebind
+        /// started from the gamepad page has to target the pad's index or the operation writes
+        /// its override onto the key.
+        /// </summary>
+        public static bool ResolveBindingIndexFor(InputActionAsset asset, string actionName,
+                                                  InputDeviceKind device,
+                                                  out InputAction action, out int bindingIndex)
+        {
+            bindingIndex = -1;
+            var indices = ResolveBindingIndices(asset, actionName, out action);
+            if (action == null) return false;
+
+            foreach (int index in indices)
+            {
+                if (!PathIsFor(action.bindings[index].effectivePath, device)) continue;
+
+                bindingIndex = index;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Rebind <paramref name="action"/> to <paramref name="control"/>.
+        /// </summary>
+        /// <summary>
+        /// Bumped whenever anything in this class changes what a key is bound to.
+        ///
+        /// ⚠️⚠️ IT EXISTS SO A READER CAN CACHE A KEY LABEL WITHOUT GOING STALE. Resolving one
+        /// costs a map lookup, an action lookup, `InputControlPath.ToHumanReadableString` and an
+        /// upper-casing, and `Hud.KeyLabel` was paying all four on every frame of every prompt
+        /// that names a key. Caching it is only safe if there is one number that changes the
+        /// moment a binding does, and `docs/VISION.md` section 3 is why it has to be exact: a
+        /// screen that teaches the wrong key is worse than one that teaches none.
+        ///
+        /// ⚠️ EVERY MUTATION GOES THROUGH THIS FILE, WHICH IS WHAT MAKES ONE COUNTER ENOUGH.
+        /// `TryRebind`, `ResetAll` and `Load` are the three, and `ConvertedSettingsPanel` calls
+        /// `Invalidate` for the override its rebind operation applies and then removes before
+        /// the conflict check runs.
+        /// </summary>
+        public static int Revision { get; private set; }
+
+        /// <summary>Tell every cached key label that it is out of date.</summary>
+        public static void Invalidate() => Revision++;
+
+        /// <summary>
+        /// The device prefix of a control path, e.g. `&lt;Gamepad&gt;` from
+        /// `&lt;Gamepad&gt;/buttonSouth`. Empty when the path does not name one.
+        /// </summary>
+        public static string DeviceOf(string path)
+        {
+            if (string.IsNullOrEmpty(path) || path[0] != '<') return "";
+
+            int close = path.IndexOf('>');
+            return close < 0 ? "" : path.Substring(0, close + 1);
+        }
+
+        public static string TryRebind(InputActionAsset asset, string action, InputControl control)
+        {
+            if(control==null)return LabelFor(action);
+            // Captured controls use /Keyboard1/f10, while persistent bindings use
+            // layout paths. An instance name neither matches DeviceOf nor survives
+            // reconnecting a device. Keep generic gamepad mappings across pad models.
+            string layout=control.device is Gamepad?GamepadDevice:
+                control.device is Keyboard?"<Keyboard>":control.device is Mouse?"<Mouse>":null;
+            if(layout==null)return LabelFor(action);
+            string path=layout+control.path.Substring(control.device.path.Length);
+            var kind=control.device is Gamepad?InputDeviceKind.Gamepad:InputDeviceKind.KeyboardMouse;
+
+            foreach (string other in RebindableActions)
+            {
+                if (other == action) continue;
+
+                // ⚠️ THE PANEL REFUSES A KEY ANOTHER action IN THE SAME CONTEXT HOLDS, and only
+                // that. Refusing across contexts would make half the spectator rows unbindable to
+                // the obvious key for no reason a player could ever work out from the screen.
+                if (!WouldClash(action, other)) continue;
+
+                // ⚠️ EVERY BINDING OF THE OTHER ACTION, NOT ITS FIRST. This compared one binding
+                // when an action only had one; with a pad binding beside each keyboard one, the
+                // first-binding version let a player bind their pad's A button to two different
+                // actions and refused nothing, because it was only ever looking at the keys.
+                var otherIndices = ResolveBindingIndices(asset, other, out var otherAction);
+                if (otherAction == null) continue;
+
+                foreach (int otherIndex in otherIndices)
+                    if (string.Equals(otherAction.bindings[otherIndex].effectivePath,path,System.StringComparison.OrdinalIgnoreCase))
+                        return LabelFor(other);
+            }
+
+            var indices = ResolveBindingIndices(asset, action, out var target);
+            if (target == null || indices.Count == 0) return LabelFor(action);
+
+            // ⚠️⚠️ THE OVERRIDE LANDS ON THE BINDING FOR THE DEVICE THE PLAYER JUST PRESSED, AND
+            // TARGETING THE FIRST ONE WOULD HAVE SILENTLY DESTROYED THEIR KEYBOARD. Rebinding
+            // SPRINT with a pad wrote the pad's path over binding 0, which is the KEY: the row
+            // then read "Button South", the key stopped working, and there was no way back to it
+            // except Reset All. One row, two devices, two bindings, and each is rebound on its own.
+            int index = -1;
+
+            foreach (int candidate in indices)
+            {
+                // Keyboard and mouse are one settings page/control family; a
+                // mouse-bound action can be moved to a key without touching its pad.
+                if (!PathIsFor(target.bindings[candidate].effectivePath,kind)) continue;
+
+                index = candidate;
+                break;
+            }
+
+            // ⚠️⚠️ AND WHEN THIS ACTION HAS NO BINDING ON THAT DEVICE AT ALL, IT REFUSES RATHER
+            // THAN FALLING BACK TO `indices[0]`. The fallback was the paragraph above waiting to
+            // happen a second time: `ToggleFullscreen` has a deliberately `null` pad path
+            // (`ScreenInputCatalogue`: a phone has no window), so a pad press aimed at it would
+            // have written `<Gamepad>/...` straight over the KEY binding, which is the one fault
+            // this method already carries a warning about. Refusing reads on screen as "that
+            // control cannot be bound here", which is true. `HasBindingFor` is the check a screen
+            // should make first so the player never gets this far.
+            if (index < 0) return LabelFor(action);
+
+            // Move Ready with its shared keyboard/mouse control. A separate saved
+            // Ready override and the controller's separate Ready button stay intact.
+            InputAction ready = null;
+            int readyIndex = -1;
+            bool sharedReady = action == "Interact" && kind == InputDeviceKind.KeyboardMouse
+                && ResolveBindingIndexFor(asset, "ReadyUp", kind, out ready, out readyIndex)
+                && string.Equals(ready.bindings[readyIndex].effectivePath,
+                    target.bindings[index].effectivePath, System.StringComparison.OrdinalIgnoreCase);
+            target.ApplyBindingOverride(index, path);
+            if (sharedReady) ready.ApplyBindingOverride(readyIndex, path);
+            Invalidate();
+            Save(asset);
+            return null;
+        }
+
+        /// <summary>Every override, back to the asset's own defaults.</summary>
+        public static void ResetAll(InputActionAsset asset)
+        {
+            if (asset == null) return;
+
+            asset.RemoveAllBindingOverrides();
+            Invalidate();
+            PlayerPrefs.DeleteKey(OverridesKey);
+            PlayerPrefs.Save();
+        }
+
+        public static void Save(InputActionAsset asset)
+        {
+            if (asset == null) return;
+
+            PlayerPrefs.SetString(OverridesKey, asset.SaveBindingOverridesAsJson());
+            PlayerPrefs.Save();
+        }
+
+        /// <summary>
+        /// ⚠️ CALL THIS BEFORE ANY SCREEN READS A BINDING. Overrides live outside the asset,
+        /// so an unloaded asset silently shows and uses the defaults — which reads to the
+        /// player as their rebind having been forgotten.
+        /// </summary>
+        public static void Load(InputActionAsset asset)
+        {
+            if (asset == null) return;
+
+            string json = PlayerPrefs.GetString(OverridesKey, "");
+            if (!string.IsNullOrEmpty(json)) asset.LoadBindingOverridesFromJson(json);
+            Invalidate();
+        }
+
+        private static InputAction Find(InputActionAsset asset, string action)
+        {
+            var map = asset != null ? asset.FindActionMap("Player", false) : null;
+            return map?.FindAction(action, false);
+        }
+
+        /// <summary>The first keyboard binding on an action, skipping composite parents.</summary>
+        private static int FirstKeyboardBinding(InputAction action)
+        {
+            for (int i = 0; i < action.bindings.Count; i++)
+            {
+                var b = action.bindings[i];
+                if (b.isComposite) continue;
+                if (string.IsNullOrEmpty(b.effectivePath)) continue;
+
+                return i;
+            }
+
+            return -1;
+        }
+    }
+}

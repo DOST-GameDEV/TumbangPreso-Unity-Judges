@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    ⚠️ THE SOURCE LIVES IN Packages/com.tumbangpreso.core/Runtime/, NOT HERE.
+    Unity can only compile code under Assets/ or Packages/, so the rules layer lives in
+    an embedded local package and THIS PROJECT COMPILES THOSE SAME FILES IN PLACE. One
+    copy of the source, two toolchains: Unity builds it through the package's asmdef, and
+    `dotnet test` builds it through here.
+
+    ⚠️ DO NOT "FIX" THIS BY COPYING THE FILES. Two copies of the balance layer is exactly
+    the failure this whole structure exists to prevent: the copy that drifts is the one
+    nobody is running the tests against.
+
+    ⚠️ netstandard2.1 IS DELIBERATE. It is what Unity 6 consumes, so the same source
+    compiles in both places. A net9.0 target would test perfectly well and then be
+    unusable from the game.
+
+    ⚠️ THERE IS NO UnityEngine REFERENCE HERE AND THERE MUST NEVER BE ONE. The package's
+    asmdef enforces the same rule on the Unity side with "noEngineReferences": true, so
+    adding one is a compile error rather than a review comment.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <RootNamespace>TumbangPreso.Core</RootNamespace>
+    <AssemblyName>TumbangPreso.Core</AssemblyName>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Packages\com.tumbangpreso.core\Runtime\**\*.cs" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,235 @@
+using TumbangPreso.UI;
+using UnityEngine;
+
+namespace TumbangPreso.Visual
+{
+    /// <summary>
+    /// The particle burst on a landed hit, converted from
+    /// `character_visual.gd::_spawn_impact_particles`.
+    ///
+    /// ⚠️ NO ART ASSET, ON PURPOSE. A handful of small unshaded points in the IMPACT colour,
+    /// built in code — the moodboard's "impact effect (particle burst)" without anything to
+    /// author or keep in sync with twelve rigs.
+    ///
+    /// ⚠️ AND IT FREES ITSELF. The original notes this explicitly: a burst per hit that never
+    /// cleans up leaks one particle system per tag for the rest of the match, and a 90-second
+    /// round with four players produces a lot of tags.
+    /// </summary>
+    public static class ImpactBurst
+    {
+        public const int ParticleCount = 16;
+        public const float Lifetime = 0.4f;
+
+        /// <summary>Roughly chest height, so the burst reads as happening to the UNIT rather
+        /// than at its feet.</summary>
+        public const float Height = 1.0f;
+
+        public const float SpeedMin = 1.5f;
+        public const float SpeedMax = 3.5f;
+        public const float PointRadius = 0.04f;
+
+        /// <summary>How long the hit flash on the body lasts. Deliberately NOT shared with the
+        /// YouCard's ready flash — one is a hit landing on a 3D mesh, the other a 2D meter
+        /// refilling, and there is no reason the two move together.</summary>
+        public const float FlashDuration = 0.15f;
+
+        public static void SpawnAt(Vector3 worldPosition)
+        {
+            var go = new GameObject("~ImpactBurst");
+            go.transform.position = worldPosition + Vector3.up * Height;
+
+            var ps = go.AddComponent<ParticleSystem>();
+
+            // ⚠️⚠️ IT IS ALREADY PLAYING BY THE TIME WE GET IT, AND `main.duration` IS ILLEGAL
+            // WHILE IT IS. `AddComponent<ParticleSystem>` returns a system that is live on the
+            // frame it is added, so the very next line logged
+            // *"Setting the duration while system is still playing is not supported"* — every
+            // single time a tag landed. In a player that is silent log spam; in a PlayMode test
+            // an unexpected assert FAILS THE RUN, which is how the first bot punch this port
+            // ever landed came back as a red test rather than as the fix it was.
+            //
+            // Stopping with `StopEmittingAndClear` is the form the message itself asks for.
+            ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+
+            // ⚠️ CONFIGURE BEFORE THE FIRST PLAY. A burst configured after it starts emits one
+            // frame of defaults first, which looks like a white puff nobody asked for.
+            var main = ps.main;
+            main.duration = Lifetime;
+            main.loop = false;
+            main.startLifetime = Lifetime;
+            main.startSpeed = new ParticleSystem.MinMaxCurve(SpeedMin, SpeedMax);
+            main.startSize = PointRadius * 2.0f;
+            main.startColor = UiTheme.Impact;
+            main.gravityModifier = 1.0f;
+            main.playOnAwake = false;
+            main.stopAction = ParticleSystemStopAction.Destroy;
+
+            var emission = ps.emission;
+            emission.rateOverTime = 0.0f;
+
+            // A burst, not a stream — everything at once on the frame of the hit.
+            emission.SetBursts(new[] { new ParticleSystem.Burst(0.0f, ParticleCount) });
+
+            // Spherical emission, matching the original's 180° spread.
+            var shape = ps.shape;
+            shape.shapeType = ParticleSystemShapeType.Sphere;
+            shape.radius = 0.05f;
+
+            var renderer = ps.GetComponent<ParticleSystemRenderer>();
+            renderer.renderMode = ParticleSystemRenderMode.Billboard;
+            renderer.maxParticleSize = .02f;
+
+            // ⚠️⚠️ A RENDERER CREATED IN CODE HAS NO MATERIAL AND UNITY DRAWS THAT IN MAGENTA.
+            // This is the same rule the port ledger opens with, and a particle system is the
+            // easiest place in the project to miss it: the burst still emits, still moves and
+            // still dies on schedule, so everything about it is correct except that the hit
+            // feedback is a spray of bright pink error quads.
+            renderer.sharedMaterial = BurstMaterial;
+
+            ComfortParticles.Configure(ps);
+            ps.Play();
+
+            // Belt and braces alongside stopAction: if the system is stopped by anything else,
+            // the object still goes rather than sitting in the scene forever.
+            Object.Destroy(go, Lifetime * 2.0f);
+        }
+
+        /// <summary>A slipper landing on a body: fast streaks in the thrower's colour and one ring that snaps open.</summary>
+        public static void SpawnSlipperHit(Vector3 at, Color accent, bool insideView = false)
+        {
+            var go = new GameObject("~SlipperHit");
+            go.transform.position = at;
+            var ps = go.AddComponent<ParticleSystem>();
+            ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            ps.useAutoRandomSeed = false;
+            ps.randomSeed = 417u;
+            var main = ps.main;
+            main.duration = .3f; main.loop = false; main.playOnAwake = false;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(.14f, .3f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(3.5f, 8f);
+            main.startSize = new ParticleSystem.MinMaxCurve(.05f, .1f);
+            main.startColor = new ParticleSystem.MinMaxGradient(accent, Color.white);
+            main.gravityModifier = .8f;
+            main.stopAction = ParticleSystemStopAction.Destroy;
+            var emission = ps.emission; emission.rateOverTime = 0;
+            emission.SetBursts(new[] { new ParticleSystem.Burst(0, insideView ? (short)7 : (short)20) });
+            var shape = ps.shape; shape.shapeType = ParticleSystemShapeType.Sphere; shape.radius = .08f;
+            var size = ps.sizeOverLifetime; size.enabled = true;
+            size.size = new ParticleSystem.MinMaxCurve(1, AnimationCurve.EaseInOut(0, 1, 1, 0));
+            var renderer = ps.GetComponent<ParticleSystemRenderer>();
+            // Next to the lens a stretched streak fills the screen, so the victim's own view gets small flat sparks.
+            renderer.renderMode = insideView ? ParticleSystemRenderMode.Billboard : ParticleSystemRenderMode.Stretch;
+            renderer.velocityScale = .035f; renderer.lengthScale = 1.5f;
+            renderer.sharedMaterial = BurstMaterial; renderer.maxParticleSize = insideView ? .012f : .05f;
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            ComfortParticles.Configure(ps);
+            ps.Play(); Object.Destroy(go, .7f);
+            if (!insideView && !Settings.SettingsStore.Current.ReducedEffects) ImpactRing.Spawn(at, accent, BurstMaterial);
+        }
+
+        /// <summary>The ring: a circle facing the viewer that opens fast and thins to nothing.</summary>
+        private sealed class ImpactRing : MonoBehaviour
+        {
+            private const float Life = .2f, From = .15f, To = 1.15f;
+            private const int Points = 40;
+            private LineRenderer _line;
+            private float _age;
+            public static void Spawn(Vector3 at, Color colour, Material material)
+            {
+                var go = new GameObject("~SlipperHitRing");
+                go.transform.position = at;
+                go.AddComponent<VfxRenderTag>();
+                var line = go.AddComponent<LineRenderer>();
+                line.sharedMaterial = material; line.loop = true; line.positionCount = Points; line.useWorldSpace = false;
+                line.alignment = LineAlignment.View; line.startColor = line.endColor = colour;
+                line.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; line.receiveShadows = false;
+                go.AddComponent<ImpactRing>()._line = line;
+            }
+            private void LateUpdate()
+            {
+                _age += Time.deltaTime;
+                float u = _age / Life;
+                if (u >= 1) { Destroy(gameObject); return; }
+                var view = Camera.main;
+                if (view != null) transform.rotation = view.transform.rotation;
+                float radius = Mathf.Lerp(From, To, 1 - (1 - u) * (1 - u));
+                _line.widthMultiplier = .13f * (1 - u);
+                for (int i = 0; i < Points; i++)
+                {
+                    float a = i * Mathf.PI * 2 / Points;
+                    _line.SetPosition(i, new Vector3(Mathf.Cos(a) * radius, Mathf.Sin(a) * radius, 0));
+                }
+            }
+        }
+
+        public static void SpawnTinContact(Vector3 at)
+        {
+            var go = new GameObject("~TinContact");
+            go.transform.position = at;
+            var ps = go.AddComponent<ParticleSystem>();
+            ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            // Local deterministic variation must not consume gameplay's random stream.
+            ps.useAutoRandomSeed = false;
+            ps.randomSeed = 731u;
+            var main = ps.main;
+            main.duration = .24f; main.loop = false; main.playOnAwake = false;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(.12f, .24f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(.65f, 1.5f);
+            main.startSize = new ParticleSystem.MinMaxCurve(.022f, .042f);
+            main.startColor = new ParticleSystem.MinMaxGradient(new Color(.86f, .78f, .55f), new Color(1f, .96f, .82f));
+            main.gravityModifier = .6f;
+            main.stopAction = ParticleSystemStopAction.Destroy;
+            var emission = ps.emission; emission.rateOverTime = 0;
+            emission.SetBursts(new[] { new ParticleSystem.Burst(0, 9) });
+            var shape = ps.shape; shape.shapeType = ParticleSystemShapeType.Sphere; shape.radius = .06f;
+            var size = ps.sizeOverLifetime; size.enabled = true;
+            size.size = new ParticleSystem.MinMaxCurve(1, AnimationCurve.EaseInOut(0, 1, 1, 0));
+            var renderer = ps.GetComponent<ParticleSystemRenderer>();
+            renderer.sharedMaterial = WorldCueProfile.Current.InkEffects>0 ? TinMaterial : BurstMaterial; renderer.maxParticleSize = .009f;
+            renderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            ComfortParticles.Configure(ps);
+            ps.Play(); Object.Destroy(go, .55f);
+        }
+
+        private static Material _burstMaterial;
+        private static Material _tinMaterial;
+        private static Material TinMaterial
+        {
+            get
+            {
+                if(_tinMaterial==null)
+                {
+                    _tinMaterial=new Material(Shader.Find("TumbangPreso/InkDust")){name="Tin ink chips",hideFlags=HideFlags.DontSave};
+                    _tinMaterial.SetFloat("_Chip",1);
+                }
+                return _tinMaterial;
+            }
+        }
+
+        /// <summary>
+        /// One shared material for every burst. ⚠️ THE SHADER IS RESOLVED RATHER THAN NAMED
+        /// ONCE: this project renders on the built-in pipeline with the URP package present, so
+        /// a single hard-coded name is a magenta spray the day either changes.
+        ///
+        /// ⚠️ VERTEX-COLOURED AND UNTEXTURED ON PURPOSE. The Godot original draws small flat
+        /// points, so the particle's own start colour IS the look, and a default particle
+        /// texture would put a soft glow on a game with no other soft glows in it.
+        /// </summary>
+        private static Material BurstMaterial
+        {
+            get
+            {
+                if (_burstMaterial != null) return _burstMaterial;
+
+                var shader = Shader.Find("Particles/Standard Unlit")
+                             ?? Shader.Find("Sprites/Default")
+                             ?? Shader.Find("Unlit/Color");
+
+                _burstMaterial = new Material(shader) { name = "ImpactBurst" };
+                return _burstMaterial;
+            }
+        }
+    }
+}

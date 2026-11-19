@@ -1,0 +1,1105 @@
+using System.Collections.Generic;
+using NUnit.Framework;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using TumbangPreso.InputLayer;
+using TumbangPreso.Settings;
+using TumbangPreso.UI;
+using UnityEngine;
+using UnityEngine.InputSystem;
+using UnityEngine.TestTools;
+
+namespace TumbangPreso.Tests
+{
+    /// <summary>
+    /// The input map's one rule, and the ability layer's round boundary.
+    ///
+    /// ⚠️⚠️ BOTH OF THESE ARE REGRESSION TESTS FOR FAULTS THAT SHIPPED, NOT SPECULATION. The
+    /// bindings carried four live collisions for weeks because nothing checked the asset, and
+    /// `HeroAbilitySystem.ResetKit` had zero call sites for its whole life, so ultimate charge
+    /// banked in the warm-up survived into round two. Neither is visible in a code review of the
+    /// file that contains it: one lives in a JSON asset and the other is an absence.
+    /// </summary>
+    public sealed class InputMapAndAbilityTests
+    {
+        [Test]
+        public void EveryRosterAbilityDeclaresItsNetworkDeliveryAndPassesTheBuildGate()
+        {
+            Assert.IsTrue(typeof(HeroAbility).GetProperty(nameof(HeroAbility.NetworkMode)).GetMethod.IsAbstract,
+                "A new ability must not silently inherit a default delivery mode.");
+            AbilityNetworking.ValidateRoster();
+            new EditorTools.AbilityNetworkingBuildCheck().OnPreprocessBuild(null);
+            foreach (var hero in Roster.HeroPeople)
+                foreach (var ability in HeroAbilitySystem.CreateKitFor(hero.Id).AllAbilities)
+                    Assert.AreEqual(ability.NetworkMode == AbilityNetworkMode.HostConfirmed,
+                        ability.DefersPredictedEffect, ability.Id);
+        }
+
+        [TestCase(AbilityNetworkMode.Unspecified, AbilityNetworkMode.SharedUltimate)]
+        [TestCase(AbilityNetworkMode.SharedUltimate, AbilityNetworkMode.SharedUltimate)]
+        [TestCase(AbilityNetworkMode.Predicted, AbilityNetworkMode.Predicted)]
+        [TestCase((AbilityNetworkMode)99, AbilityNetworkMode.SharedUltimate)]
+        public void InvalidAbilityDeliveryCannotEnterACheckedKit(AbilityNetworkMode first, AbilityNetworkMode ultimate)
+            => Assert.Throws<System.InvalidOperationException>(() =>
+                AbilityNetworking.Validate(new NetworkingProbeKit(first, ultimate)));
+
+        [Test]
+        public void DriftDeclaresThePortableCoreDurationForStrictCrossplayCompatibility()
+        {
+            float duration = new AmihanHeroKit().Skill1.Duration;
+            Assert.AreEqual(0x3ed07507, System.BitConverter.SingleToInt32Bits(duration));
+            Assert.AreEqual(AmihanRules.QuickDashHitSeconds, duration);
+        }
+
+        [Test]
+        public void SkillCompatibilityIgnoresCosmeticsLiveTimersAndCurrentRole()
+        {
+            var first = new NetworkingProbeKit(AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate,
+                presentation: "old art", roleKit: true);
+            var restyled = new NetworkingProbeKit(AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate,
+                presentation: "new art", roleKit: true);
+            string expected = Fingerprint(first);
+            Assert.AreEqual(64, expected.Length);
+            restyled.SetRole(true, null);
+            restyled.Skill1.Activate(null);
+            Assert.AreEqual(expected, Fingerprint(restyled));
+            var culture = System.Globalization.CultureInfo.CurrentCulture;
+            try
+            {
+                System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("fr-FR");
+                Assert.AreEqual(expected, Fingerprint(restyled), "Locale changed network compatibility.");
+            }
+            finally { System.Globalization.CultureInfo.CurrentCulture = culture; }
+        }
+
+        [Test]
+        public void SkillCompatibilityChangesWithRulesDeliveryIdentityAndSharedTiming()
+        {
+            var first = new NetworkingProbeKit(AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate);
+            string expected = Fingerprint(first);
+            Assert.AreNotEqual(expected, Fingerprint(new NetworkingProbeKit(
+                AbilityNetworkMode.HostConfirmed, AbilityNetworkMode.SharedUltimate)));
+            Assert.AreNotEqual(expected, Fingerprint(new NetworkingProbeKit(
+                AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate, cooldown: 2)));
+            Assert.AreNotEqual(expected, Fingerprint(new NetworkingProbeKit(
+                AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate, firstId: "new-skill")));
+            Assert.AreNotEqual(expected, Fingerprint(first, introductionSeconds: 5));
+        }
+
+        private static string Fingerprint(HeroKit kit, float introductionSeconds = 4)
+            => Net.SkillContractFingerprint.Compute(new[] { kit }, (_, held) => introductionSeconds + (held ? .5f : 0));
+
+        [Test]
+        public void PreparedRecoveryCapabilityAffectsCompatibilityWithoutEffectNames()
+        {
+            var ordinary = new NetworkingProbeKit(AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate);
+            var prepared = new NetworkingProbeKit(AbilityNetworkMode.Predicted, AbilityNetworkMode.SharedUltimate, preparedFirst: true);
+            Assert.IsInstanceOf<IPreparedWorldReplication>(prepared.Skill1);
+            Assert.AreNotEqual(Fingerprint(ordinary), Fingerprint(prepared));
+        }
+
+        private class NetworkingProbeAbility : HeroAbility
+        {
+            public override AbilityNetworkMode NetworkMode { get; }
+            public NetworkingProbeAbility(string id, AbilityNetworkMode mode, float cooldown = 1, string presentation = "")
+                : base(id, presentation, presentation, cooldown, castAction: presentation, viewmodelAction: presentation,
+                    castCue: presentation)
+                => NetworkMode = mode;
+        }
+
+        private sealed class PreparedProbeAbility : NetworkingProbeAbility, IPreparedWorldReplication
+        {
+            public PreparedProbeAbility(string id, AbilityNetworkMode mode, float cooldown, string presentation)
+                : base(id, mode, cooldown, presentation) { }
+            public bool CapturePreparedWorld(out Vector3 centre, out float preparation, out float remaining)
+            { centre = Vector3.zero; preparation = remaining = 0; return false; }
+            public bool RestorePreparedWorld(AbilityContext context, Vector3 centre, float preparation, float remaining) => false;
+        }
+
+        private sealed class NetworkingProbeKit : HeroKit
+        {
+            public NetworkingProbeKit(AbilityNetworkMode first, AbilityNetworkMode ultimate,
+                string presentation = "", float cooldown = 1, string firstId = "one", bool roleKit = false,
+                bool preparedFirst = false) : base("probe", "probe")
+            {
+                Skill1 = preparedFirst ? new PreparedProbeAbility(firstId, first, cooldown, presentation)
+                    : new NetworkingProbeAbility(firstId, first, cooldown, presentation);
+                Skill2 = new NetworkingProbeAbility("two", AbilityNetworkMode.Predicted, presentation: presentation);
+                if (roleKit)
+                {
+                    AttackingSkill = Skill2;
+                    DefendingSkill = new NetworkingProbeAbility("defending", AbilityNetworkMode.Predicted, presentation: presentation);
+                }
+                Ultimate = new NetworkingProbeAbility("ultimate", ultimate, presentation: presentation);
+            }
+        }
+
+        [Test]
+        public void TimedSnapshotsBindToTheirActualAbilitiesRatherThanTheLiveSecondSlot()
+        {
+            var dante = new DanteHeroKit();
+            var shield = dante.CaptureTimedKit();
+            Assert.AreSame(dante.Skill1, shield.PersonalAbility);
+            // The carapace lasts GeoRules.ShieldSeconds (15 s since f60eba049; it was 20 s when this was written).
+            Assert.IsTrue(shield.TryAge(GeoRules.ShieldSeconds - 2, 0, false, .25f, out var aged));
+            Assert.AreEqual(GeoRules.ShieldSeconds - 2.25f, aged.PersonalRemaining, .001f);
+            Assert.IsFalse(shield.TryAge(GeoRules.ShieldSeconds + 1, 0, false, 0, out _));
+            Assert.IsFalse(shield.TryAge(1, 1, false, 0, out _));
+            Assert.IsFalse(shield.TryAge(1, 0, true, 0, out _));
+            Assert.IsFalse(shield.TryAge(float.NaN, 0, false, 0, out _));
+            Assert.IsFalse(shield.TryAge(1, 0, false, float.PositiveInfinity, out _));
+
+            var sean = new SeanHeroKit();
+            sean.SetRole(true, null);
+            Assert.AreSame(sean.AttackingSkill, sean.CaptureTimedKit().PersonalAbility);
+            Assert.AreNotSame(sean.Skill2, sean.CaptureTimedKit().PersonalAbility);
+        }
+
+        [Test]
+        public void ZackTimedSnapshotCarriesOverclockIndependentlyOfTheRoleSlot()
+        {
+            // Zack: OVERCLOCKED's 25 s rides the passive fields beside a pending ultimate. Since 2026-10-26 the personal window
+            // is FULL THROTTLE's 3 s lock, bound to the attacking skill itself, never to whichever skill holds the live slot.
+            var zack = new ZackHeroKit();
+            zack.SetRole(true, null);
+            var overclock = zack.CaptureTimedKit();
+            Assert.AreSame(zack.AttackingSkill, overclock.PersonalAbility);
+            Assert.AreNotSame(zack.Skill2, overclock.PersonalAbility);
+            Assert.AreEqual(0f, overclock.PersonalRemaining);
+            Assert.IsTrue(overclock.TryAge(2.5f, 0, false, .5f, out var agedLock));
+            Assert.AreEqual(2f, agedLock.PersonalRemaining, .001f);
+            Assert.IsFalse(overclock.TryAge(ZackRules.FullThrottleSeconds + 1, 0, false, 0, out _), "A lock longer than 3 s is refused.");
+            Assert.AreSame(zack.Ultimate, overclock.UltimateAbility);
+            Assert.AreEqual(ZackRules.OverclockSeconds, overclock.PassiveCapacity);
+            Assert.IsTrue(overclock.TryAge(0, 0, true, 0, out _));
+            Assert.IsTrue(overclock.TryAge(0, 0, false, 2, out var agedOverclock, passive: 12));
+            Assert.AreEqual(10, agedOverclock.PassiveRemaining, .001f);
+            Assert.IsFalse(overclock.TryAge(0, 0, false, 0, out _, passive: 26), "More than 25 s of Overclocked is refused.");
+        }
+
+        private static InputActionAsset LoadActions()
+        {
+            var asset = Resources.Load<InputActionAsset>("TumbangPreso");
+            Assert.IsNotNull(asset, "no InputActionAsset at Resources/TumbangPreso");
+            return asset;
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ ONE CONTROL, ONE ACTION. `Rebinding.TryRebind` refuses a key another action
+        /// already holds and names the action holding it, so the shipped defaults were breaking
+        /// the rule the settings panel enforces on the player. Left click carried Throw AND
+        /// Grab, E carried Grab, Lunge AND Skill 1, Q carried Throw AND Skill 2. Whichever
+        /// consumer ran first won the press, which is why throw did not feel like it was on left
+        /// click even though it was bound there.
+        /// </summary>
+        [Test]
+        public void NoTwoActionsShareAControl()
+        {
+            var asset = LoadActions();
+
+            // ⚠️ THE PLAYER'S OWN OVERRIDES ARE NOT LOADED HERE, DELIBERATELY. This asserts the
+            // DEFAULTS are clean; a player who has rebound something is protected by TryRebind.
+            asset.RemoveAllBindingOverrides();
+
+            var clashes = Rebinding.FindDuplicateBindings(asset);
+
+            Assert.IsEmpty(clashes,
+                "two actions share a control in TumbangPreso.inputactions: " +
+                string.Join(" | ", clashes));
+        }
+
+        [Test]
+        public void EarlierGrabOverrideStillLoadsAfterDefaultMouseMappingChanges()
+        {
+            var asset = LoadActions();
+            asset.RemoveAllBindingOverrides();
+            const string saved = "{\"bindings\":[{\"action\":\"Player/Grab\",\"id\":\"6f1a2b30-0002-4000-8000-000000000005\",\"path\":\"<Keyboard>/g\",\"interactions\":null,\"processors\":null}]}";
+            asset.LoadBindingOverridesFromJson(saved);
+            var grab = asset.FindAction("Player/Grab");
+            Assert.AreEqual("<Keyboard>/g", grab.bindings[0].effectivePath);
+            Assert.AreEqual("<Mouse>/rightButton", grab.bindings[0].path, "Saved override replaced the new default.");
+            Assert.IsTrue(Rebinding.IsOneUseKey("Lunge", "ReadyUp"));
+        }
+
+        /// <summary>Every rebindable action has to actually exist, or the panel draws a dead row.</summary>
+        [Test]
+        public void EveryRebindableActionExists()
+        {
+            var asset = LoadActions();
+            var missing = new List<string>();
+
+            foreach (string action in Rebinding.RebindableActions)
+            {
+                string shown = Rebinding.DisplayNameFor(asset, action);
+                if (shown == "-") missing.Add(action);
+            }
+
+            Assert.IsEmpty(missing,
+                "listed as rebindable but not present in the asset: " + string.Join(", ", missing));
+        }
+
+        /// <summary>And every action in the asset has a row, or it is unrebindable in practice.</summary>
+        [Test]
+        public void EveryActionHasARebindRow()
+        {
+            var asset = LoadActions();
+            var map = asset.FindActionMap("Player", true);
+
+            var listed = new HashSet<string>(Rebinding.RebindableActions);
+            var orphans = new List<string>();
+
+            foreach (var action in map.actions)
+            {
+                if (action.name == "Move" && (listed.Contains("MoveForward") || listed.Contains("Move"))) continue;
+
+                // ⚠️⚠️ `Look` IS THE PAD'S RIGHT STICK AND HAS NO REBIND ROW BY DESIGN, WHICH IS
+                // THE SAME EXEMPTION `Move` TAKES ONE LINE UP AND FOR A STRONGER REASON. A rebind
+                // row captures ONE control and shows its name; a stick is a two-axis Value
+                // action, so the row would either capture one axis of it (leaving the other
+                // silently bound to the old stick) or display `2DVECTOR(MODE:2)`, which is
+                // literally the string `docs/TODO.md` § 18 records the tutorial teaching before
+                // `Hud.CompositeLabel` was written. 🧑: *"wtf is 2d vector modee?"*.
+                //
+                // ⚠️ THE SENSITIVITY SLIDER IS THE SETTING THAT COVERS IT. `CameraRig` scales all
+                // three devices through `MouseSensitivity`, so the thing a player actually wants
+                // to change about looking already has a row. Rebinding WHICH stick looks is not a
+                // request anybody has made, and it is why this is an exemption rather than a gap.
+                if (action.name == "Look") continue;
+
+                if (!listed.Contains(action.name)) orphans.Add(action.name);
+            }
+
+            Assert.IsEmpty(orphans,
+                "in the asset but missing from Rebinding.RebindableActions, so they have no " +
+                "row in the settings panel: " + string.Join(", ", orphans));
+        }
+
+        /// <summary>
+        /// ⚠️ THE ONE BINDING HE ASKED FOR BY NAME. 🧑 2026-08-23: *"i want throw to map to left
+        /// click as well, why is throw in soemwher eelse"*. It always was on left click; Grab
+        /// was on it too, which is why it did not behave like it. Asserted so a future pass
+        /// cannot quietly move it again.
+        /// </summary>
+        [Test]
+        public void ThrowIsOnLeftClickAndNothingElseIs()
+        {
+            var asset = LoadActions();
+            asset.RemoveAllBindingOverrides();
+
+            var map = asset.FindActionMap("Player", true);
+            var throwAction = map.FindAction("SpecialAbility", true);
+
+            bool onLeftClick = false;
+            foreach (var b in throwAction.bindings)
+                if (b.effectivePath == "<Mouse>/leftButton") onLeftClick = true;
+
+            Assert.IsTrue(onLeftClick, "SpecialAbility (throw / punch) is not bound to left click");
+
+            foreach (var action in map.actions)
+            {
+                if (action.name == "SpecialAbility") continue;
+
+                foreach (var b in action.bindings)
+                    Assert.AreNotEqual("<Mouse>/leftButton", b.effectivePath,
+                        $"{action.name} also holds left click, so it competes with the throw");
+            }
+        }
+
+        /// <summary>
+        /// The latest owner layout: Throw/Tag left click, Shove/Lunge middle click,
+        /// Retrieve/Reset right click, curve left wheel up and right wheel down,
+        /// Interact/Ready F, Signature E, Role Ability Q, Ultimate X, descriptions Tab.
+        /// </summary>
+        [Test]
+        public void TheDefaultsAreTheOwnersLayout()
+        {
+            var asset = LoadActions();
+            asset.RemoveAllBindingOverrides();
+            var map = asset.FindActionMap("Player", true);
+
+            string Key(string action) => map.FindAction(action, true).bindings[0].effectivePath;
+
+            Assert.AreEqual("<Keyboard>/leftShift", Key("Sprint"));
+            Assert.AreEqual("<Keyboard>/space", Key("Jump"));
+            Assert.AreEqual("<Mouse>/leftButton", Key("SpecialAbility"));
+            Assert.AreEqual("<Mouse>/middleButton", Key("Lunge"));
+            Assert.AreEqual("<Mouse>/scroll/up", Key("CurveLeft"));
+            Assert.AreEqual("<Mouse>/scroll/down", Key("CurveRight"));
+            Assert.AreEqual("<Mouse>/rightButton", Key("Grab"));
+            Assert.AreEqual("<Keyboard>/f", Key("Interact"));
+            Assert.AreEqual("<Keyboard>/e", Key("Skill1"), "the signature ability");
+            Assert.AreEqual("<Keyboard>/q", Key("Skill2"), "the attacking / defending ability");
+            Assert.AreEqual("<Keyboard>/x", Key("Ultimate"));
+            Assert.AreEqual("<Keyboard>/f1", Key("AbilityInfo"));
+            Assert.AreEqual("<Keyboard>/tab", Key("Scoreboard"));
+            Assert.AreEqual("<Keyboard>/t", Key("EmoteWheel"));
+        }
+
+        /// <summary>
+        /// ⚠⚠ EVERY REBINDABLE ACTION BELONGS TO EXACTLY ONE GROUP. The settings panel now
+        /// draws its rows by walking `Rebinding.Groups`, not `RebindableActions`, so an action
+        /// missing from every group vanishes from the screen with no error at all. That is the
+        /// same silent failure mode the `Rebinding` class note warns about for stale rows.
+        /// </summary>
+        [Test]
+        public void ActionsUseTheLatestMouseAndInteractionOrder()
+        {
+            var actions = System.Array.Find(Rebinding.Groups, g => g.Title == "ACTIONS").Actions;
+            CollectionAssert.AreEqual(new[] { "SpecialAbility", "Lunge", "Grab", "CurveLeft", "CurveRight", "Interact" }, actions);
+            Assert.AreEqual("Retrieve Slipper / Reset Can", Rebinding.LabelFor("Grab"));
+            Assert.AreEqual("Interact / Ready", Rebinding.LabelFor("Interact"));
+            Assert.AreEqual("Run", Rebinding.LabelFor("Sprint"));
+            Assert.AreEqual("Role Ability", Rebinding.LabelFor("Skill2"));
+            Assert.AreEqual("Ability Descriptions", Rebinding.LabelFor("AbilityInfo"));
+            CollectionAssert.DoesNotContain(System.Array.Find(Rebinding.Groups, g => g.Title == "INTERFACE").Actions, "ReadyUp");
+            Assert.AreEqual("Interact", Rebinding.SettingsRowFor("ReadyUp"));
+            Assert.IsTrue(System.Array.Exists(Rebinding.RebindableActions, a => a == "Interact"));
+            Assert.IsNotNull(LoadActions().FindActionMap("Player").FindAction("Interact"),
+                "Removing a settings row must not remove the existing gameplay action.");
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void InteractRebindingKeepsReadyReachableWithoutErasingAnIndependentSavedKey(bool independentReady)
+        {
+            const string store = "tumbangpreso.bindings";
+            bool hadSaved = PlayerPrefs.HasKey(store);
+            string originalSaved = PlayerPrefs.GetString(store, "");
+            var asset = InputActionAsset.FromJson(LoadActions().ToJson());
+            var keyboard = InputSystem.AddDevice<Keyboard>();
+            try
+            {
+                var interact = asset.FindAction("Player/Interact", true);
+                var ready = asset.FindAction("Player/ReadyUp", true);
+                if (independentReady) ready.ApplyBindingOverride(0, "<Keyboard>/f9");
+                string readyPad = Rebinding.PathFor(asset, "ReadyUp", InputDeviceKind.Gamepad);
+                string interactPad = Rebinding.PathFor(asset, "Interact", InputDeviceKind.Gamepad);
+                string expectedReady = independentReady ? "<Keyboard>/f9" : "<Keyboard>/f10";
+
+                Assert.IsNull(Rebinding.TryRebind(asset, "Interact", keyboard.f10Key));
+                Assert.AreEqual("<Keyboard>/f10", interact.bindings[0].effectivePath);
+                Assert.AreEqual(expectedReady, ready.bindings[0].effectivePath);
+                Assert.AreEqual(readyPad, Rebinding.PathFor(asset, "ReadyUp", InputDeviceKind.Gamepad));
+                Assert.AreEqual(interactPad, Rebinding.PathFor(asset, "Interact", InputDeviceKind.Gamepad));
+
+                // Restart from the shipped asset and the actual stored JSON.
+                asset.RemoveAllBindingOverrides();
+                Rebinding.Load(asset);
+                Assert.AreEqual("<Keyboard>/f10", interact.bindings[0].effectivePath);
+                Assert.AreEqual(expectedReady, ready.bindings[0].effectivePath);
+                Assert.IsNotNull(Rebinding.TryRebind(asset, "Interact", keyboard.spaceKey));
+                Assert.AreEqual("<Keyboard>/f10", interact.bindings[0].effectivePath);
+                Assert.AreEqual(expectedReady, ready.bindings[0].effectivePath);
+
+                Assert.IsNull(Rebinding.TryRebind(asset, "Interact", keyboard.f8Key));
+                Assert.AreEqual(independentReady ? "<Keyboard>/f9" : "<Keyboard>/f8", ready.bindings[0].effectivePath);
+            }
+            finally
+            {
+                InputSystem.RemoveDevice(keyboard); Object.DestroyImmediate(asset);
+                if (hadSaved) PlayerPrefs.SetString(store, originalSaved); else PlayerPrefs.DeleteKey(store);
+                PlayerPrefs.Save(); Rebinding.Invalidate();
+            }
+        }
+
+        [Test]
+        public void SettingsGroupsCoverEveryActionExactlyOnce()
+        {
+            var counted = new Dictionary<string, int>();
+
+            foreach (var group in Rebinding.Groups)
+            {
+                Assert.IsNotEmpty(group.Title, "a control group has no heading");
+
+                foreach (string action in group.Actions)
+                {
+                    counted.TryGetValue(action, out int n);
+                    counted[action] = n + 1;
+                }
+            }
+
+            var missing = new List<string>();
+            var twice = new List<string>();
+
+            foreach (string action in Rebinding.RebindableActions)
+            {
+                counted.TryGetValue(Rebinding.SettingsRowFor(action), out int n);
+                if (n == 0) missing.Add(action);
+                else if (n > 1) twice.Add(action);
+            }
+
+            Assert.IsEmpty(missing,
+                "rebindable but in no settings group, so it has no row on screen: " +
+                string.Join(", ", missing));
+            Assert.IsEmpty(twice, "listed in more than one group: " + string.Join(", ", twice));
+
+            var strays = new List<string>();
+            var listed = new HashSet<string>(Rebinding.RebindableActions);
+            foreach (var pair in counted)
+                if (!listed.Contains(pair.Key)) strays.Add(pair.Key);
+
+            Assert.IsEmpty(strays,
+                "in a settings group but not rebindable, so the row would be dead: " +
+                string.Join(", ", strays));
+        }
+
+        // ------------------------------------------------------------------ abilities
+
+        /// <summary>
+        /// ⚠️⚠️ THE BANK SURVIVES A ROUND BOUNDARY, ON INSTRUCTION. 🧑 2026-08-23: *"its okay
+        /// for ult progress to persist after round and into next rounds"*. An earlier pass
+        /// zeroed it here and that was wrong. What must NOT happen is charge accruing while the
+        /// round clock is stopped, which is `PracticeMode` below.
+        /// </summary>
+        [Test]
+        public void ResetForRoundKeepsUltimateCharge()
+        {
+            var kit = HeroAbilitySystem.CreateKitFor("cheska");
+
+            kit.AddUltimateCharge(HeroKit.UltimateMax * 0.6f);
+            float banked = kit.UltimateCharge;
+
+            kit.ResetForRound(null);
+
+            Assert.AreEqual(banked, kit.UltimateCharge, 0.0001f,
+                "the round boundary emptied the ultimate bank; it is meant to carry over");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ TWO KINDS OF "CHARGE" MEET AT ONE CALL AND THEY GO OPPOSITE WAYS. Since the
+        /// 2026-08-25 economy rework the word is overloaded, and the two behaviours are one line
+        /// apart inside `HeroKit.ResetForRound`, so a change aimed at either can silently take
+        /// the other with it. Nothing asserted them together until now.
+        ///
+        ///  * The **ultimate meter** is a RESOURCE earned across the whole match and it
+        ///    PERSISTS. 🧑 has asked for this twice: *"its okay for ult progress to persist
+        ///    after round and into next rounds"* (2026-08-23), and again on 2026-08-25 after the
+        ///    rework: *"i want ult charges to stay in between rounds ... Only ult tho"*.
+        ///  * A skill's **charges** are a PER-ROUND allowance and they REFILL, because his rule
+        ///    for those was *"charges ... that reset each round"*.
+        ///
+        /// ⚠️ THE "Only ult tho" IS THE HALF WORTH TESTING. Persisting the meter is easy to get
+        /// right by accident; persisting it *without* also carrying a spent barricade into the
+        /// next round is the part that needs pinning, and a test that only checked the meter
+        /// would have passed on a build where skills never refilled either.
+        /// </summary>
+        [Test]
+        public void UltimateChargePersistsButSkillChargesRefill()
+        {
+            var kit = HeroAbilitySystem.CreateKitFor("cheska");
+
+            var go = new GameObject("RoundBoundaryProbeMotor");
+
+            // Cheska's barricade spawns ice chips that self-destruct on a timer, and `Destroy`
+            // outside play mode logs an error the framework promotes to a failure. Same
+            // suppression and same reason as `ChargesComeBackOnPlayAndOnlyForTheSkillsThatShould`.
+            bool ignoring = LogAssert.ignoreFailingMessages;
+            LogAssert.ignoreFailingMessages = true;
+
+            try
+            {
+                var ctx = new AbilityContext(go.AddComponent<CharacterMotor>(), null, null);
+
+                // Bank most of an ultimate and spend the round's only barricade.
+                kit.AddUltimateCharge(kit.UltimateCost * 0.75f);
+                float banked = kit.UltimateCharge;
+
+                kit.Skill2.Activate(ctx);
+                Assert.AreEqual(0, kit.Skill2.ChargesRemaining, "the barricade did not spend");
+
+                kit.ResetForRound(ctx);
+
+                Assert.AreEqual(banked, kit.UltimateCharge, 0.0001f,
+                    "the round boundary emptied the ultimate meter. It is a match-long resource "
+                    + "and only ResetForMatch may clear it; see HeroKit.ResetForRound.");
+
+                Assert.AreEqual(kit.Skill2.MaxCharges, kit.Skill2.ChargesRemaining,
+                    "the barricade did not refill at the round boundary. Skill charges are a "
+                    + "per-round allowance and every round starts full.");
+
+                // ⚠️ AND THE MATCH BOUNDARY IS THE ONE THAT TAKES THE METER. Without this the
+                // test above is satisfied by a build that never clears the meter at all, which
+                // would carry an ultimate from one match into the next.
+                kit.ResetForMatch(ctx);
+                Assert.AreEqual(0.0f, kit.UltimateCharge, 0.0001f,
+                    "ultimate charge survived into a new match");
+            }
+            finally
+            {
+                LogAssert.ignoreFailingMessages = ignoring;
+                Object.DestroyImmediate(go);
+            }
+        }
+
+        /// <summary>A new match starts everybody at zero, whatever last match left behind.</summary>
+        [Test]
+        public void ResetForMatchClearsUltimateCharge()
+        {
+            var kit = HeroAbilitySystem.CreateKitFor("cheska");
+
+            kit.AddUltimateCharge(HeroKit.UltimateMax);
+            kit.ResetForMatch(null);
+
+            Assert.AreEqual(0.0f, kit.UltimateCharge, 0.0001f,
+                "ultimate charge survived into a new match");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ TIME PASSING EARNS NOTHING, IN OR OUT OF PRACTICE, AND THIS TEST USED TO ASSERT
+        /// THE OPPOSITE. It was written when charge trickled at `UltimatePassiveChargePerSecond`
+        /// 1.0/s and it checked the two halves of that: frozen in practice, resuming when live.
+        /// The first half was right. The second half was asserting a bug.
+        ///
+        /// At 1.0/s against a max of 100, a player who did NOTHING reached 90 of the 100 needed
+        /// in a 90 s round, so the meter was a 100 second clock and the objectives were a bonus
+        /// on top. `docs/VISION.md` § 4 lists **"Nothing may reward waiting"** as a competitive
+        /// requirement and names the ultimate charge in the same sentence, so the trickle was
+        /// against the mode's own rules the whole time it was passing this test.
+        ///
+        /// 🧑 2026-08-25: *"make it so that ult has to be charged and isnt cooldown gated"*.
+        /// The trickle is deleted, so both halves now assert zero and the test is named for what
+        /// it actually checks. `docs/Hero_Strike_Balance.md` § 2.1.
+        /// </summary>
+        [Test]
+        public void TimePassingEarnsNoUltimateCharge()
+        {
+            var kit = new ProbeKit { PracticeMode = true };
+
+            for (int i = 0; i < 120; i++) kit.Tick(null, 1.0f / 60.0f);
+
+            Assert.AreEqual(0.0f, kit.UltimateCharge, 0.0001f,
+                "charge accrued during practice, so warm-up time earns an ultimate");
+
+            // A whole 90 s round at 60 Hz, live, with the player doing nothing at all.
+            kit.PracticeMode = false;
+            for (int i = 0; i < 90 * 60; i++) kit.Tick(null, 1.0f / 60.0f);
+
+            Assert.AreEqual(0.0f, kit.UltimateCharge, 0.0001f,
+                "a full live round of standing still produced ultimate charge. Every point must "
+                + "be earned by an act: see Balance's note on why the passive trickle was "
+                + "deleted, and do not reintroduce one");
+        }
+
+        /// <summary>
+        /// Pin each adopted kit price, including the newer role kits. The former total order
+        /// placed Glacial Nova above Supernova; ABSOLUTE ZERO now costs 12 objectives.
+        /// </summary>
+        [Test]
+        public void UltimateCostsMatchTheCurrentNineHeroEconomy()
+        {
+            // Every ultimate costs its authored price plus the three objective points added on 2026-10-28.
+            float extra = Balance.UltimateExtraObjectivePoints;
+            var expected = new Dictionary<string, float>
+            {
+                ["dante"] = GeoRules.EarthquakeCost + extra,
+                ["cheska"] = CryoRules.AbsoluteZeroCost + extra,
+                ["sean"] = SeanRules.UltimateCost + extra,
+                ["zack"] = ZackRules.OverclockCost + extra,
+                ["nemu"] = 15.0f + extra,
+                ["phaister"] = VoodooRules.DollCost + extra,
+                ["rafi"] = RafiRules.BahaCost + extra,
+                ["amihan"] = AmihanRules.StormSurgeCost + extra,
+                ["paete"] = PaeteRules.SentryCost + extra,
+            };
+            Assert.AreEqual(Roster.HeroPeople.Count, expected.Count, "a hero has no cost contract");
+            float lowest = float.MaxValue;
+            foreach (var hero in Roster.HeroPeople)
+            {
+                Assert.IsTrue(expected.TryGetValue(hero.Id, out float cost), hero.Id + " has no cost contract");
+                float actual = HeroAbilitySystem.CreateKitFor(hero.Id).UltimateCost;
+                Assert.AreEqual(cost, actual, 0.001f, hero.Id + " has the wrong ultimate price");
+                Assert.That(actual, Is.InRange(Balance.UltimateChargeLataKnock * 10.0f,
+                                               Balance.UltimateChargeLataKnock * 20.0f));
+                lowest = Mathf.Min(lowest, actual);
+            }
+            Assert.GreaterOrEqual(lowest, Balance.UltimateChargeLegalThrow * 15.0f,
+                "the cheapest ultimate can be bought with throws, which are safe and free");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ AN ABILITY IS EITHER ON A COOLDOWN OR ON CHARGES, NEVER BOTH, AND NEVER NEITHER.
+        /// A charge ability carries `Cooldown` 0, so if one ever also acquired a cooldown the
+        /// deck would draw it as Cooling while it still had charges in hand, and if a cooldown
+        /// ability lost its cooldown it would be castable every frame with nothing to say so.
+        /// Both are silent failures in play and neither is visible in a review of the one file
+        /// that would cause it.
+        /// </summary>
+        [Test]
+        public void EveryShippedAbilityIsGatedByExactlyOneOfCooldownOrCharges()
+        {
+            var placeholders = new HashSet<string>();
+            foreach (var person in Roster.HeroPeople)
+            {
+                string hero = person.Id;
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+                Assert.IsTrue(kit.HasRoleAbilities, hero + " is missing a role ability");
+                foreach (var skill in kit.AllAbilities)
+                {
+                    Assert.NotNull(skill, hero + " is missing a skill");
+                    if (skill == kit.Ultimate) continue;
+                    if (skill is PlaceholderRoleAbility) placeholders.Add(skill.Id);
+
+                    if (skill.UsesCharges)
+                    {
+                        Assert.AreEqual(0.0f, skill.Cooldown, 0.0001f,
+                            $"{hero}/{skill.Id} has charges AND a {skill.Cooldown}s cooldown");
+                        Assert.AreEqual(skill.MaxCharges, skill.ChargesRemaining,
+                            $"{hero}/{skill.Id} does not start a round full");
+                    }
+                    else
+                    {
+                        Assert.Greater(skill.Cooldown, 0.0f,
+                            $"{hero}/{skill.Id} has neither cooldown nor charges");
+                        Assert.AreEqual(0, skill.MaxCharges,
+                            $"{hero}/{skill.Id} has a cooldown and a charge cap");
+                    }
+                }
+
+                // ⚠️ THE ULTIMATE IS GATED BY THE METER AND MUST NOT ALSO CARRY A COOLDOWN.
+                // Two gates on one power means a player who earned 150 points can still be told
+                // to wait, which is the refusal `docs/Hero_Strike_UI.md` § 6 has no answer for.
+                Assert.AreEqual(0.0f, kit.Ultimate.Cooldown, 0.0001f,
+                    hero + "'s ultimate carries a cooldown as well as a charge cost");
+                Assert.IsFalse(kit.Ultimate.UsesCharges,
+                    hero + "'s ultimate is on ability charges as well as the ultimate meter");
+            }
+            Assert.IsEmpty(placeholders, "Every current defending slot is implemented.");
+        }
+
+        /// <summary>
+        /// A charge returns only on its authored event, and never exceeds its cap.
+        /// </summary>
+        [Test]
+        public void ChargesComeBackOnPlayAndOnlyForTheSkillsThatShould()
+        {
+            var cheska = HeroAbilitySystem.CreateKitFor("cheska");
+            foreach (var skill in new[] { cheska.Skill1, cheska.AttackingSkill, cheska.DefendingSkill })
+            {
+                Assert.IsFalse(skill.UsesCharges, skill.Id + " still uses the retired ice charges");
+            }
+
+            // Sean left this list on 2026-10-24 (MOLTEN THROW is on a cooldown) and Zack on 2026-10-25 (FULL THROTTLE is 24 s):
+            // no attacking skill recharges on a knock any more. The loop stays for the next one that does.
+            Assert.IsFalse(HeroAbilitySystem.CreateKitFor("zack").AttackingSkill.UsesCharges);
+            foreach (string hero in new string[0])
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+                var skill = kit.AttackingSkill;
+                int cap = 1;
+                Assert.AreEqual(cap, skill.MaxCharges, hero + " has the wrong charge cap");
+                Assert.AreEqual(HeroAbility.Recharge.LataKnocked, skill.RechargedBy);
+                skill.ApplyNetworkSnapshot(0, 0);
+                kit.OnRechargeEvent(HeroAbility.Recharge.OwnSlipperRetrieved);
+                Assert.AreEqual(0, skill.ChargesRemaining, hero + " recharged off retrieval");
+                kit.OnRechargeEvent(HeroAbility.Recharge.LataKnocked);
+                Assert.AreEqual(1, skill.ChargesRemaining, hero + " did not regain one charge");
+                for (int i = 0; i < cap + 1; i++) kit.OnRechargeEvent(HeroAbility.Recharge.LataKnocked);
+                Assert.AreEqual(cap, skill.ChargesRemaining, hero + " exceeded its charge cap");
+            }
+
+            var rafi = HeroAbilitySystem.CreateKitFor("rafi");
+            foreach (var skill in new[] { rafi.Skill1, rafi.AttackingSkill })
+            {
+                // Rafi's skills moved from two charges to 35 s cooldowns on 2026-10-01 (ec644a4b9).
+                Assert.IsFalse(skill.UsesCharges, skill.Id + " is on cooldowns now, not charges");
+                Assert.AreEqual(HeroAbility.Recharge.Never, skill.RechargedBy);
+                skill.ApplyNetworkSnapshot(20, 0);
+                rafi.OnRechargeEvent(HeroAbility.Recharge.LataKnocked);
+                rafi.OnRechargeEvent(HeroAbility.Recharge.OwnSlipperRetrieved);
+                Assert.AreEqual(20, skill.CooldownRemaining, 0.001f, skill.Id + " recovered without its own event");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ NO POWER STARTS WHILE THE ROUND CLOCK IS STOPPED, AND THIS TEST USED TO ASSERT
+        /// THE OPPOSITE. It was `PracticeCastsAreFreeAndDoNotSpendTheBank`, and it held 🧑's
+        /// 2026-08-25 ask: *"BUt i want ppl to be able to test skills still and shit during
+        /// buffer period"*. That shipped, and what it produced was 🧑 2026-08-30: *"remove unli
+        /// skill before round bcz ppl fly out of map and shit"* — the warm-up is the one window
+        /// where bodies may walk with nothing refereeing, so an unlimited free ultimate is four
+        /// people being launched out of the arena before the round starts.
+        ///
+        /// ⚠️ THE HALF THAT SURVIVED IS THE BANK, and it is asserted here rather than deleted
+        /// with the rest: the warm-up must still neither earn an ultimate nor spend one, which
+        /// is the *"pause when the game isnt ongoing"* half of the original ask and the half
+        /// that never launched anybody. `HeroKit.PracticeMode` carries both quotes.
+        /// </summary>
+        [Test]
+        public void TheWarmUpRefusesEveryPowerAndLeavesTheBankAlone()
+        {
+            var kit = new ProbeKit { PracticeMode = true };
+            kit.AddUltimateCharge(HeroKit.UltimateMax);
+            float banked = kit.UltimateCharge;
+
+            Assert.IsFalse(kit.IsUltimateReady,
+                "the ultimate tile reported ready while the round clock was stopped, so the HUD "
+                + "is inviting a press the rules now refuse");
+
+            Assert.AreEqual(HeroKit.CastOutcome.NotYet, kit.CastUltimate(null),
+                "a full meter cast an ultimate during the warm-up");
+            // A skill cast with no body is refused as CannotAct before the warm-up gate since 2026-10-01 (9803a3c93),
+            // so the skills are cast by a body that can act and the warm-up is the only thing refusing them.
+            var body = new GameObject("WarmUpProbeMotor");
+            try
+            {
+                var ctx = new AbilityContext(body.AddComponent<CharacterMotor>(), null, null);
+                Assert.AreEqual(HeroKit.CastOutcome.NotYet, kit.CastSkill1(ctx),
+                    "a skill cast during the warm-up");
+                Assert.AreEqual(HeroKit.CastOutcome.NotYet, kit.CastSkill2(ctx),
+                    "a skill cast during the warm-up");
+            }
+            finally { Object.DestroyImmediate(body); }
+
+            Assert.AreEqual(banked, kit.UltimateCharge, 0.0001f,
+                "the warm-up spent the banked charge, so carrying an ultimate across a round "
+                + "boundary now costs the player the ultimate they carried");
+
+            // ⚠️ AND THE SAME KIT CASTS THE MOMENT THE CLOCK STARTS. Without this the test
+            // passes just as well against an ability that is broken outright.
+            kit.PracticeMode = false;
+            Assert.IsTrue(kit.IsUltimateReady, "a full meter was not ready in a live round");
+            Assert.AreEqual(HeroKit.CastOutcome.Cast, kit.CastUltimate(null),
+                "the round went live and the ultimate was still refused");
+        }
+
+        /// <summary>And once the round is live it costs the meter, exactly as before.</summary>
+        [Test]
+        public void LiveCastsSpendTheBank()
+        {
+            var kit = new ProbeKit { PracticeMode = false };
+            kit.AddUltimateCharge(HeroKit.UltimateMax);
+
+            Assert.IsTrue(kit.TryActivateUltimate(null), "a fully charged ultimate was refused");
+            Assert.AreEqual(0.0f, kit.UltimateCharge, 0.0001f,
+                "a live cast did not spend the meter");
+        }
+
+        /// <summary>An empty meter refuses outside practice, or the economy means nothing.</summary>
+        [Test]
+        public void AnEmptyMeterRefusesOutsidePractice()
+        {
+            var kit = new ProbeKit { PracticeMode = false };
+
+            Assert.IsFalse(kit.IsUltimateReady, "an empty meter reported ready");
+            Assert.IsFalse(kit.TryActivateUltimate(null), "an empty meter cast anyway");
+        }
+
+        /// <summary>
+        /// A stand-in ability, so the round-boundary contract can be tested without a live
+        /// arena.
+        ///
+        /// ⚠️ THE REAL KITS CANNOT BE ACTIVATED IN AN EDITMODE TEST. Their `OnActivate`
+        /// spawns hazards, plays audio and reads `ctx.Motor`, none of which exist outside a
+        /// running match. What is being tested here is the BASE CLASS contract every one of
+        /// them inherits, and this exercises exactly that.
+        /// </summary>
+        private sealed class ProbeAbility : HeroAbility
+        {
+            public override AbilityNetworkMode NetworkMode => AbilityNetworkMode.Predicted;
+            public bool EndRan;
+
+            public ProbeAbility() : base("probe", "PROBE", "A stand-in.", 5.0f, 3.0f,
+                                         AbilityGlyph.Burst)
+            {
+            }
+
+            protected override void OnEnd(AbilityContext ctx) => EndRan = true;
+
+            /// <summary>
+            /// ⚠️ THE BASE CHECK NEEDS A LIVE MOTOR AND THERE ISN'T ONE IN AN EDITMODE TEST.
+            /// `HeroAbility.CanActivate` refuses a null context and asks `Motor.CanAct()`, both
+            /// of which are about the WORLD. What is under test here is the kit's own economy,
+            /// so this keeps the only part of the check that belongs to the ability itself.
+            /// </summary>
+            public override bool CanActivate(AbilityContext ctx) => IsReady;
+        }
+
+        private sealed class ProbeKit : HeroKit
+        {
+            public ProbeKit() : base("probe", "PROBE")
+            {
+                Skill1 = new ProbeAbility();
+                Skill2 = new ProbeAbility();
+                Ultimate = new ProbeAbility();
+            }
+        }
+
+        /// <summary>A round boundary clears cooldowns too, or round two opens on round one's timers.</summary>
+        [Test]
+        public void ResetForRoundClearsCooldowns()
+        {
+            var kit = new ProbeKit();
+
+            kit.Skill1.Activate(null);
+            kit.Skill2.Activate(null);
+
+            Assert.IsFalse(kit.Skill1.IsReady, "the harness failed to put skill 1 on cooldown");
+            Assert.IsTrue(kit.Skill1.IsActive, "the harness failed to make skill 1 active");
+
+            kit.ResetForRound(null);
+
+            Assert.IsTrue(kit.Skill1.IsReady, "skill 1 is still cooling after a reset");
+            Assert.IsTrue(kit.Skill2.IsReady, "skill 2 is still cooling after a reset");
+            Assert.IsFalse(kit.Skill1.IsActive, "skill 1 is still running after a reset");
+            Assert.IsFalse(kit.Skill2.IsActive, "skill 2 is still running after a reset");
+        }
+
+        /// <summary>
+        /// ⚠⚠ AN ACTIVE ABILITY IS ENDED, NOT DROPPED, AND THE DIFFERENCE IS A PERMANENT
+        /// BUFF. Demonic Carapace grants stun immunity in `OnActivate` and takes it back in
+        /// `OnEnd`; Phantom Phase does the same for tag immunity. Zeroing the timer behind their
+        /// backs at a round boundary would leave the grant switched on with no timer left to
+        /// switch it off, so a hero mid-Carapace when the round ended would open the next one
+        /// permanently unstunnable.
+        /// </summary>
+        [Test]
+        public void ResetForRoundEndsAnActiveAbilityCleanly()
+        {
+            var kit = new ProbeKit();
+            var skill = (ProbeAbility)kit.Skill1;
+
+            skill.Activate(null);
+            Assert.IsFalse(skill.EndRan, "the harness ended the ability before the reset");
+
+            kit.ResetForRound(null);
+
+            Assert.IsTrue(skill.EndRan,
+                "ResetForRound dropped an active ability without running OnEnd, which leaks " +
+                "whatever that ability had granted");
+        }
+
+        /// <summary>
+        /// ⚠️ EVERY ABILITY NEEDS AN ICON AND A SENTENCE, because character select and the
+        /// hold-to-read panel both draw them and a blank tile is worse than no tile. This is
+        /// what stops a new hero from shipping with three empty slots.
+        /// </summary>
+        [Test]
+        public void EveryAbilityIsPresentable()
+        {
+            foreach (string heroId in new[] { "cheska", "dante", "nemu", "sean", "zack" })
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(heroId);
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    Assert.IsNotNull(ability, $"{heroId} is missing an ability");
+                    Assert.IsNotEmpty(ability.Name, $"{heroId}: an ability has no name");
+                    Assert.IsNotEmpty(ability.Description,
+                        $"{heroId}: {ability.Name} has no description, so the inspect panel " +
+                        "and character select would both draw an empty row");
+                    Assert.IsNotNull(AbilityIcons.For(ability.Glyph),
+                        $"{heroId}: {ability.Name} has no icon");
+                    Assert.IsNotEmpty(AbilityIcons.LabelFor(ability.Glyph),
+                        $"{heroId}: {ability.Name}'s glyph has no label");
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ audio
+
+        /// <summary>
+        /// ⚠⚠ THE ANNOUNCEMENTS DUCK THE BED AND THE IMPACTS DO NOT. `audio_manager.gd` 4.6
+        /// hooks the duck at the play path so no other file has to know the music exists; the
+        /// value of the table is entirely that the countdown, the round end and the score award
+        /// do not each have to remember. A cue quietly dropping out of it is silent: the mix
+        /// just gets muddier under the one moment that carries information.
+        /// </summary>
+        [Test]
+        public void TheAnnouncementCuesDuckTheMusicBed()
+        {
+            foreach (string cue in new[] { "countdown_tick", "countdown_go", "round_end",
+                                           "match_win", "round_lose", "score_award" })
+                Assert.IsTrue(Audio.AudioCues.DucksMusic(cue),
+                    $"'{cue}' no longer ducks the bed, so it plays over the top of it");
+
+            // An impact ducks through `PlayImpact` by its own tiny amount scaled to the hit.
+            // Putting it in this table as well would stack two ducks on one sound.
+            foreach (string cue in new[] { "slipper_land", "bump_swing", "sfx_ice_freeze" })
+                Assert.IsFalse(Audio.AudioCues.DucksMusic(cue),
+                    $"'{cue}' is an impact and should not take the announcement duck as well");
+        }
+
+        /// <summary>
+        /// ⚠️ THE MIX LEVEL OF A CUE IS ITS TRIM PLUS THE HEADROOM, AND THE TRIM CANNOT PUSH
+        /// A CUE UP. The SFX bus was measured clipping at +2.0 dBFS with the music silent; the
+        /// headroom is what stops a busy fight repeating that, and a positive trim would be a
+        /// route around it rather than an expression inside it.
+        /// </summary>
+        [Test]
+        public void NoCueTrimCanRaiseACueAboveTheHeadroom()
+        {
+            foreach (var pair in Audio.AudioCues.TrimDb)
+                Assert.LessOrEqual(Audio.AudioCues.TrimFor(pair.Key), Audio.AudioCues.HeadroomDb,
+                    $"'{pair.Key}' is trimmed above the mix headroom");
+
+            Assert.AreEqual(Audio.AudioCues.HeadroomDb, Audio.AudioCues.TrimFor("no_such_cue"),
+                            0.0001f, "an untrimmed cue should sit exactly at the headroom");
+        }
+
+        /// <summary>
+        /// ⚠⚠ THE LIFT IS THE STAND-IN FOR A PRESSURE TRACK THAT HAS NOT BEEN DELIVERED. The
+        /// Godot original says so and says what replaces it. If the numbers drift, the last
+        /// fifteen seconds of a round stop reading as the round tightening, which is the only
+        /// thing this exists to do.
+        /// </summary>
+        [Test]
+        public void TheIntensityLiftIsAModestRampNearTheEndOfARound()
+        {
+            Assert.Greater(Audio.MusicDirector.LiftDb, 0.0f, "a lift that does not lift");
+            Assert.LessOrEqual(Audio.MusicDirector.LiftDb, 6.0f,
+                "more than 6 dB on the same bed reads as a mistake in the mix rather than as " +
+                "pressure");
+
+            Assert.Greater(Audio.MusicDirector.LiftSecondsLeft, 0.0f);
+            Assert.Less(Audio.MusicDirector.LiftSecondsLeft, Core.Balance.RoundTime,
+                "the lift would be on for the whole round, which is not a lift");
+            Assert.Greater(Audio.MusicDirector.PressureSecondsLeft,
+                           Audio.MusicDirector.LiftSecondsLeft,
+                "pressure should build before the final lift reaches its decisive band");
+            Assert.Less(Audio.MusicDirector.PressureSecondsLeft, Core.Balance.RoundTime,
+                "pressure cannot be active for the whole round");
+
+            Assert.Greater(Audio.MusicDirector.LiftTime, 0.0f,
+                "an instant jump on one frame reads as a mix error");
+            Assert.Less(Audio.MusicDirector.LiftTime, Audio.MusicDirector.LiftSecondsLeft,
+                "the ramp must finish well before the clock does");
+        }
+
+        // ------------------------------------------------------------------ hazard steering
+
+        /// <summary>
+        /// ⚠️⚠️ THE BOTS USED TO WALK STRAIGHT THROUGH HERO HAZARDS, and it cost real points:
+        /// `BotBehaviourProbe` measured Hero Strike unretrieved-slipper penalties swinging from
+        /// 0 to 28 across identical runs while Classic sat at a flat 0. A hazard landing between
+        /// an attacker and its tsinelas is the whole variance.
+        /// </summary>
+        [Test]
+        public void HazardOnThePathIsFoundAndSteeredAround()
+        {
+            HazardMap.Clear();
+
+            var go = new GameObject("TestHazard");
+            try
+            {
+                go.transform.position = new Vector3(0.0f, 0.0f, 5.0f);
+                HazardVolume.Attach(go, 2.0f, ownerSlot: 3);
+
+                Vector3 from = Vector3.zero;
+                Vector3 to = new Vector3(0.0f, 0.0f, 10.0f);
+
+                Assert.IsTrue(HazardMap.TryFindBlocker(from, to, mySlot: 1, bodyRadius: 0.5f,
+                                                       maxRadius: AiTuning.HazardAvoidMaxRadius,
+                                                       out var blocker),
+                    "a hazard sitting on the straight line was not reported as a blocker");
+
+                Vector3 steer = HazardMap.SteerAround(from, to, blocker, 0.5f);
+
+                Assert.Greater(Mathf.Abs(steer.x), 0.05f,
+                    "the steer did not move sideways, so it still walks into the hazard");
+
+                // ⚠️ AND IT STILL MAKES PROGRESS. Steering ninety degrees off would clear the
+                // hazard and never arrive; the tangent has to keep most of its forward component.
+                Assert.Greater(steer.z, 0.0f,
+                    "the steer points away from the goal instead of around the hazard");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                HazardMap.Clear();
+            }
+        }
+
+        /// <summary>Your own trail sits under your own feet by design. Avoiding it is a bug.</summary>
+        [Test]
+        public void YourOwnHazardIsNotAvoided()
+        {
+            HazardMap.Clear();
+
+            var go = new GameObject("TestHazard");
+            try
+            {
+                go.transform.position = new Vector3(0.0f, 0.0f, 5.0f);
+                HazardVolume.Attach(go, 2.0f, ownerSlot: 1);
+
+                Assert.IsFalse(HazardMap.TryFindBlocker(Vector3.zero, new Vector3(0, 0, 10),
+                                                        mySlot: 1, bodyRadius: 0.5f,
+                                                        maxRadius: AiTuning.HazardAvoidMaxRadius,
+                                                        out _),
+                    "a hero was told to walk around its own trail");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                HazardMap.Clear();
+            }
+        }
+
+        /// <summary>A hazard behind you is not a reason to turn.</summary>
+        [Test]
+        public void HazardBehindIsIgnored()
+        {
+            HazardMap.Clear();
+
+            var go = new GameObject("TestHazard");
+            try
+            {
+                go.transform.position = new Vector3(0.0f, 0.0f, -5.0f);
+                HazardVolume.Attach(go, 2.0f, ownerSlot: -1);
+
+                Assert.IsFalse(HazardMap.TryFindBlocker(Vector3.zero, new Vector3(0, 0, 10),
+                                                        mySlot: 1, bodyRadius: 0.5f,
+                                                        maxRadius: AiTuning.HazardAvoidMaxRadius,
+                                                        out _),
+                    "a hazard behind the body was treated as a blocker");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                HazardMap.Clear();
+            }
+        }
+
+        /// <summary>The give-up distance exists so a slipper inside a hazard is still fetched.</summary>
+        [Test]
+        public void GiveUpDistanceIsShorterThanTheAvoidMargin()
+        {
+            Assert.Greater(AiTuning.HazardAvoidGiveUp, AiTuning.HazardAvoidMargin,
+                "a bot that gives up before it has cleared its own margin would never " +
+                "avoid anything at all");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ AN ARENA-SIZED HAZARD IS WALKED THROUGH, and this test is the tripwire on the
+        /// ability footprints. Turning avoidance on without this cap took Hero Strike from
+        /// 78-97 throws a match down to 17, because a disc covering most of a 14 by 14 box has
+        /// no way round it and the bots walked the perimeter instead of playing.
+        ///
+        /// ⚠️ WHEN `docs/TODO.md` § 1 LANDS AND THE FOOTPRINTS COME DOWN, this stops being a
+        /// special case on its own. Do not raise the cap to "fix" it; shrink the ability.
+        /// </summary>
+        [Test]
+        public void AnArenaSizedHazardIsNotAvoided()
+        {
+            HazardMap.Clear();
+
+            var go = new GameObject("TestHazard");
+            try
+            {
+                go.transform.position = new Vector3(0.0f, 0.0f, 5.0f);
+                HazardVolume.Attach(go, 7.5f, ownerSlot: -1);   // Nemu's Seance Void, as shipped
+
+                Assert.IsFalse(HazardMap.TryFindBlocker(Vector3.zero, new Vector3(0, 0, 10),
+                                                        mySlot: 1, bodyRadius: 0.5f,
+                                                        maxRadius: AiTuning.HazardAvoidMaxRadius,
+                                                        out _),
+                    "a hazard wider than the cap was treated as avoidable, which strands the " +
+                    "bots on the perimeter");
+            }
+            finally
+            {
+                Object.DestroyImmediate(go);
+                HazardMap.Clear();
+            }
+        }
+    }
+}

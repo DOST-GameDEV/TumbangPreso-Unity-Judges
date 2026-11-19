@@ -1,0 +1,525 @@
+using TumbangPreso.Core;
+using TumbangPreso.Visual;
+using UnityEngine;
+
+namespace TumbangPreso
+{
+    /// <summary>
+    /// The LRT-2 consist crossing the guideway over Ilalim ng Tulay, and the map's metronome.
+    ///
+    /// ⚠️⚠️ THIS IS A MECHANIC, NOT A BACKDROP ANIMATION. It shipped as a model sliding along Z
+    /// with one whoosh, which is a screensaver: nothing on the street changed while it passed
+    /// and no decision was different for having seen it. A map's one recurring event is the
+    /// cheapest depth there is, because every player learns its period inside a single round
+    /// and can then plan against it.
+    ///
+    /// What it does now, in three phases:
+    ///
+    ///   WARNING  (3.0 s)  approach state and the shadow sweeping in from the south
+    ///   OVERHEAD (2.7 s)  the pass itself
+    ///   idle     (rest)   back to `Interval`
+    ///
+    /// ⚠️ THE SOUND IS ONE FIELD RECORDING ON A MOVING SOURCE, and it starts when the consist
+    /// spawns rather than at the warning, because the recording carries its own approach. It
+    /// used to be three synthesised cues. See § THE PASS.
+    ///
+    /// ⚠️⚠️ AND THE TWO MODES ANSWER IT DIFFERENTLY. See `OverheadPassWindow`: Hero Strike gets
+    /// double cooldown rate while the consist is over the street. Classic keeps
+    /// the passing train and its sound. Classic does not
+    /// receive powers, from a hero kit or from a map.
+    /// </summary>
+    public sealed class LrtTrainFlyby : MonoBehaviour
+    {
+        [Header("Train Movement Settings")]
+        /// <summary>
+        /// ⚠️⚠️ 300, AND IT HAS BEEN RAISED THREE TIMES ON THE SAME COMPLAINT. It shipped at 24,
+        /// went to 78 and then 150 on *"i want train to play rarely / like maybe when they open
+        /// the game"*, and reaches 300 on 🧑 2026-08-27: *"make it play very rarely"*. At 24 s a
+        /// 90 s round carried three or four passes, so the map's signature event was arriving
+        /// every twenty seconds and had stopped being an event. At 300 a Classic match (4 x 90 s)
+        /// sees the opener and about one more; a Hero Strike match (8 x 90 s) sees the opener and
+        /// two.
+        ///
+        /// ⚠️ IT IS STILL LEARNABLE, WHICH IS THE PROPERTY THIS FILE'S HEADER PROTECTS: "every
+        /// player learns its period inside a single round". `InitialDelay` below is what keeps
+        /// that true at any interval: the FIRST pass is what teaches the map has one.
+        ///
+        /// ⚠️ AND IT IS A BALANCE CHANGE, NOT ONLY A MOOD ONE. `OverheadPassWindow` gives Hero
+        /// Strike double cooldown rate while the consist is overhead, so this cuts the number of
+        /// overclock windows in a whole match to two or three. `docs/TODO.md` section 5 already
+        /// records that the overclock window has never been measured against a match; this makes
+        /// measuring it more urgent rather than less.
+        /// </summary>
+        [Tooltip("Seconds between train passes.")]
+        public float Interval = 300.0f;
+
+        /// <summary>
+        /// ⚠️ THE FIRST PASS COMES EARLY ON PURPOSE, which is the other half of *"like maybe
+        /// when they open the game"*. A rare event that a player might never see in their first
+        /// match is not a rare event, it is a missing one. Opening with a pass teaches the map
+        /// has one; `Interval` then makes it something you wait for rather than something you
+        /// tune out.
+        /// </summary>
+        [Tooltip("Initial delay before the first train pass.")]
+        public float InitialDelay = 20.0f;
+
+        [Tooltip("Speed of the train crossing the viaduct (m/s).")]
+        public float Speed = 18.0f;
+
+        [Tooltip("Start Z position of the train.")]
+        public float StartZ = -48.0f;
+
+        [Tooltip("End Z position where the train disappears.")]
+        public float EndZ = 48.0f;
+
+        [Tooltip("Track X offset. Measured from the dual-track guideway centre.")]
+        public float TrackX = -2.35f;
+
+        [Tooltip("Train root Y. Unity normalises the imported prefab root to its wheel underside.")]
+        public float TrackY = 9.190f;
+
+        /// <summary>
+        /// How far down the street the consist counts as "overhead".
+        ///
+        /// ⚠️ MEASURED FROM THE PLAY AREA, NOT PICKED. The walls stand at z = +/-16.5 and the
+        /// chalk box ends at +/-7.0. A window keyed to the train origin lasted only 1.83 s at
+        /// 18 m/s and closed while half the consist was still above the street. This half-range
+        /// is wall half-length 16.5 plus consist half-length 7.8. The full window is therefore
+        /// `(33.0 + 15.6) / 18 = 2.70 s`, from nose entering to tail leaving.
+        /// </summary>
+        public float OverheadHalfZ = 24.3f;
+
+        /// <summary>Seconds of warning before the consist reaches the overhead window.</summary>
+        public float WarningLead = 3.0f;
+
+        /// <summary>
+        /// STATION TO STATION (owner, 2026-10-04, from a jump pad: "make it so the train actually
+        /// comes from pedro gil station going to UN. when its not moving its just in the middle
+        /// of the track"). Off, the consist runs `StartZ` to `EndZ` and is put back at `StartZ`,
+        /// which on the rebuilt Ilalim left it parked on the open viaduct. On, `StartZ` and `EndZ`
+        /// are the two STATIONS: it waits inside one, eases out, crosses the court, brakes into
+        /// the other, waits there, and comes back on the other track, so it is never parked or
+        /// moved in sight. `_currentZ` is then the distance along the run and the world z is
+        /// `_dir * _currentZ`; trains keep right, so the run toward +z is on x = +|TrackX|.
+        /// </summary>
+        public bool Shuttle;
+
+        /// <summary>Metres over which a shuttle run gathers speed out of a station and sheds it
+        /// into the next.</summary>
+        public float StationEase = 45.0f;
+
+        /// <summary>Half-length of the stretch round the court where the pass sounds. 48 keeps
+        /// the recording's arithmetic (§ THE PASS): its peak lands with the consist overhead.</summary>
+        public float SoundHalfZ = 48.0f;
+
+        /// <summary>
+        /// Where the line is in the world. Zero, the viaduct runs through the origin, over the
+        /// court, as on the first Ilalim. The rebuilt map's court is in the lot beside Taft
+        /// (owner, 2026-10-04: "can we move the play area to this open space?") and the world was
+        /// moved to put it at the origin, so there the line's centreline is x = `CentreX` and the
+        /// midpoint between its two stations is z = `CentreZ`. The pass's windows (warning,
+        /// overhead, sound) stay centred on the COURT, world z = 0: the consist is "passing" when
+        /// it is level with the players, wherever its stations are.
+        /// </summary>
+        public float CentreX, CentreZ;
+
+        /// <summary>
+        /// THE CONSIST IS A BODY (owner, 2026-10-04: "the cars are just pass through, even the
+        /// train"). With jump pads on the pavements a player can land on the deck, and the consist
+        /// went through them. On, it carries a kinematic box (`SolidSize`, about its rail-head
+        /// origin), so it can be stood against when it waits in a station, and while it RUNS it
+        /// fells and throws whoever it reaches, as a car does on the live road (`KantoTraffic`):
+        /// resolved once by the host, the throw through the existing impact RPC.
+        /// </summary>
+        public bool Solid;
+
+        /// <summary>The consist's box: width, height over the rail head, length. LRT-1's car body
+        /// is 2.5 m wide and stands about 3.6 m over the rail; the consist is 15.6 m.</summary>
+        public Vector3 SolidSize = new Vector3(2.6f, 3.6f, 15.6f);
+
+        /// <summary>The throw: along the line, and up. A train, so harder than a car's 14.</summary>
+        public float HitThrow = 26.0f, HitLift = 13.0f, HitTrip = 3.0f;
+
+        private readonly System.Collections.Generic.Dictionary<CharacterMotor, float> _nextHit =
+            new System.Collections.Generic.Dictionary<CharacterMotor, float>();
+
+        private void BuildSolid()
+        {
+            if (!Solid || !Application.isPlaying) return;
+            var body = gameObject.AddComponent<Rigidbody>();
+            body.isKinematic = true; body.useGravity = false;
+            var box = gameObject.AddComponent<BoxCollider>();
+            box.center = new Vector3(0.0f, SolidSize.y * 0.5f, 0.0f);
+            box.size = SolidSize;
+        }
+
+        private void HitPlayers(float speed)
+        {
+            if (!Solid || speed < 2.0f || !NetAuthority.ShouldResolve()) return;
+            var round = GameServices.Round;
+            var players = round != null ? round.Players : null;
+            if (players == null) return;
+            Vector3 forward = transform.forward, right = transform.right, at = transform.position;
+            for (int k = 0; k < players.Count; k++)
+            {
+                var who = players[k];
+                if (who == null || !who.isActiveAndEnabled) continue;
+                Vector3 d = who.transform.position - at;
+                if (d.y < -1.5f || d.y > SolidSize.y) continue;
+                if (Mathf.Abs(Vector3.Dot(d, forward)) > SolidSize.z * 0.5f + 0.5f) continue;
+                float side = Vector3.Dot(d, right);
+                if (Mathf.Abs(side) > SolidSize.x * 0.5f + 0.5f) continue;
+                if (_nextHit.TryGetValue(who, out float next) && Time.time < next) continue;
+                if (who.IsTripImmune) continue;
+                _nextHit[who] = Time.time + 2.0f;
+                who.ApplyTrip(HitTrip);
+                if (!who.IsTripped) continue;
+                who.ApplyResolvedImpact(CharacterMotor.AsLaunch(forward * HitThrow + right * (side >= 0.0f ? 6.0f : -6.0f) + Vector3.up * HitLift));
+                Visual.WindTumble.Attach(who)?.Throw(HitTrip);
+                NetCue.PlayVaried("hit_body", who.transform.position, 0.6f, 0.75f, 1.0f);
+                ImpactBurst.SpawnAt(who.transform.position);
+            }
+        }
+
+        private int _dir = 1;
+        private float RunX => CentreX + (Shuttle ? _dir * Mathf.Abs(TrackX) : TrackX);
+        private Vector3 RunPosition(float along) => new Vector3(RunX, TrackY, CentreZ + (Shuttle ? _dir * along : along));
+
+        /// <summary>The run coordinate measured from the court: zero when the consist is level
+        /// with world z = 0, negative before it gets there.</summary>
+        private float FromCourt(float along) => along + (Shuttle ? _dir : 1) * CentreZ;
+
+        private void Place(float along)
+        {
+            transform.position = RunPosition(along);
+            if (Shuttle) transform.rotation = Quaternion.Euler(0.0f, _dir > 0 ? 0.0f : 180.0f, 0.0f);
+        }
+
+        private float _timer;
+        private bool _isRunning;
+        private float _currentZ;
+        private bool _whooshPlayed;
+        private bool _warned;
+        private bool _windowOpen;
+
+        private void Start()
+        {
+            _timer = Interval - InitialDelay;
+            _isRunning = false;
+            Place(StartZ);
+            BuildSolid();
+            OverheadPassWindow.Clear();
+        }
+
+        // ⚠️ THE WINDOW IS A STATIC AND THIS IS THE ONLY THING THAT WRITES IT. Leaving a 2x
+        // cooldown rate behind on the way out would follow the player into the next match on a
+        // different map, where nothing would ever put it back.
+        private void OnDisable() => OverheadPassWindow.Clear();
+        private void OnDestroy()
+        {
+            OverheadPassWindow.Clear();
+        }
+
+        private void Update()
+        {
+            if (!_isRunning)
+            {
+                _timer += Time.deltaTime;
+                if (_timer < Interval) return;
+
+                _timer = 0.0f;
+                _isRunning = true;
+                _currentZ = StartZ;
+                _whooshPlayed = false;
+                _warned = false;
+                _windowOpen = false;
+                return;
+            }
+
+            float speed = Speed;
+            if (Shuttle)
+            {
+                // Out of one station and into the next: a quarter speed at the platform, full
+                // speed `StationEase` metres out. Never zero, or it would not leave.
+                float fromEnds = Mathf.Min(_currentZ - StartZ, EndZ - _currentZ);
+                speed *= Mathf.Lerp(0.25f, 1.0f, Mathf.Clamp01(fromEnds / Mathf.Max(1.0f, StationEase)));
+            }
+            _currentZ += speed * Time.deltaTime;
+            Place(_currentZ);
+            HitPlayers(speed);
+
+            float warnAt = -OverheadHalfZ - Speed * WarningLead;
+
+            float court = FromCourt(_currentZ);
+
+            if (!_warned && court >= warnAt)
+            {
+                _warned = true;
+                OverheadPassWindow.SetWarning(true);
+            }
+
+            bool overhead = court >= -OverheadHalfZ && court <= OverheadHalfZ;
+
+            if (overhead != _windowOpen)
+            {
+                _windowOpen = overhead;
+                OverheadPassWindow.SetOverhead(overhead);
+
+                if (overhead)
+                {
+                    OverheadPassWindow.SetWarning(false);
+                }
+            }
+
+            // ⚠️⚠️ THE `sfx_fire_whoosh` THAT USED TO FIRE HERE IS GONE, AND IT WAS THE THIRD
+            // TRAIN SOUND. A fire cue, borrowed, played from a fixed point as the consist crossed
+            // z = -18, on top of a distant warning one-shot and a looping bed. Three sounds for
+            // one object, two of them synthesised and one of them about fire, is most of why 🧑
+            // reported this repeatedly and finally said *"i keep reporting its broken and i give
+            // up on it"*. The recording is the train; the burst stays because it is a picture.
+            if (!_whooshPlayed && court >= -18.0f)
+            {
+                _whooshPlayed = true;
+                ImpactBurst.SpawnAt(RunPosition(_currentZ) + Vector3.down * 0.5f);
+            }
+
+            if (!Shuttle || Mathf.Abs(court) <= SoundHalfZ) DriveRumble();
+            else if (_rumbleStarted) StopRumble();
+
+            if (_currentZ < EndZ) return;
+
+            _isRunning = false;
+            _windowOpen = false;
+            OverheadPassWindow.SetOverhead(false);
+            OverheadPassWindow.SetWarning(false);
+            StopRumble();
+            // It has arrived in the far station: the next run starts from there, the other way,
+            // on the other track. Without Shuttle it is put back where it started.
+            if (Shuttle) _dir = -_dir;
+            Place(StartZ);
+        }
+
+        // ------------------------------------------------------------------ § THE PASS
+        //
+        // ⚠️⚠️ THE CONSIST NOW CARRIES ITS OWN MOVING SOURCE, AND BEFORE THIS THE SOUND NEVER
+        // MOVED AT ALL. 🧑 2026-08-26: *"pls make the sfx of the train passing by better ... make
+        // it feel like its getting farther and add sound or movement to screen to make it
+        // realistic? bcz usually when it passes by u feel the shaking"*.
+        //
+        // ⚠️ WHY THE OLD ONE COULD NOT DO IT, WHICH IS NOT THAT THE CLIP WAS WRONG. Both cues
+        // went through `AudioDirector.PlayAtVaried`, which parks a POOLED VOICE AT A FIXED
+        // POSITION and plays it there. That is the right call for an impact, which happens at a
+        // point and is over. The train travels from z = -48 to z = +48 while its sound is
+        // playing: 96 m in 5.3 s at 18 m/s. Fired once at the position the nose happened to hold
+        // at that instant, the sound stayed at that spot for the whole pass, so it faded by the
+        // listener WALKING, never by the train leaving. There is no amount of better clip that
+        // fixes a stationary emitter.
+        //
+        // ⚠️ SO: A LOOPING SOURCE PARENTED TO THE CONSIST. Unity then does the approach and the
+        // recede for free off the transform, and `dopplerLevel` does the pitch shift on the way
+        // past, which is the half of "getting farther" that a volume ramp alone cannot fake.
+        //
+        // ⚠️⚠️ IT PLAYS ONE CUE, ONCE, WITHOUT LOOPING, AND THAT IS THE 2026-08-27 CHANGE.
+        // 🧑: *"i keep reporting its broken and i give up on it ... replace train passing by
+        // sound and train sound as a whole with this"*, with a 10.55 s field recording. The train
+        // had THREE synthesised sounds: a distant one-shot warning (`sfx_lrt_pass`), a 2.0 s
+        // seamless bed looped on this source (`sfx_lrt_rumble`), and a borrowed `sfx_fire_whoosh`
+        // fired from a fixed point at z = -18. Two of the three are deleted and the third is
+        // replaced.
+        //
+        // ⚠️⚠️ THE CLIP IS TIME-ALIGNED TO THE PASS BY ARITHMETIC, NOT BY EAR, AND IT NEEDS NO
+        // OFFSET. Measured on the recording, its loudest quarter-second is at **2.70 s** (RMS
+        // 0.234 against 0.10 for the carriage tail). The consist spawns at z = -48 and reaches
+        // the street at 18 m/s, so it is overhead at **48 / 18 = 2.67 s** after the source
+        // starts. Starting the clip when the run starts therefore puts the recording's own pass
+        // within 0.03 s of the real one. If `Speed`, `StartZ` or the clip ever change, this is
+        // the sum to redo.
+        //
+        // ⚠️ AND THE LOOP IS OFF. A 10.55 s clip outlasts the 5.33 s traverse, so there is
+        // nothing to loop; the previous note here records what looping an enveloped one-shot did
+        // (silence at 2.70 s, then a swell from nothing while the train was directly overhead)
+        // and turning the loop off is what makes that unreachable rather than merely unlikely.
+        //
+        // ⚠️ LINEAR ROLLOFF, NOT LOGARITHMIC, AND IT IS MEASURED FROM THE MAP. The guideway sits
+        // 9.19 m up and the play area is 33 m of street; logarithmic falloff drops most of its
+        // range inside the first few metres, so the consist would be at full volume across the
+        // entire arena and then vanish. Linear from 12 to 70 spans the map: audible from the far
+        // wall, loudest overhead, gone by the time the tail clears the boundary traffic.
+        // 20, up from 12 (2026-10-04): the pavement is 13 to 15 m from the consist, and at 12 the
+        // rolloff had already taken a slice off before anybody could stand under it.
+        private const float RumbleMinDistance = 20.0f;
+
+        /// ⚠️⚠️ 44, DOWN FROM 70, BECAUSE 70 MADE IT AUDIBLE FROM THE MOMENT IT SPAWNED.
+        /// The consist starts at z = -48 and the arena is centred on the origin, so at 70 m of
+        /// range the bed was already playing before the warning toast fired and kept playing
+        /// well after the tail had left. Combined with a bed that had no mix trim at all, that is
+        /// the *"loud wind soudn that plays randomly"* off the played build: not random, just
+        /// audible for the whole 5.3 s traverse at full level. At 44 the sound arrives with the
+        /// warning and leaves with the train.
+        private const float RumbleMaxDistance = 52.0f;
+
+        /// <summary>
+        /// How hard the street shakes directly under the consist.
+        ///
+        /// ⚠️ 0.30, AGAINST `CameraRig.Shake`'s 0.35 DEFAULT AND THE 0.45x AN IMPACT GETS. A
+        /// train passing overhead is a rumble, not a hit: it lasts the whole 2.7 s window, and
+        /// anything near impact strength for that long is unplayable rather than atmospheric.
+        /// It is also scaled by distance below, so this is the value only for a player standing
+        /// directly beneath the guideway.
+        /// </summary>
+        private const float ShakePeak = 0.30f;
+
+        private AudioSource _rumble;
+        private bool _rumbleReady;
+        private bool _rumbleStarted;
+
+        /// <summary>
+        /// ⚠️ BUILT ON FIRST USE, NOT IN `Start`. `GameServices.Audio` is installed by the match
+        /// bootstrap and this component lives on the map, so a `Start`-time lookup races it and
+        /// silently leaves the train mute for the whole session. Asking on the first pass is
+        /// 24 s later and cannot lose that race.
+        /// </summary>
+        private void EnsureRumble()
+        {
+            if (_rumbleReady) return;
+            _rumbleReady = true;
+
+            if (GameServices.Audio == null) return;
+
+            // ⚠️ CALLED ON `GameServices.Audio` RATHER THAN ON A LOCAL, DELIBERATELY.
+            // `AudioCueCheck.CallSitePattern` is anchored on the literal `Audio.` receiver, so a
+            // cue asked for through a local named anything else is a call site the check cannot
+            // see, and it would then report `sfx_lrt_pass` as a file nothing plays.
+            if (!GameServices.Audio.TryGetClip("sfx_lrt_pass", out var clip, out float mix)) return;
+
+            var go = new GameObject("LrtRumble");
+            go.transform.SetParent(transform, false);
+
+            _rumble = go.AddComponent<AudioSource>();
+            _rumble.clip = clip;
+            _rumble.loop = false;
+            _rumble.playOnAwake = false;
+            _rumble.spatialBlend = 1.0f;
+            _rumble.rolloffMode = AudioRolloffMode.Linear;
+            _rumble.minDistance = RumbleMinDistance;
+            _rumble.maxDistance = RumbleMaxDistance;
+
+            // ⚠️ ABOVE 1. The consist is the only thing in the game moving fast enough for
+            // doppler to be audible at all, and at 18 m/s the true shift is about 5 per cent,
+            // which nobody hears. This is the one place exaggerating it is honest: the effect
+            // being sold is "it went past me", not a physics reading.
+            // 1.3: the first 2.2 was hard to hear, 3.5 was "too much" (owner, 2026-10-04).
+            _rumble.dopplerLevel = 1.3f;
+            Reverb(go);
+
+            // The rail clank (tools/synth_ilalim_train_clack.py): wheels over the joints, a loop
+            // on the consist beside the roar (owner: "theres no sfx for the rails clanking when
+            // the train goes over"). Not a registered cue: a map-owned loop like the street bed.
+            var clackClip = Resources.Load<AudioClip>("Ambience/lrt_clack");
+            if (clackClip != null)
+            {
+                var clackGo = new GameObject("LrtClack");
+                clackGo.transform.SetParent(transform, false);
+                _clack = clackGo.AddComponent<AudioSource>();
+                _clack.clip = clackClip;
+                _clack.loop = true;
+                _clack.playOnAwake = false;
+                _clack.spatialBlend = 1.0f;
+                _clack.rolloffMode = AudioRolloffMode.Linear;
+                _clack.minDistance = RumbleMinDistance;
+                _clack.maxDistance = RumbleMaxDistance;
+                _clack.dopplerLevel = 1.3f;
+                Reverb(clackGo);
+            }
+
+            _rumbleMix = mix;
+        }
+
+        private float _rumbleMix = 1.0f;
+        private AudioSource _clack;
+
+        // The street under a concrete viaduct rings (owner, 2026-10-04: "theres no reverb").
+        private static void Reverb(GameObject source)
+        {
+            var reverb = source.AddComponent<AudioReverbFilter>();
+            reverb.reverbPreset = AudioReverbPreset.ParkingLot;
+        }
+
+        /// <summary>
+        /// The pass, every frame it is running: the rumble's level and the shake under it.
+        ///
+        /// ⚠️⚠️ BOTH ARE DRIVEN OFF THE SAME DISTANCE, so the loudest moment and the hardest
+        /// shake are the same moment by construction rather than by two timers agreeing. That is
+        /// the whole reason it reads as one heavy object rather than as a sound plus an effect.
+        /// </summary>
+        private void DriveRumble()
+        {
+            EnsureRumble();
+
+            var listener = UnityEngine.Camera.main;
+            if (listener == null) return;
+
+            float distance = Vector3.Distance(listener.transform.position, transform.position);
+
+            if (_rumble != null)
+            {
+                // ⚠️ ONCE PER PASS, NOT "WHENEVER IT IS NOT PLAYING". With the old looping bed
+                // those were the same sentence. With a one-shot they are not: a clip that ended
+                // would be restarted on the next frame, which is the enveloped-loop fault the
+                // section header records, rebuilt out of a restart instead of a loop flag.
+                if (!_rumbleStarted)
+                {
+                    _rumbleStarted = true;
+                    _rumble.time = 0.0f;
+                    _rumble.Play();
+                }
+
+                // The player's slider is read every frame rather than cached, because it can be
+                // moved in the pause panel while a train is mid-pass.
+                float slider = GameServices.Audio != null ? GameServices.Audio.AmbienceVolume : 1.0f;
+                _rumble.volume = _rumbleMix * slider * KantoStreetSound.AmbientGainScale;
+                if (_clack != null)
+                {
+                    if (!_clack.isPlaying) _clack.Play();
+                    _clack.volume = 0.85f * slider;
+                }
+            }
+
+            // ⚠️ THE SHAKE IS RE-ARMED EVERY FRAME RATHER THAN FIRED ONCE. `CameraRig.Shake`
+            // takes a `Max()` against what is already running and drains on a timer, so a single
+            // call at the start of a 2.7 s window would have decayed to nothing within a fifth
+            // of a second. Re-arming with a SHORT duration each frame is what makes it a
+            // sustained rumble whose strength tracks the consist instead of a one-off jolt.
+            if (distance > RumbleMaxDistance) return;
+
+            float nearness = 1.0f - Mathf.Clamp01((distance - RumbleMinDistance)
+                                                  / (RumbleMaxDistance - RumbleMinDistance));
+
+            // Squared, so the shake is genuinely local to the pass. Linear left the whole street
+            // trembling for the entire approach, which is the "screensaver" failure this file's
+            // header already argues against, moved into the camera.
+            float strength = ShakePeak * nearness * nearness;
+            if (strength < 0.01f) return;
+
+            var rig = listener.GetComponent<CameraSystem.CameraRig>();
+            // ⚠️ 0.7 s, NOT 0.12. `CameraRig` scales a shake by `Clamp01(_shakeLeft)`, so re-arming
+            // 0.12 s every frame held the whole pass at 12 per cent of `ShakePeak`: it "worked"
+            // and nobody could see it (owner, 2026-10-04: "add a slight screen shake when the
+            // train passes"). At 0.7 it is a slight rumble that dies away as the tail clears.
+            rig?.Shake(strength, 0.7f);
+        }
+
+        /// <summary>
+        /// ⚠️ THE RUMBLE STOPS WITH THE CONSIST. It is a looping source on an object that gets
+        /// teleported back to `StartZ` and left there for the rest of the interval; leaving it
+        /// playing would put a train under the south wall for 24 s.
+        /// </summary>
+        private void StopRumble()
+        {
+            _rumbleStarted = false;
+            if (_rumble != null && _rumble.isPlaying) _rumble.Stop();
+            if (_clack != null && _clack.isPlaying) _clack.Stop();
+        }
+
+    }
+}

@@ -1,0 +1,45 @@
+using System;
+using System.IO;
+using UnityEditor;
+using UnityEngine;
+
+namespace TumbangPreso.EditorTools
+{
+    public static class OwnerMenuEditsAuthor
+    {
+        public static void Prepare()
+        {
+            try
+            {
+                const string source="ArtSource/ui/owner-ui-edits-2026-09-15";
+                const string target="Assets/TumbangPreso/Resources/UI/owner-menu-edits";
+                Directory.CreateDirectory(target);
+                File.Copy(source+"/background_mainmenu_clean.png",target+"/main-background.png",true);
+                File.Copy(source+"/login-background-woven.png",target+"/login-background.png",true);
+                File.Copy(source+"/derived/main-sky-cutout.png",target+"/main-sky-cutout.png",true);
+                File.Copy(source+"/derived/main-sky-background-data.png",target+"/main-sky-background-data.png",true);
+                File.Copy(source+"/derived/main-ground-mask.png",target+"/main-ground-mask.png",true);
+                foreach(var file in Directory.GetFiles(source+"/generated-clouds","*.png"))
+                    File.Copy(file,target+"/"+Path.GetFileName(file),true);
+                foreach(var file in Directory.GetFiles(source+"/login-v2","*.png"))
+                    File.Copy(file,target+"/"+Path.GetFileName(file),true);
+                File.Copy(source+"/login-v2/login-layout-v2.json",target+"/login-layout-v2.json",true);
+                foreach(var file in Directory.GetFiles(source+"/extracted","*.png"))
+                    File.Copy(file,target+"/"+Path.GetFileName(file),true);
+                AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+                foreach(var file in Directory.GetFiles(target,"*.png"))
+                {
+                    var importer=(TextureImporter)AssetImporter.GetAtPath(file.Replace('\\','/'));
+                    importer.textureType=TextureImporterType.Default;
+                    // Manual authoring and automatic reimports share the same quality policy.
+                    OwnerArtworkQualityImport.Apply(importer, file.Replace('\\','/'));
+                    importer.SaveAndReimport();
+                }
+                AssetDatabase.SaveAssets();
+                Debug.Log("[OwnerMenuEdits] Clean background and15original-size pieces imported without compression or sprite-metadata edits.");
+                EditorApplication.Exit(0);
+            }
+            catch(Exception exception){Debug.LogException(exception);EditorApplication.Exit(1);}
+        }
+    }
+}

@@ -1,0 +1,1078 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+namespace TumbangPreso.UI
+{
+    /// <summary>
+    /// What KIND of thing an ability is, drawn as a shape rather than spelled out.
+    ///
+    /// ⚠️⚠️ THE GLYPH DESCRIBES THE SHAPE OF THE EFFECT, NOT THE ELEMENT. Fire, ice and
+    /// lightning are already carried by the hero's colour, and a flame icon on a fire hero's
+    /// three powers tells the player nothing about which of the three to press. What they need
+    /// at a glance is *what it does to the world*: does it put something on the ground, put a
+    /// wall in front of me, move me, protect me, or hit everything at once. Two heroes with
+    /// completely different fiction share a glyph when they share a job, on purpose.
+    ///
+    /// ⚠️ ADD A GLYPH RATHER THAN REUSING A NEAR MISS. A wrong icon is worse than a generic
+    /// one, because the player trusts it once and then stops trusting all of them.
+    /// </summary>
+    public enum AbilityGlyph
+    {
+        /// <summary>A patch of ground that does something to whoever stands on it.</summary>
+        Zone,
+
+        /// <summary>A solid thing placed in the world that bodies and slippers cannot pass.</summary>
+        Wall,
+
+        /// <summary>Moves the caster. Rushes, dashes, grinds.</summary>
+        Dash,
+
+        /// <summary>Protects the caster. Armour, immunity, carapace.</summary>
+        Shield,
+
+        /// <summary>Goes off around the caster and hits everything in reach.</summary>
+        Burst,
+
+        /// <summary>Sends something away from the caster at a target.</summary>
+        Projectile,
+
+        /// <summary>The caster stops being fully present. Phase, ghost, untargetable.</summary>
+        Phase,
+
+        /// <summary>Comes down from above onto a place. Slams, strikes, fissures.</summary>
+        Slam,
+
+        /// <summary>Changes the tsinelas rather than the world. Overcharge, curve, empower.</summary>
+        Empower,
+
+        // -------------------------------------------------------------------
+        // BESPOKE HERO GLYPHS (Unique across all 15 abilities)
+        // -------------------------------------------------------------------
+
+        /// <summary>Dante Skill 1: Seismic Stomp (Heavy downward ground slam with shockwaves).</summary>
+        DanteStomp,
+
+        /// <summary>Dante Skill 2: Demonic Carapace (Solid heavy armored crest).</summary>
+        DanteShield,
+
+        /// <summary>Dante Ultimate: Titan Fissure (Jagged tectonic ground split).</summary>
+        DanteFissure,
+
+        /// <summary>Sean signature: LAVA RAM (his lava fist driving forward, the hit bursting in front).</summary>
+        SeanRush,
+
+        /// <summary>Sean attacking: MOLTEN THROW (his slipper dipped in lava, flying flat and dripping).</summary>
+        SeanIgnite,
+
+        /// <summary>Sean ultimate: MAYON AWAKENS (the cone erupting from its lit summit). The name is the parol era's.</summary>
+        SeanSupernova,
+
+        /// <summary>Cheska Skill 1: Permafrost Sheet (Frosted ice ground zone with crystal shards).</summary>
+        CheskaFrostSheet,
+
+        /// <summary>Cheska Skill 2: Ice Barricade (Three crystalline ice pillars).</summary>
+        CheskaBarricade,
+
+        /// <summary>Cheska Ultimate: Glacial Nova (6-point radial blizzard snowflake).</summary>
+        CheskaNova,
+
+        /// <summary>Zack Skill 1: Bolt Sprint (Dynamic high-speed lightning streak bolt).</summary>
+        ZackSprint,
+
+        /// <summary>Zack Skill 2: Magnet (Electrified spark core with orbital charge arcs). ⚠️ THE GLYPH IS KEPT FROM STATIC CHARGE, WHICH THIS SLOT REPLACED ON 2026-09-02: an orb with things drawn around it reads as a magnet exactly as well as it read as static, and `MagnetRecallAbility` carries why a seventh Zack glyph would be art spent on a distinction the player never makes.</summary>
+        ZackOvercharge,
+
+        /// <summary>Zack Ultimate: Thunderstrike (Overhead thundercloud with downward lightning strike).</summary>
+        ZackThunderstrike,
+
+        /// <summary>Nemu Skill 1: Ghost Step (Crescent moon spirit phase).</summary>
+        NemuPhase,
+
+        /// <summary>Nemu Skill 2: Astral Projection (Kuro the ghost companion pet silhouette).</summary>
+        NemuAstralPet,
+
+        /// <summary>Nemu Ultimate: Seance Void (Gravitational swirling spiral vortex).</summary>
+        NemuSeanceVoid,
+
+        /// <summary>Phaister Skill 1: Hex Sigil (Occult hexagonal magic circle rune).</summary>
+        PhaisterHexSigil,
+
+        /// <summary>Phaister Skill 2: Shadow Blink (Occult dimensional warp diamond with shadow streaks).</summary>
+        PhaisterShadowBlink,
+
+        /// <summary>Phaister Ultimate: Grand Eclipse (Crowned solar eclipse corona with flare rays).</summary>
+        PhaisterEclipse,
+
+        /// <summary>Phaister Witchfire Empower (Witchfire empowered mystical slipper wisp).</summary>
+        PhaisterWitchfire,
+        RafiCrosscurrent,
+        RafiMirrorwake,
+        RafiBreakwater,
+
+        // ⚠️ AMIHAN (2026-09-25), the first kit with a signature and two ROLE abilities, so four
+        // glyphs: her signature, the attacking and the defending role ability, and the ultimate.
+        /// <summary>Amihan signature: Quick Dash (a figure's slipstream: three swept lines past a chevron).</summary>
+        AmihanQuickDash,
+        /// <summary>Amihan attacking: Updraft (a rising spiral column under a lifted figure).</summary>
+        AmihanUpdraft,
+        /// <summary>Amihan defending: Whirlwind (a curved gale front rolling forward).</summary>
+        AmihanWhirlwind,
+        /// <summary>Amihan ultimate: Storm Surge (a fan of wind lines from a kasikus diamond).</summary>
+        AmihanStormSurge,
+
+        // ⚠️ PAETE (2026-09-25): signature, attacking, defending, ultimate.
+        /// <summary>Paete signature: Liana Leap (two vines converging on a hooked anchor).</summary>
+        PaeteVine,
+        /// <summary>Paete attacking: Bakya Bloom (a seedling with a slipper in its pod).</summary>
+        PaeteSprout,
+        /// <summary>Paete defending: Bawi (thorns drawing slippers inward).</summary>
+        PaeteThorn,
+        /// <summary>Paete ultimate: Makiling's Embrace (a core with roots pulling in from all sides).</summary>
+        PaeteSentry,
+
+        // Current role powers, appended to preserve serialized enum values.
+        DanteBoulder,
+        DanteBarrier,
+        CheskaFrostbite,
+        NemuTerrify,
+        NemuKuroGuard,
+        PhaisterCursedDoll,
+        PhaisterVulnerable,
+        /// <summary>A role slot whose ability has not been designed yet.</summary>
+        ComingSoon,
+
+        /// <summary>Phaister ultimate: VOODOO DOLL (HERO-10 v3; it replaced OMEN, whose eclipse it borrowed): a doll hung on three
+        /// strings from the arc of THE CIRCLE, an X for one eye. Appended after `ComingSoon` to keep every serialized value.</summary>
+        PhaisterVoodooDoll,
+        RafiSkim,
+        RafiWaterwall,
+        SeanCinderGate,
+
+        // ⚠️ NEMU'S GHOSTS (owner 2026-10-15, *"make dedicated icons"*), appended to keep every serialized value.
+        /// <summary>Nemu signature: DON'T LOOK (two ghost hands closing over a wide eye).</summary>
+        NemuDontLook,
+        /// <summary>Nemu attacking: SKITTER (a green ghost scurrying with a slipper held up in its claws).</summary>
+        NemuSkitter,
+        /// <summary>Nemu defending: LOOKOUT (a lantern ghost beside a can, an arrow standing it up).</summary>
+        NemuLookout,
+
+        // ⚠️ RAGO THE LAVA BRAWLER (owner 2026-10-24, "thoroughly redesign his icons"), appended to keep every serialized value.
+        /// <summary>Sean while Molten: VOLCANIC BOMB (a black-glass ball split by a glowing crack, falling in a trail of fire).</summary>
+        SeanVolcanicBomb,
+
+        // ⚠️ ZACK THE SPEEDSTER (2026-10-25 rework, docs/reports/zack-kit-2026-10-25/plan.md), appended to keep every serialized value.
+        /// <summary>Zack signature: BACKTRACK (a gold arc looping back on itself round a spark).</summary>
+        ZackBacktrack,
+        /// <summary>Zack attacking: AFTERIMAGE (a running figure with its gold copy stepping out ahead).</summary>
+        ZackAfterimage,
+        /// <summary>Zack defending: LIVE WIRE (two concrete posts and a sagging, sparking wire).</summary>
+        ZackLiveWire,
+        /// <summary>Zack ultimate: OVERCLOCK (a gauge pinned past its end by a bolt).</summary>
+        ZackOverclock,
+
+        // ⚠️ FULL THROTTLE replaced AFTERIMAGE (owner pick, 2026-10-26), appended to keep every serialized value.
+        /// <summary>Zack attacking: FULL THROTTLE (a battery tipped forward, every cell full, the charging bolt on its face).</summary>
+        ZackFullThrottle,
+    }
+
+    /// <summary>
+    /// Procedural icons for the ability deck, the hold-to-inspect panel and character select.
+    ///
+    /// ⚠️⚠️ THEY ARE BAKED IN CODE, LIKE EVERY OTHER SURFACE IN THIS UI. `GodotTheme` already
+    /// paints every box, border and shadow in the game into a cached texture rather than
+    /// shipping PNGs, for the reason its own note gives: a baked file that drifts from the
+    /// code that wanted it is indistinguishable from a broken conversion. Icons follow the same
+    /// rule, and it also means the ability art is not blocked on the team's art queue
+    /// (`CLAUDE.md` § 4a). When real icons land, replace `Bake` and nothing else changes.
+    ///
+    /// ⚠️ WHITE ON TRANSPARENT, TINTED AT THE USE SITE. One texture per glyph, ever, and the
+    /// hero colour arrives through `Image.color`. Baking a coloured icon per hero would be
+    /// five times the textures for no visual difference.
+    /// </summary>
+    public static class AbilityIcons
+    {
+        private const int Size = 128;
+
+        private static readonly Dictionary<AbilityGlyph, Sprite> Cache =
+            new Dictionary<AbilityGlyph, Sprite>();
+        private static Sprite _cooldownDisc;
+
+        public static IEnumerator Warmup(System.Action<float> completed = null)
+        {
+            var glyphs = (AbilityGlyph[])System.Enum.GetValues(typeof(AbilityGlyph));
+            for (int i = 0; i < glyphs.Length; i++)
+            {
+                var glyph = glyphs[i];
+                if (!Cache.TryGetValue(glyph, out var cached) || cached == null)
+                {
+                    if (!Drawn.ContainsKey(glyph))
+                    {
+                        var load = Resources.LoadAsync<Sprite>("UI/ability-icons/" + glyph);
+                        yield return load;
+                        Drawn[glyph] = load.asset as Sprite;
+                    }
+                    // Missing illustrations keep their existing baked fallback,
+                    // with only one glyph's generation/upload in this turn.
+                    For(glyph);
+                    yield return null;
+                }
+                completed?.Invoke((i + 1f) / (glyphs.Length + 1));
+            }
+            if (_cooldownDisc == null)
+            {
+                CooldownDisc();
+                yield return null;
+            }
+            completed?.Invoke(1);
+        }
+
+        public static Sprite For(AbilityGlyph glyph)
+        {
+            if (Cache.TryGetValue(glyph, out var cached) && cached != null) return cached;
+
+            // ⚠️⚠️ THE DRAWN SET WINS OVER THE BAKE (2026-09-23). The owner asked for every skill
+            // icon to be improved, then for "a drawing for all". Since 2026-11-05 the set is the
+            // owner's own sheet (`ArtSource/ui/ability-icons`), cut by `tools/cut_ability_icons.py`
+            // into `Resources/UI/ability-icons/<AbilityGlyph>.png`. This is the swap the header above
+            // always anticipated ("when real icons land, replace Bake and nothing else changes").
+            // The bake stays as the fallback for a glyph added before its drawing exists.
+            var sprite = Illustration(glyph) ?? Bake(glyph);
+            Cache[glyph] = sprite;
+            return sprite;
+        }
+
+        /// <summary>The drawn illustration for a glyph, or null if none has been drawn yet.</summary>
+        public static Sprite Illustration(AbilityGlyph glyph)
+        {
+            if (Drawn.TryGetValue(glyph, out var known)) return known;
+            var sprite = Resources.Load<Sprite>("UI/ability-icons/" + glyph);
+            Drawn[glyph] = sprite;
+            return sprite;
+        }
+
+        private static readonly Dictionary<AbilityGlyph, Sprite> Drawn = new Dictionary<AbilityGlyph, Sprite>();
+
+        /// <summary>
+        /// The icon without its black outline, for the match feed (owner, 2026-11-05: "don't add the black outlines
+        /// when they show on the match feed"). `tools/cut_ability_icons.py` writes it beside the outlined one.
+        /// </summary>
+        public static Sprite Plain(AbilityGlyph glyph)
+        {
+            if (!PlainDrawn.TryGetValue(glyph, out var sprite))
+            {
+                sprite = Resources.Load<Sprite>("UI/ability-icons-plain/" + glyph);
+                PlainDrawn[glyph] = sprite;
+            }
+            return sprite != null ? sprite : For(glyph);
+        }
+
+        private static readonly Dictionary<AbilityGlyph, Sprite> PlainDrawn = new Dictionary<AbilityGlyph, Sprite>();
+
+        /// <summary>
+        /// ⚠️ The project enters Play mode without a domain reload, so these caches outlive a play session. Without
+        /// this, a glyph looked up before its drawing existed kept "no drawing" for good: Phaister's ultimate showed
+        /// the old baked lines after its picture landed (2026-11-05).
+        /// </summary>
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void ResetCaches()
+        {
+            Cache.Clear(); Drawn.Clear(); PlainDrawn.Clear();
+        }
+
+        /// <summary>
+        /// The colour an Image showing an ability icon should wear.
+        ///
+        /// ⚠️ A DRAWN ICON CARRIES ITS OWN COLOURS, SO IT IS NEVER HUE-TINTED. Every call site used
+        /// to tint the white glyph (gold when ready, cream when not, the hero's colour on a card),
+        /// and `Image.color` multiplies, so a tinted illustration turns into a muddy monochrome.
+        /// The drawing is shown as drawn; a site's "off" state becomes a dim instead of a hue, and
+        /// its alpha is kept. A glyph with no drawing keeps the caller's tint exactly as before.
+        /// </summary>
+        public static Color Tint(AbilityGlyph glyph, Color wanted, bool muted = false)
+        {
+            if (Illustration(glyph) == null) return wanted;
+            float v = muted ? 0.5f : 1.0f;
+            return new Color(v, v, v, wanted.a);
+        }
+
+        /// <summary>The same rule when the caller holds the sprite rather than the glyph.</summary>
+        public static Color Tint(Sprite shown, Color wanted, bool muted = false)
+        {
+            if (shown == null || !IsDrawn(shown)) return wanted;
+            float v = muted ? 0.5f : 1.0f;
+            return new Color(v, v, v, wanted.a);
+        }
+
+        private static bool IsDrawn(Sprite sprite)
+        {
+            foreach (var pair in Drawn) if (pair.Value == sprite) return true;
+            return false;
+        }
+
+        /// <summary>A soft-edged disc used by the HUD's radial cooldown veil.</summary>
+        public static Sprite CooldownDisc()
+        {
+            if (_cooldownDisc != null) return _cooldownDisc;
+
+            var pixels = new Color[Size * Size];
+            for (int y = 0; y < Size; y++)
+            {
+                for (int x = 0; x < Size; x++)
+                {
+                    float u = (x + 0.5f) / Size * 2.0f - 1.0f;
+                    float v = (y + 0.5f) / Size * 2.0f - 1.0f;
+                    pixels[y * Size + x] = new Color(1, 1, 1, Disc(u, v, 0.92f));
+                }
+            }
+
+            var tex = new Texture2D(Size, Size, TextureFormat.RGBA32, false)
+            {
+                name = "ability_cooldown_disc",
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp,
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+            tex.SetPixels(pixels);
+            tex.Apply(false, false);
+
+            _cooldownDisc = Sprite.Create(tex, new Rect(0, 0, Size, Size),
+                new Vector2(0.5f, 0.5f), 100.0f, 0, SpriteMeshType.FullRect);
+            _cooldownDisc.name = tex.name;
+            _cooldownDisc.hideFlags = HideFlags.HideAndDontSave;
+            return _cooldownDisc;
+        }
+
+        /// <summary>
+        /// A one-word name for the glyph, for the inspect panel's "what is this" line.
+        ///
+        /// ⚠️ IT SAYS THE JOB, NOT THE SHAPE. "GROUND ZONE" is useful; "circle" is noise.
+        /// </summary>
+        public static string LabelFor(AbilityGlyph glyph)
+        {
+            switch (glyph)
+            {
+                case AbilityGlyph.Zone: return "GROUND ZONE";
+                case AbilityGlyph.Wall: return "BLOCKER";
+                case AbilityGlyph.Dash: return "MOBILITY";
+                case AbilityGlyph.Shield: return "PROTECTION";
+                case AbilityGlyph.Burst: return "AREA BURST";
+                case AbilityGlyph.Projectile:
+                    return "PROJECTILE";
+                case AbilityGlyph.Phase: return "EVASION";
+                case AbilityGlyph.Slam: return "FROM ABOVE";
+                case AbilityGlyph.Empower: return "SLIPPER BUFF";
+                case AbilityGlyph.ComingSoon: return "COMING SOON";
+                // ⚠️⚠️ EVERY BESPOKE GLYPH REPORTS ITS JOB, AND FOR A YEAR IT REPORTED ITS OWN
+                // NAME. `Logs/shots-hero/hero_inspect_dante_v1.png` is what that looked like on
+                // the one screen this string is drawn on: **SEISMIC STOMP in green, then
+                // `[SEISMIC STOMP]` in green underneath it**, on all three cards, for all six
+                // heroes. Eighteen cards printing thirty-six copies of eighteen names. 🧑
+                // 2026-09-03, of the tray: *"make sure that when u click tab the skills are
+                // readable and feel good to the eyes to read and arent messy af"*, and this is
+                // the messiest thing in it: a second heading that says what the first heading
+                // already said, competing with it for the same eye at the same colour.
+                //
+                // ⚠️⚠️ THE JOB WORDS ARE `docs/VISION.md` § 3 RULE 1 PUT BACK.
+                // *"The icon says what the power does to the WORLD, not what element it is made
+                // of... Two heroes with completely different fiction share a glyph when they
+                // share a job."* The nine generic words above ARE that vocabulary, and the
+                // bespoke glyphs opted out of it by naming themselves. A player comparing three
+                // cards can now read MOBILITY, TSINELAS BUFF, FROM ABOVE and know what kind of
+                // kit they are holding; NAME, NAME, NAME told them nothing they could compare.
+                //
+                // ⚠️ THE GLYPHS THEMSELVES DO NOT MOVE AND MUST NOT. Each ability keeps its own
+                // drawn icon, which is the other half of § 3 rule 1 and what
+                // `HeroPresentationTests` asserts is unique per ability. **The picture is
+                // bespoke; the WORD is the family.** Two abilities sharing a word is the point,
+                // not a collision.
+                case AbilityGlyph.DanteStomp: return "AREA BURST";
+                case AbilityGlyph.DanteBoulder: return "PROJECTILE";
+                case AbilityGlyph.DanteBarrier: return "REFLECTOR";
+                case AbilityGlyph.DanteShield: return "PROTECTION";
+                case AbilityGlyph.DanteFissure: return "AREA BURST";
+                case AbilityGlyph.SeanRush: return "MOBILITY";
+
+                // ⚠️ IGNITION CANNON AND MAGNET ARE BOTH `TSINELAS BUFF` AND NEITHER IS A
+                // PROJECTILE. Both of them change what YOUR NEXT THROW does rather than
+                // producing something of their own, which is exactly what that word is for, and
+                // it is the single most useful thing the tray can tell a player about either.
+                case AbilityGlyph.SeanIgnite: return "SLIPPER BUFF";
+                case AbilityGlyph.SeanCinderGate: return "PROJECTILE";    // MAGMA FIST (the name is the parol era's)
+                case AbilityGlyph.SeanSupernova: return "AREA BURST";
+                case AbilityGlyph.SeanVolcanicBomb: return "AREA BURST";
+                case AbilityGlyph.CheskaFrostSheet: return "GROUND ZONE";
+                case AbilityGlyph.CheskaBarricade: return "BLOCKER";
+                case AbilityGlyph.CheskaNova: return "AREA BURST";
+                case AbilityGlyph.CheskaFrostbite: return "SLIPPER BUFF";
+                case AbilityGlyph.ZackSprint: return "MOBILITY";
+                case AbilityGlyph.ZackOvercharge: return "SLIPPER BUFF";
+                case AbilityGlyph.ZackThunderstrike: return "FROM ABOVE";
+                case AbilityGlyph.ZackBacktrack: return "MOBILITY";
+                case AbilityGlyph.ZackAfterimage: return "DECOY";
+                case AbilityGlyph.ZackFullThrottle: return "SPEED BOOST";
+                case AbilityGlyph.ZackLiveWire: return "TRIPWIRE";
+                case AbilityGlyph.ZackOverclock: return "POWER-UP";
+                case AbilityGlyph.NemuPhase: return "EVASION";
+                case AbilityGlyph.NemuAstralPet: return "FETCH";
+                case AbilityGlyph.NemuSeanceVoid: return "GROUND ZONE";
+                case AbilityGlyph.NemuTerrify: return "BLIND TRAP";
+                case AbilityGlyph.NemuKuroGuard: return "CAN HELPER";
+                case AbilityGlyph.NemuDontLook: return "BLIND TRAP";
+                case AbilityGlyph.NemuSkitter: return "FETCH";
+                case AbilityGlyph.NemuLookout: return "CAN HELPER";
+                case AbilityGlyph.PhaisterHexSigil: return "GROUND ZONE";
+                case AbilityGlyph.PhaisterShadowBlink: return "MOBILITY";
+                case AbilityGlyph.PhaisterEclipse: return "GROUND ZONE";
+                case AbilityGlyph.PhaisterCursedDoll: return "STATUS CURSE";
+                case AbilityGlyph.PhaisterVulnerable: return "STATUS CURSE";
+                case AbilityGlyph.PhaisterVoodooDoll: return "COMPANION";
+                case AbilityGlyph.PhaisterWitchfire: return "SLIPPER BUFF";
+                case AbilityGlyph.RafiCrosscurrent: return "REDIRECTION";
+                case AbilityGlyph.RafiMirrorwake: return "DECOY";
+                case AbilityGlyph.RafiSkim: return "GROUND SKIM";
+                case AbilityGlyph.RafiWaterwall: return "SLIPPER SCREEN";
+                case AbilityGlyph.RafiBreakwater: return "MOVING WAVE";
+                case AbilityGlyph.AmihanQuickDash: return "MOBILITY";
+                case AbilityGlyph.AmihanUpdraft: return "FLIGHT";
+                case AbilityGlyph.AmihanWhirlwind: return "MOVING GALE";
+                case AbilityGlyph.AmihanStormSurge: return "MAP-WIDE PUSH";
+                case AbilityGlyph.PaeteVine: return "GRAPPLE";
+                case AbilityGlyph.PaeteSprout: return "THROWING PLANT";
+                case AbilityGlyph.PaeteThorn: return "SLIPPER PULL";
+                case AbilityGlyph.PaeteSentry: return "PULL AND ROOT";
+                default:
+                    return "POWER";
+            }
+        }
+
+        // ------------------------------------------------------------------ baking
+
+        private static Sprite Bake(AbilityGlyph glyph)
+        {
+            var pixels = new Color[Size * Size];
+
+            for (int y = 0; y < Size; y++)
+            {
+                for (int x = 0; x < Size; x++)
+                {
+                    // Centred, normalised to roughly -1..1
+                    float u = (x + 0.5f) / Size * 2.0f - 1.0f;
+                    float v = (y + 0.5f) / Size * 2.0f - 1.0f;
+
+                    float a = Coverage(glyph, u, v);
+                    pixels[y * Size + x] = new Color(1.0f, 1.0f, 1.0f, Mathf.Clamp01(a));
+                }
+            }
+
+            var tex = new Texture2D(Size, Size, TextureFormat.RGBA32, false)
+            {
+                name = "abilityglyph_" + glyph,
+                filterMode = FilterMode.Bilinear,
+                wrapMode = TextureWrapMode.Clamp,
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+
+            tex.SetPixels(pixels);
+            tex.Apply(false, false);
+
+            var sprite = Sprite.Create(tex, new Rect(0, 0, Size, Size), new Vector2(0.5f, 0.5f),
+                                       100.0f, 0, SpriteMeshType.FullRect);
+            sprite.name = tex.name;
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            return sprite;
+        }
+
+        /// <summary>
+        /// The glyph shapes, as signed-distance coverage in a -1..1 square.
+        /// </summary>
+        private static float Coverage(AbilityGlyph glyph, float u, float v)
+        {
+            switch (glyph)
+            {
+                case AbilityGlyph.ComingSoon:
+                    return Mathf.Max(EllipseRing(u, v, 0.72f, 0.72f, Stroke), Box(u, v, 0.38f, Stroke * 0.5f));
+                // Amihan's fallbacks, drawn only until `tools/build_ability_icons.py`'s drawings load.
+                case AbilityGlyph.AmihanQuickDash:
+                    return Mathf.Max(Mathf.Max(Chevron(u - 0.34f, v, 0.6f, Stroke),
+                        Box(u + 0.3f, v - 0.3f, 0.42f, 0.055f)),
+                        Mathf.Max(Box(u + 0.4f, v, 0.5f, 0.055f), Box(u + 0.3f, v + 0.3f, 0.42f, 0.055f)));
+                case AbilityGlyph.AmihanUpdraft:
+                    return Mathf.Max(Mathf.Max(EllipseRing(u, v + 0.55f, 0.62f, 0.18f, 0.07f),
+                        EllipseRing(u, v + 0.18f, 0.46f, 0.14f, 0.07f)),
+                        Mathf.Max(EllipseRing(u, v - 0.14f, 0.3f, 0.1f, 0.06f), Disc(u, v - 0.6f, 0.18f)));
+                case AbilityGlyph.AmihanWhirlwind:
+                    return Mathf.Max(Sub(Disc(u, v + 0.15f, 0.86f), Disc(u, v + 0.42f, 0.8f)),
+                        Sub(Disc(u, v + 0.55f, 0.6f), Disc(u, v + 0.78f, 0.56f)));
+                case AbilityGlyph.AmihanStormSurge:
+                    return Mathf.Max(Disc(u, v + 0.62f, 0.2f), Spokes(u, v + 0.62f, 9, 0.34f, 1.35f, Stroke * 0.7f));
+                // Paete's fallbacks, drawn only until `tools/build_ability_icons.py`'s drawings load.
+                case AbilityGlyph.PaeteVine:
+                    return Mathf.Max(Mathf.Max(Box(u + 0.25f, v - 0.28f, 0.52f, 0.06f), Box(u + 0.25f, v + 0.28f, 0.52f, 0.06f)),
+                        Disc(u - 0.52f, v, 0.2f));
+                case AbilityGlyph.PaeteSprout:
+                    return Mathf.Max(Mathf.Max(Box(u, v - 0.35f, 0.08f, 0.45f), Disc(u, v + 0.25f, 0.34f)),
+                        Box(u, v + 0.62f, 0.5f, 0.07f));
+                case AbilityGlyph.PaeteThorn:
+                    return Mathf.Max(Disc(u, v, 0.2f), Spokes(u, v, 7, 0.3f, 0.9f, Stroke * 0.8f));
+                case AbilityGlyph.PaeteSentry:
+                    return Mathf.Max(Disc(u, v, 0.3f), Spokes(u, v, 8, 0.4f, 1.0f, Stroke));
+                case AbilityGlyph.RafiCrosscurrent:
+                    return Mathf.Max(Sub(EllipseRing(u + .12f, v, .67f, .60f, .16f), Box(u - .5f, v + .4f, .6f, .65f)),
+                        RightTriangle(u - .38f, v - .44f, .24f, .28f));
+                case AbilityGlyph.RafiSkim:
+                    return Mathf.Max(EllipseRing(u-.12f,v-.12f,.57f,.25f,.13f),Box(u+.12f,v+.48f,.65f,.07f));
+                case AbilityGlyph.RafiWaterwall:
+                    return Mathf.Max(Mathf.Max(Box(u+.6f,v,.09f,.65f),Box(u-.6f,v,.09f,.65f)),
+                        Box(u,v-.52f-.07f*Mathf.Sin(u*6),.68f,.08f));
+                case AbilityGlyph.RafiMirrorwake:
+                    return Mathf.Max(Mathf.Max(Disc(u + .3f, v - .42f, .19f), Box(u + .3f, v + .15f, .17f, .35f)),
+                        Mathf.Max(EllipseRing(u - .27f, v - .4f, .21f, .21f, .075f), Box(u - .27f, v + .15f, .075f, .33f)));
+                case AbilityGlyph.RafiBreakwater:
+                    return Mathf.Max(Box(u, v + .5f, .82f, .10f),
+                        Sub(Disc(u + .12f, v + .05f, .70f), Disc(u - .17f, v - .2f, .53f)));
+                case AbilityGlyph.Zone:
+                    return EllipseRing(u, v, 0.82f, 0.54f, 0.26f);
+
+                case AbilityGlyph.Wall:
+                    return Mathf.Max(Mathf.Max(
+                        Box(u + 0.44f, v + 0.16f, 0.18f, 0.50f),
+                        Box(u, v - 0.02f, 0.20f, 0.68f)),
+                        Box(u - 0.44f, v + 0.16f, 0.18f, 0.50f));
+
+                case AbilityGlyph.Dash:
+                    return Mathf.Max(
+                        Chevron(u - 0.30f, v, 0.62f, Stroke),
+                        Chevron(u + 0.16f, v, 0.62f, Stroke));
+
+                case AbilityGlyph.Shield:
+                    return Crest(u, v, 1.36f, 1.72f);
+
+                case AbilityGlyph.Burst:
+                    return Mathf.Max(
+                        Disc(u, v, 0.26f),
+                        Spokes(u, v, 6, 0.40f, 0.94f, Stroke));
+
+                case AbilityGlyph.Projectile:
+                    return Mathf.Max(
+                        RightTriangle(u - 0.30f, v, 0.44f, 0.60f),
+                        Box(u + 0.60f, v, 0.26f, Stroke * 0.55f));
+
+                case AbilityGlyph.Phase:
+                    // A thick crescent with the caster half gone
+                    return Mathf.Max(
+                        Sub(Disc(u, v, 0.84f), Disc(u - 0.34f, v + 0.05f, 0.76f)),
+                        Disc(u - 0.40f, v - 0.14f, 0.17f));
+
+                case AbilityGlyph.Slam:
+                    // Down arrow/stomp slamming onto a ground bar
+                    return Mathf.Max(Mathf.Max(
+                        Box(u, v - 0.27f, Stroke, 0.45f),
+                        DownTriangle(u, v + 0.18f, 0.46f, 0.44f)),
+                        Box(u, v + 0.80f, 0.66f, 0.11f));
+
+                case AbilityGlyph.Empower:
+                    return Bolt(u, v);
+
+                case AbilityGlyph.DanteStomp:
+                    return SeismicBoot(u, v);
+
+                case AbilityGlyph.DanteShield:
+                    return HornedCarapace(u, v);
+
+                case AbilityGlyph.DanteBoulder:
+                    return Mathf.Max(Disc(u + 0.28f, v - 0.16f, 0.47f),
+                        Mathf.Max(Box(u - 0.46f, v + 0.2f, 0.3f, 0.06f),
+                            Box(u - 0.54f, v - 0.2f, 0.24f, 0.06f)));
+
+                case AbilityGlyph.DanteBarrier:
+                    return Mathf.Max(Box(u - 0.15f, v, 0.14f, 0.82f),
+                        Mathf.Max(Disc(u + 0.5f, v - 0.14f, 0.2f),
+                            Chevron(u + 0.48f, v + 0.38f, 0.26f, Stroke)));
+
+                case AbilityGlyph.DanteFissure:
+                    // Jagged vertical split crack with branching fissures
+                    return FissureCrack(u, v);
+
+                case AbilityGlyph.SeanRush:
+                    // High-thrust flame chevrons
+                    return Mathf.Max(Mathf.Max(
+                        Chevron(u - 0.36f, v, 0.68f, Stroke * 1.15f),
+                        Chevron(u + 0.08f, v, 0.68f, Stroke * 1.15f)),
+                        RightTriangle(u + 0.62f, v, 0.30f, 0.36f));
+
+                case AbilityGlyph.SeanCinderGate:
+                    // A finite seam and a returning arrow, not a shoe buff or solid wall.
+                    return Mathf.Max(Box(u,v+.36f,.75f,.065f),Mathf.Max(
+                        Mathf.Max(Box(u+.52f,v+.20f,.055f,.20f),Box(u-.49f,v+.23f,.055f,.17f)),
+                        Mathf.Max(Box(u,v+.15f,.06f,.25f),Chevron(-v+.16f,u,.40f,Stroke))));
+
+                case AbilityGlyph.SeanIgnite:
+                    // Flaming slipper / rising flame silhouette
+                    return FlameBurst(u, v);
+
+                case AbilityGlyph.SeanSupernova:
+                case AbilityGlyph.SeanVolcanicBomb:
+                    // 8-ray brilliant exploding star (the painted icon is what shows; this is the missing-file fallback)
+                    return SupernovaStar(u, v);
+
+                case AbilityGlyph.CheskaFrostSheet:
+                    // Elliptical frost ring with diagonal crystal facets
+                    return FrostSheet(u, v);
+
+                case AbilityGlyph.CheskaBarricade:
+                    // 3 sharp crystalline ice pillars
+                    return IceBarricade(u, v);
+
+                case AbilityGlyph.CheskaNova:
+                    // 6-point snowflake
+                    return Snowflake(u, v);
+
+                case AbilityGlyph.CheskaFrostbite:
+                    return Mathf.Max(EllipseRing(u - 0.15f, v, 0.36f, 0.65f, 0.13f),
+                        Spokes(u + 0.39f, v - 0.3f, 5, 0.13f, 0.44f, Stroke));
+
+                case AbilityGlyph.ZackSprint:
+                    // Lightning stroke with a pair of speed trails
+                    return SprintBolt(u, v);
+
+                case AbilityGlyph.ZackOvercharge:
+                    // Static charge orb with orbiting electric sparks
+                    return StaticOrb(u, v);
+
+                case AbilityGlyph.ZackThunderstrike:
+                    // Storm cloud striking lightning down
+                    return ThunderstrikeCloud(u, v);
+
+                // The painted icons are what show; these are the missing-file fallbacks.
+                case AbilityGlyph.ZackBacktrack:
+                    return Mathf.Max(EllipseRing(u, v, 0.62f, 0.62f, Stroke), Chevron(u + 0.62f, -v, 0.30f, Stroke));
+                case AbilityGlyph.ZackAfterimage:
+                case AbilityGlyph.ZackOverclock:
+                case AbilityGlyph.ZackFullThrottle:
+                    return SprintBolt(u, v);
+                case AbilityGlyph.ZackLiveWire:
+                    return Mathf.Max(Mathf.Max(Box(u + 0.62f, v + 0.15f, 0.07f, 0.55f), Box(u - 0.62f, v + 0.15f, 0.07f, 0.55f)),
+                        Box(u, v - 0.25f, 0.62f, 0.05f));
+
+                case AbilityGlyph.NemuPhase:
+                    // Crescent body with spirit trails, distinct from the generic phase glyph
+                    return GhostStep(u, v);
+
+                case AbilityGlyph.NemuAstralPet:
+                case AbilityGlyph.NemuSkitter:
+                    // Kuro the ghost companion pet silhouette
+                    return KuroGhostPet(u, v);
+
+                case AbilityGlyph.NemuSeanceVoid:
+                    // Swirling spiral seance vortex
+                    return SpiralVoid(u, v);
+
+                case AbilityGlyph.NemuTerrify:
+                case AbilityGlyph.NemuDontLook:
+                    return Mathf.Max(Disc(u, v - 0.15f, 0.5f),
+                        Mathf.Max(DownTriangle(u - 0.48f, v + 0.36f, 0.24f, 0.4f),
+                            DownTriangle(u + 0.48f, v + 0.36f, 0.24f, 0.4f)));
+
+                case AbilityGlyph.NemuKuroGuard:
+                case AbilityGlyph.NemuLookout:
+                    return Mathf.Max(Crest(u, v, 1.2f, 1.5f),
+                        Mathf.Max(DownTriangle(u - 0.38f, v - 0.47f, 0.24f, 0.3f),
+                            DownTriangle(u + 0.38f, v - 0.47f, 0.24f, 0.3f)));
+
+                case AbilityGlyph.PhaisterHexSigil:
+                    // Occult hexagonal magic rune sigil
+                    return HexWardSigil(u, v);
+
+                case AbilityGlyph.PhaisterShadowBlink:
+                    // Dimensional shadow warp rift
+                    return ShadowBlinkRift(u, v);
+
+                case AbilityGlyph.PhaisterEclipse:
+                    // Solar eclipse with dark moon core and corona rays
+                    return SolarEclipseNova(u, v);
+
+                case AbilityGlyph.PhaisterCursedDoll:
+                    return Mathf.Max(Disc(u, v - 0.35f, 0.28f),
+                        Mathf.Max(Box(u, v + 0.28f, 0.28f, 0.44f),
+                            RightTriangle(u + 0.6f, v, 0.23f, 0.32f)));
+
+                case AbilityGlyph.PhaisterVulnerable:
+                    return Mathf.Max(Disc(u, v + 0.1f, 0.43f),
+                        Box(u + 0.22f, v - 0.28f, 0.07f, 0.68f));
+
+                case AbilityGlyph.PhaisterWitchfire:
+                    // Empowered witchfire flame wisp
+                    return WitchfireOrb(u, v);
+
+                case AbilityGlyph.PhaisterVoodooDoll:
+                    return VoodooMarionette(u, v);
+
+                default:
+                    return Disc(u, v, 0.62f);
+            }
+        }
+
+        // ------------------------------------------------------------------ primitives
+
+        /// <summary>
+        /// The one stroke weight in the set.
+        ///
+        /// ⚠️⚠️ 0.16 OF THE HALF-SQUARE, WHICH IS ABOUT 10 OF 128 TEXTURE PIXELS AND 3 OF THE
+        /// 40 SCREEN PIXELS A DECK GLYPH ACTUALLY OCCUPIES. Anything thinner disappears, and
+        /// that is not a guess: the previous set ran 0.06 to 0.09 and every glyph in it was a
+        /// smudge. If a new glyph "needs" a finer line, it needs fewer parts instead.
+        /// </summary>
+        private const float Stroke = 0.16f;
+
+        private static float Edge(float distance)
+        {
+            const float feather = 2.5f / Size;
+            return Mathf.Clamp01(0.5f - distance / feather);
+        }
+
+        private static float Sub(float shape, float hole) => Mathf.Clamp01(shape - hole);
+
+        private static float Disc(float u, float v, float r)
+            => Edge(Mathf.Sqrt(u * u + v * v) - r);
+
+        private static float EllipseDisc(float u, float v, float rx, float ry)
+        {
+            float d = Mathf.Sqrt((u / rx) * (u / rx) + (v / ry) * (v / ry)) - 1.0f;
+            return Edge(d * ry);
+        }
+
+        private static float EllipseRing(float u, float v, float rx, float ry, float thickness)
+        {
+            float d = Mathf.Sqrt((u / rx) * (u / rx) + (v / ry) * (v / ry)) - 1.0f;
+            return Edge(Mathf.Abs(d) * ry - thickness * 0.5f);
+        }
+
+        private static float Box(float u, float v, float halfW, float halfH)
+        {
+            float dx = Mathf.Abs(u) - halfW;
+            float dy = Mathf.Abs(v) - halfH;
+            return Edge(Mathf.Max(dx, dy));
+        }
+
+        /// <summary>
+        /// A capsule between two points.
+        /// </summary>
+        private static float Segment(float u, float v, float ax, float ay, float bx, float by,
+                                     float halfThickness)
+        {
+            float pax = u - ax, pay = v - ay;
+            float bax = bx - ax, bay = by - ay;
+
+            float h = Mathf.Clamp01((pax * bax + pay * bay) / (bax * bax + bay * bay));
+            float dx = pax - bax * h, dy = pay - bay * h;
+
+            return Edge(Mathf.Sqrt(dx * dx + dy * dy) - halfThickness);
+        }
+
+        private static float Bolt(float u, float v)
+        {
+            float upper = Segment(u, v, 0.20f, 0.86f, -0.26f, 0.08f, Stroke * 0.85f);
+            float cross = Segment(u, v, -0.26f, 0.08f, 0.20f, 0.02f, Stroke * 0.85f);
+            float lower = Segment(u, v, 0.20f, 0.02f, -0.16f, -0.86f, Stroke * 0.85f);
+            return Mathf.Max(upper, Mathf.Max(cross, lower));
+        }
+
+        private static float SprintBolt(float u, float v)
+        {
+            float bolt = Bolt(u - 0.16f, v);
+            float upperTrail = Segment(u, v, -0.82f, 0.34f, -0.34f, 0.34f, Stroke * 0.45f);
+            float lowerTrail = Segment(u, v, -0.76f, -0.36f, -0.42f, -0.36f, Stroke * 0.45f);
+            return Mathf.Max(bolt, Mathf.Max(upperTrail, lowerTrail));
+        }
+
+        private static float SeismicBoot(float u, float v)
+        {
+            float shin = Box(u + 0.24f, v - 0.34f, 0.18f, 0.43f);
+            float foot = Box(u - 0.02f, v + 0.10f, 0.45f, 0.18f);
+            float toe = Disc(u - 0.43f, v + 0.10f, 0.18f);
+            float ground = Segment(u, v, -0.82f, -0.56f, 0.82f, -0.56f, Stroke * 0.52f);
+            float shockL = Segment(u, v, -0.22f, -0.38f, -0.65f, -0.18f, Stroke * 0.42f);
+            float shockR = Segment(u, v, 0.26f, -0.38f, 0.68f, -0.18f, Stroke * 0.42f);
+            return Mathf.Max(Mathf.Max(shin, Mathf.Max(foot, toe)),
+                Mathf.Max(ground, Mathf.Max(shockL, shockR)));
+        }
+
+        private static float HornedCarapace(float u, float v)
+        {
+            float shell = Crest(u, v + 0.10f, 1.34f, 1.42f);
+            float hornL = Segment(u, v, -0.48f, 0.46f, -0.78f, 0.84f, Stroke * 0.62f);
+            float hornR = Segment(u, v, 0.48f, 0.46f, 0.78f, 0.84f, Stroke * 0.62f);
+            float groove = Mathf.Max(
+                Segment(u, v, -0.34f, 0.30f, 0.0f, -0.12f, Stroke * 0.28f),
+                Segment(u, v, 0.34f, 0.30f, 0.0f, -0.12f, Stroke * 0.28f));
+            return Mathf.Max(Sub(shell, groove), Mathf.Max(hornL, hornR));
+        }
+
+        private static float GhostStep(float u, float v)
+        {
+            float crescent = Sub(Disc(u - 0.18f, v + 0.02f, 0.70f),
+                                 Disc(u - 0.42f, v + 0.16f, 0.60f));
+            float wispTop = Segment(u, v, 0.15f, 0.46f, 0.74f, 0.64f, Stroke * 0.42f);
+            float wispBottom = Segment(u, v, 0.18f, -0.36f, 0.76f, -0.52f, Stroke * 0.42f);
+            float spark = Disc(u - 0.50f, v + 0.36f, 0.12f);
+            return Mathf.Max(crescent, Mathf.Max(wispTop, Mathf.Max(wispBottom, spark)));
+        }
+
+        /// <summary>A fat chevron pointing right, of the given vertical span.</summary>
+        private static float Chevron(float u, float v, float halfSpan, float thickness)
+        {
+            if (Mathf.Abs(v) > halfSpan) return 0.0f;
+
+            float leg = u + Mathf.Abs(v) * 0.9f;
+            return Edge(Mathf.Abs(leg) - thickness * 0.5f);
+        }
+
+        private static float DownTriangle(float u, float v, float halfW, float height)
+        {
+            if (v < -height || v > 0.0f) return 0.0f;
+
+            float t = Mathf.InverseLerp(-height, 0.0f, v);
+            return Edge(Mathf.Abs(u) - halfW * t);
+        }
+
+        private static float UpTriangle(float u, float v, float halfW, float height)
+        {
+            if (v < 0.0f || v > height) return 0.0f;
+
+            float t = Mathf.InverseLerp(0.0f, height, v);
+            return Edge(Mathf.Abs(u) - halfW * (1.0f - t));
+        }
+
+        private static float RightTriangle(float u, float v, float halfH, float length)
+        {
+            if (u < -length || u > 0.0f) return 0.0f;
+
+            float t = Mathf.InverseLerp(-length, 0.0f, u);
+            return Edge(Mathf.Abs(v) - halfH * (1.0f - t));
+        }
+
+        /// <summary>A solid shield crest: straight shoulders, tapering to a point.</summary>
+        private static float Crest(float u, float v, float width, float height)
+        {
+            if (v > height * 0.5f || v < -height * 0.5f) return 0.0f;
+
+            float t = Mathf.InverseLerp(height * 0.5f, -height * 0.5f, v);
+            float curve = 1.0f - Mathf.Pow(t, 4.0f);
+            return Edge(Mathf.Abs(u) - width * 0.5f * Mathf.Max(0.02f, curve));
+        }
+
+        private static float Spokes(float u, float v, int count, float inner, float outer,
+                                    float thickness)
+        {
+            float best = 0.0f;
+
+            for (int i = 0; i < count; i++)
+            {
+                float angle = Mathf.PI * 2.0f * i / count;
+                float cos = Mathf.Cos(angle);
+                float sin = Mathf.Sin(angle);
+
+                float su = u * cos + v * sin;
+                float sv = -u * sin + v * cos;
+
+                best = Mathf.Max(best, Segment(su, sv, inner, 0.0f, outer, 0.0f, thickness * 0.5f));
+            }
+
+            return best;
+        }
+
+        // ------------------------------------------------------------------ bespoke helpers
+
+        private static float FissureCrack(float u, float v)
+        {
+            float s1 = Segment(u, v, 0.05f, 0.85f, -0.15f, 0.20f, Stroke * 0.9f);
+            float s2 = Segment(u, v, -0.15f, 0.20f, 0.15f, -0.25f, Stroke * 0.9f);
+            float s3 = Segment(u, v, 0.15f, -0.25f, -0.05f, -0.85f, Stroke * 0.9f);
+            float b1 = Segment(u, v, -0.15f, 0.20f, -0.65f, 0.45f, Stroke * 0.75f);
+            float b2 = Segment(u, v, 0.15f, -0.25f, 0.65f, -0.40f, Stroke * 0.75f);
+            return Mathf.Max(Mathf.Max(s1, s2), Mathf.Max(s3, Mathf.Max(b1, b2)));
+        }
+
+        private static float FlameBurst(float u, float v)
+        {
+            float fireball = EllipseRing(u - 0.38f, v, 0.36f, 0.36f, Stroke * 0.76f);
+            float hotCore = Disc(u - 0.38f, v, 0.13f);
+            float trail = Segment(u, v, -0.70f, 0.0f, 0.08f, 0.0f, Stroke * 0.72f);
+            float upperFlame = Segment(u, v, -0.72f, 0.36f, 0.12f, 0.14f, Stroke * 0.62f);
+            float lowerFlame = Segment(u, v, -0.72f, -0.36f, 0.12f, -0.14f, Stroke * 0.62f);
+            return Mathf.Max(Mathf.Max(fireball, hotCore),
+                Mathf.Max(trail, Mathf.Max(upperFlame, lowerFlame)));
+        }
+
+        private static float SupernovaStar(float u, float v)
+        {
+            float core = Disc(u, v, 0.28f);
+            float s4 = Spokes(u, v, 4, 0.24f, 0.92f, Stroke * 1.25f);
+            float d4 = Spokes(u * 0.7071f - v * 0.7071f, u * 0.7071f + v * 0.7071f, 4, 0.24f, 0.72f, Stroke * 0.85f);
+            return Mathf.Max(core, Mathf.Max(s4, d4));
+        }
+
+        private static float FrostSheet(float u, float v)
+        {
+            float slab = EllipseRing(u, v - 0.04f, 0.86f, 0.48f, Stroke * 0.95f);
+            float crystal = Spokes(u, v + 0.03f, 4, 0.0f, 0.34f, Stroke * 0.62f);
+            float center = Disc(u, v + 0.03f, 0.12f);
+            float glint = Segment(u, v, 0.46f, 0.10f, 0.70f, 0.24f, Stroke * 0.42f);
+            return Mathf.Max(slab, Mathf.Max(crystal, Mathf.Max(center, glint)));
+        }
+
+        private static float IceBarricade(float u, float v)
+        {
+            float center = Box(u, v + 0.12f, 0.20f, 0.48f);
+            float centerTip = UpTriangle(u, v - 0.36f, 0.20f, 0.48f);
+            float left = Box(u + 0.46f, v + 0.23f, 0.17f, 0.37f);
+            float leftTip = UpTriangle(u + 0.46f, v - 0.14f, 0.17f, 0.34f);
+            float right = Box(u - 0.46f, v + 0.23f, 0.17f, 0.37f);
+            float rightTip = UpTriangle(u - 0.46f, v - 0.14f, 0.17f, 0.34f);
+            float baseLine = Segment(u, v, -0.78f, -0.62f, 0.78f, -0.62f, Stroke * 0.45f);
+            return Mathf.Max(baseLine, Mathf.Max(Mathf.Max(center, centerTip),
+                Mathf.Max(Mathf.Max(left, leftTip), Mathf.Max(right, rightTip))));
+        }
+
+        private static float Snowflake(float u, float v)
+        {
+            float rays = Spokes(u, v, 6, 0.0f, 0.88f, Stroke * 0.66f);
+            float branch1 = Segment(u, v, 0.0f, 0.54f, -0.20f, 0.72f, Stroke * 0.36f);
+            float branch2 = Segment(u, v, 0.0f, 0.54f, 0.20f, 0.72f, Stroke * 0.36f);
+            float branch3 = Segment(u, v, 0.47f, -0.27f, 0.64f, -0.08f, Stroke * 0.36f);
+            float branch4 = Segment(u, v, -0.47f, -0.27f, -0.64f, -0.08f, Stroke * 0.36f);
+            float center = Disc(u, v, 0.15f);
+            return Mathf.Max(rays, Mathf.Max(center,
+                Mathf.Max(Mathf.Max(branch1, branch2), Mathf.Max(branch3, branch4))));
+        }
+
+        private static float StaticOrb(float u, float v)
+        {
+            float brokenOrbit = Sub(EllipseRing(u, v, 0.74f, 0.74f, Stroke * 0.72f),
+                                    Box(u, v, 0.12f, 0.92f));
+            float core = EllipseRing(u, v, 0.27f, 0.27f, Stroke * 0.58f);
+            float coreBolt = SprintBolt(u * 2.35f, v * 2.35f);
+            float sparkL = Segment(u, v, -0.84f, 0.12f, -0.64f, 0.28f, Stroke * 0.42f);
+            float sparkR = Segment(u, v, 0.84f, -0.12f, 0.64f, -0.28f, Stroke * 0.42f);
+            return Mathf.Max(brokenOrbit, Mathf.Max(core,
+                Mathf.Max(coreBolt, Mathf.Max(sparkL, sparkR))));
+        }
+
+        private static float ThunderstrikeCloud(float u, float v)
+        {
+            float c1 = Disc(u - 0.32f, v - 0.42f, 0.27f);
+            float c2 = Disc(u + 0.32f, v - 0.42f, 0.27f);
+            float c3 = Disc(u, v - 0.52f, 0.34f);
+            float cloudBase = Box(u, v - 0.30f, 0.62f, 0.17f);
+            float cloud = Mathf.Max(cloudBase, Mathf.Max(c1, Mathf.Max(c2, c3)));
+
+            // Heavy lightning bolt striking down from cloud base
+            float boltTop = Segment(u, v, 0.08f, 0.20f, -0.22f, -0.22f, Stroke * 0.85f);
+            float boltCross = Segment(u, v, -0.22f, -0.22f, 0.14f, -0.26f, Stroke * 0.85f);
+            float boltBot = Segment(u, v, 0.14f, -0.26f, -0.06f, -0.88f, Stroke * 0.85f);
+            float strike = Mathf.Max(boltTop, Mathf.Max(boltCross, boltBot));
+
+            return Mathf.Max(cloud, strike);
+        }
+
+        private static float KuroGhostPet(float u, float v)
+        {
+            // Head and body
+            float head = Disc(u, v - 0.08f, 0.46f);
+            float earL = DownTriangle(u - 0.26f, v - 0.42f, 0.15f, 0.24f);
+            float earR = DownTriangle(u + 0.26f, v - 0.42f, 0.15f, 0.24f);
+            float body = Box(u, v + 0.18f, 0.46f, 0.26f);
+            float lobes = Mathf.Max(
+                Disc(u - 0.30f, v + 0.44f, 0.16f),
+                Mathf.Max(Disc(u, v + 0.44f, 0.16f), Disc(u + 0.30f, v + 0.44f, 0.16f)));
+
+            float ghost = Mathf.Max(head, Mathf.Max(body, Mathf.Max(lobes, Mathf.Max(earL, earR))));
+
+            // Cut out cute ghost eyes
+            float eyeL = Disc(u - 0.16f, v - 0.10f, 0.09f);
+            float eyeR = Disc(u + 0.16f, v - 0.10f, 0.09f);
+
+            return Sub(ghost, Mathf.Max(eyeL, eyeR));
+        }
+
+        private static float SpiralVoid(float u, float v)
+        {
+            float eye = EllipseRing(u, v, 0.86f, 0.58f, Stroke * 0.72f);
+            float core = Disc(u, v, 0.18f);
+            float hook1 = Segment(u, v, -0.08f, 0.18f, 0.52f, 0.30f, Stroke * 0.56f);
+            float hook2 = Segment(u, v, 0.08f, -0.18f, -0.52f, -0.30f, Stroke * 0.56f);
+            float tail1 = Segment(u, v, 0.52f, 0.30f, 0.66f, 0.10f, Stroke * 0.44f);
+            float tail2 = Segment(u, v, -0.52f, -0.30f, -0.66f, -0.10f, Stroke * 0.44f);
+            return Mathf.Max(eye, Mathf.Max(core,
+                Mathf.Max(Mathf.Max(hook1, hook2), Mathf.Max(tail1, tail2))));
+        }
+
+        private static float HexWardSigil(float u, float v)
+        {
+            // Hexagonal rune circle with outer ring, inner ring and 6 radiating rune spokes
+            float outerRing = EllipseRing(u, v, 0.84f, 0.84f, Stroke * 0.72f);
+            float innerRing = EllipseRing(u, v, 0.44f, 0.44f, Stroke * 0.60f);
+            float spokes = Spokes(u, v, 6, 0.22f, 0.90f, Stroke * 0.55f);
+            float core = Disc(u, v, 0.16f);
+            return Mathf.Max(outerRing, Mathf.Max(innerRing, Mathf.Max(spokes, core)));
+        }
+
+        private static float ShadowBlinkRift(float u, float v)
+        {
+            // Diamond dimensional rift with shadow streaks
+            float dx = Mathf.Abs(u) / 0.42f + Mathf.Abs(v) / 0.65f;
+            float riftCore = Edge(dx - 1.0f);
+            float dxIn = Mathf.Abs(u) / 0.24f + Mathf.Abs(v) / 0.42f;
+            float riftHole = Edge(dxIn - 1.0f);
+            float riftRing = Sub(riftCore, riftHole);
+            float centerGlint = Disc(u, v, 0.10f);
+            float streakL = Segment(u, v, -0.82f, 0.0f, -0.42f, 0.0f, Stroke * 0.75f);
+            float streakR = Segment(u, v, 0.42f, 0.0f, 0.82f, 0.0f, Stroke * 0.75f);
+            float spark1 = Segment(u, v, -0.55f, 0.35f, -0.32f, 0.22f, Stroke * 0.45f);
+            float spark2 = Segment(u, v, 0.32f, -0.22f, 0.55f, -0.35f, Stroke * 0.45f);
+            return Mathf.Max(riftRing, Mathf.Max(centerGlint,
+                Mathf.Max(Mathf.Max(streakL, streakR), Mathf.Max(spark1, spark2))));
+        }
+
+        private static float SolarEclipseNova(float u, float v)
+        {
+            // Crowned solar eclipse: dark moon core, glowing corona ring, and 8 solar flare rays
+            float corona = EllipseRing(u, v, 0.55f, 0.55f, Stroke * 0.85f);
+            float rays8 = Spokes(u, v, 8, 0.55f, 0.92f, Stroke * 0.65f);
+            float moonDisc = Disc(u + 0.08f, v - 0.04f, 0.38f);
+            float innerCrescent = Sub(Disc(u, v, 0.40f), moonDisc);
+            return Mathf.Max(corona, Mathf.Max(rays8, innerCrescent));
+        }
+
+        /// <summary>
+        /// VOODOO DOLL: the arc of THE CIRCLE across the top, three strings down to the doll's crown and mitten hands, a round sack
+        /// head with a button hole and an X cut out of it, a stout body, arms held up by the strings. Few parts at the one stroke weight.
+        /// </summary>
+        private static float VoodooMarionette(float u, float v)
+        {
+            float arc = EllipseRing(u, v - 0.66f, 0.62f, 0.2f, Stroke);
+            float strings = Mathf.Max(Segment(u, v, 0f, 0.5f, 0f, 0.26f, 0.045f),
+                Mathf.Max(Segment(u, v, -0.44f, 0.56f, -0.5f, -0.04f, 0.045f), Segment(u, v, 0.44f, 0.56f, 0.5f, -0.04f, 0.045f)));
+            float head = Disc(u, v - 0.02f, 0.27f);
+            float body = Box(u, v + 0.44f, 0.25f, 0.2f);
+            float arms = Mathf.Max(Segment(u, v, -0.2f, -0.3f, -0.5f, -0.04f, 0.09f), Segment(u, v, 0.2f, -0.3f, 0.5f, -0.04f, 0.09f));
+            float doll = Mathf.Max(head, Mathf.Max(body, arms));
+            float button = Disc(u + 0.1f, v - 0.04f, 0.065f);
+            float cross = Mathf.Max(Segment(u, v, 0.05f, 0.11f, 0.17f, -0.03f, 0.035f), Segment(u, v, 0.05f, -0.03f, 0.17f, 0.11f, 0.035f));
+            return Mathf.Max(Sub(doll, Mathf.Max(button, cross)), Mathf.Max(arc, strings));
+        }
+
+        private static float WitchfireOrb(float u, float v)
+        {
+            float wisp = EllipseRing(u, v, 0.60f, 0.75f, Stroke * 0.70f);
+            float core = Disc(u, v + 0.05f, 0.22f);
+            float tip = UpTriangle(u, v - 0.45f, 0.22f, 0.35f);
+            float flame = Mathf.Max(wisp, Mathf.Max(core, tip));
+            float sparkL = Segment(u, v, -0.70f, 0.10f, -0.50f, 0.25f, Stroke * 0.45f);
+            float sparkR = Segment(u, v, 0.50f, -0.15f, 0.70f, 0.00f, Stroke * 0.45f);
+            return Mathf.Max(flame, Mathf.Max(sparkL, sparkR));
+        }
+    }
+}
+

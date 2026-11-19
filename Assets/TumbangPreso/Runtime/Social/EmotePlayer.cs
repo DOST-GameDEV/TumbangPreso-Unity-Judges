@@ -1,0 +1,191 @@
+using System;
+using UnityEngine;
+
+namespace TumbangPreso.Social
+{
+    /// <summary>
+    /// Plays an emote on a unit and tells the other peers.
+    ///
+    /// ⚠️⚠️ AN EMOTE IS CANCELLED BY ANY REAL INPUT, AND THAT IS A SAFETY RULE RATHER THAN A
+    /// POLISH ONE. Emotes are played standing still, often deliberately, and a player who
+    /// emotes at the wrong moment must be able to abort instantly by simply playing. Without
+    /// that, an emote is a self-inflicted stun, and the taya is one lunge away.
+    ///
+    /// ⚠️ AND IT IS REFUSED WHILE THE PLAYER CANNOT ACT. Emoting out of a stun would let a
+    /// player hide the animation that tells everybody else they are stunned.
+    /// </summary>
+    [RequireComponent(typeof(CharacterMotor))]
+    public sealed class EmotePlayer : MonoBehaviour
+    {
+        public event Action<string> EmoteStarted;
+        public event Action EmoteStopped;
+
+        private CharacterMotor _motor;
+        private Visual.CharacterAnimator _animator;
+        private int _emoteEpoch;
+        private int _emoteRound;
+
+        public string Current { get; private set; }
+        public bool IsEmoting => !string.IsNullOrEmpty(Current);
+
+        private void Awake() => _motor = GetComponent<CharacterMotor>();
+
+        /// <summary>
+        /// ⚠️ RE-ASKED WHILE IT IS NULL, NOT CACHED ONCE IN Awake. `CharacterVisual.ApplyModel`
+        /// adds `CharacterAnimator` to this same GameObject well after this component's own
+        /// Awake has already run — the model, and everything it carries, is instanced later —
+        /// so caching the reference once left it null for the rest of the object's life and no
+        /// emote could ever pass the `HasEmoteClip` gate below. Same fault `Carrier.Hand()`
+        /// carries its own note about, for the same reason.
+        /// </summary>
+        private Visual.CharacterAnimator Animator
+        {
+            get
+            {
+                if (_animator == null) _animator = GetComponent<Visual.CharacterAnimator>();
+                return _animator;
+            }
+        }
+
+        /// <summary>`character_base.gd::can_emote`: `state == NORMAL and not is_emoting()`.
+        /// The second half is what stops a press mid-emote from restarting the clip and
+        /// re-triggering the camera swing on top of itself.</summary>
+        public bool CanEmote() =>
+            _motor != null && _motor.CanAct() && !_motor.Intent.Locked(Verb.EmoteWheel) && !IsEmoting;
+
+        public bool HasEmoteClip(string id) =>
+            !string.IsNullOrEmpty(id) && Animator != null && Animator.HasEmoteClip(id);
+
+        /// <summary>
+        /// Local request. ⚠️ IT ASKS THE HOST RATHER THAN PLAYING IMMEDIATELY on a client, so a
+        /// peer cannot show everyone an emote the host would have refused. In single player
+        /// this is a host with no peers and it plays straight away.
+        /// </summary>
+        public void Request(string id)
+        {
+            if (!Emotes.IsKnown(id) || !CanEmote()) return;
+
+            if (NetAuthority.ShouldResolve())
+            {
+                HostPlay(id);
+                return;
+            }
+
+            // ⚠️⚠️ THIS WAS A COMMENT SAYING "Phase 5: else send the request to the host here"
+            // AND NOTHING ELSE, SO EMOTES HAVE NEVER TRAVELLED. `MatchRpc` has carried
+            // `RequestEmoteServerRpc` and a `PlayEmote` broadcast the whole time and neither had
+            // a single caller: a client's emote played on its own screen only, and the host's
+            // played on the host's only. Nobody reports it because an emote you cannot see is
+            // indistinguishable from one nobody pressed.
+            //
+            // ⚠️ IT PLAYS NOTHING LOCALLY FIRST. Unlike a throw, an emote is cheap, has no
+            // aiming and no timing, and `CanEmote` is a rule the host may legitimately refuse.
+            // Predicting it would mean occasionally starting a dance the host then cancels, and
+            // the camera swings to third person for the duration of one.
+            Net.MatchRpc.Instance?.RequestEmoteServerRpc(_motor.PlayerSlot, id);
+        }
+
+        /// <summary>Host-side. Validates, then this is what gets broadcast.</summary>
+        public void HostPlay(string id)
+        {
+            if (!NetAuthority.ShouldResolve()) return;
+            if (!Emotes.IsKnown(id) || !CanEmote()) return;
+
+            // The host applies the accepted start before broadcasting it to viewers.
+            if (NetAuthority.IsNetworked)
+            {
+                Net.MatchRpc.Instance?.RequestEmoteServerRpc(_motor.PlayerSlot, id);
+                return;
+            }
+
+            Play(id);
+        }
+
+        /// <summary>
+        /// Applied on every peer, including the one that asked.
+        ///
+        /// ⚠️⚠️ ONLY FIRES IF THE ANIMATION ACTUALLY RESOLVES ON THIS RIG. `character_visual.gd
+        /// ::play_emote` returns false and sets nothing when the animator is missing or none of
+        /// the id's candidate clips exist, and `character_base.gd::play_emote` reads that return
+        /// value before ever calling `rig.begin_emote_view()`. Doing the same here is what keeps
+        /// the camera from swinging to third person to orbit a body that never moved: an unknown
+        /// id, or a model still mid-swap with no `CharacterAnimator` bound yet, leaves `Current`
+        /// null and fires nothing, exactly as if the press had never happened.
+        /// </summary>
+        public void Play(string id)
+        {
+            if (Animator == null || !Animator.HasEmoteClip(id)) return;
+
+            Current = id;
+            _emoteEpoch = _motor.MovementEpoch;
+            _emoteRound = GameServices.Match?.RoundNumber ?? -1;
+            EmoteStarted?.Invoke(id);
+        }
+
+        public void Stop()
+        {
+            if (!IsEmoting) return;
+
+            var rpc = NetAuthority.IsNetworked ? Net.MatchRpc.Instance : null;
+            if (rpc != null && NetAuthority.IsHost)
+            {
+                rpc.RequestEmoteServerRpc(_motor.PlayerSlot, "");
+                return;
+            }
+
+            ApplyStop();
+            if (rpc != null && _motor.IsLocallySimulated())
+                rpc.RequestEmoteServerRpc(_motor.PlayerSlot, "");
+        }
+
+        internal void ApplyStop()
+        {
+            if (!IsEmoting) return;
+
+            Current = null;
+            EmoteStopped?.Invoke();
+        }
+
+        /// <summary>
+        /// `character_base.gd::_cancel_emote_on_input` + `_on_state_changed_emote`, folded into
+        /// one poll rather than two signal handlers, with the same effect: any real input or any
+        /// loss of the NORMAL playable state ends the emote immediately.
+        ///
+        /// ⚠️ JUST-PRESSED FOR THE BUTTONS, HELD FOR THE AXES, MATCHING THE .gd EXACTLY.
+        /// `input_just_pressed` for jump/sprint/grab/special_ability means a button already
+        /// held down before the emote started does not retroactively cancel it the instant the
+        /// emote begins; `input_pressed` for the four move directions means the axis is read
+        /// live, the same way movement itself is. Reading held state for the buttons too was the
+        /// port's own bug: it cancelled an emote on frame one whenever sprint was already down.
+        ///
+        /// ⚠️ NO LUNGE HERE, AND THAT IS NOT AN OMISSION. The .gd's cancel list is exactly
+        /// move/jump/sprint/grab/special_ability; lunge is E-held resolved by `Carrier`, and
+        /// `Verb.Grab` already fires on the same press before the hold decides what it becomes.
+        /// </summary>
+        private void Update()
+        {
+            if (!IsEmoting) return;
+
+            if (_emoteEpoch != _motor.MovementEpoch || _emoteRound != (GameServices.Match?.RoundNumber ?? -1))
+            {
+                ApplyStop();
+                return;
+            }
+
+            bool drivesInput = _motor.IsLocallySimulated();
+            if (!drivesInput && !NetAuthority.IsHost) return;
+            if (Animator != null && Animator.EmoteClipFinished) { Stop(); return; }
+            if (!_motor.CanAct()) { Stop(); return; }
+            if (!drivesInput) return;
+
+            var intent = _motor.Intent;
+            bool acted = intent.MoveAxis.sqrMagnitude > 0.01f
+                         || intent.JustPressed(Verb.Jump)
+                         || intent.JustPressed(Verb.Sprint)
+                         || intent.JustPressed(Verb.Grab)
+                         || intent.JustPressed(Verb.SpecialAbility);
+
+            if (acted) Stop();
+        }
+    }
+}

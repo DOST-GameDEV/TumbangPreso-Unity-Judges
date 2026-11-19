@@ -1,0 +1,481 @@
+using System.Collections.Generic;
+using TumbangPreso.InputLayer;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI.Hub
+{
+    /// <summary>
+    /// The UX-1 front end: HOME and every screen and popup reached from it, over the live court.
+    ///
+    /// ⚠️⚠️ IT IS THE VIEW OF THE `MatchSetup` SCENE, NOT A SCENE OF ITS OWN. The owner's brief says
+    /// HOME replaces the main menu and the lobby as the hub, and the lobby's controller is where every
+    /// networking path lives (`ux1-plan.md` § 0). So `ConvertedMatchSetup` keeps the controller and
+    /// installs this as its view; <see cref="IHubHost"/> is the whole contract between them.
+    ///
+    /// ⚠️⚠️ ONE STACK, ONE BACK. Escape, pad B and Android BACK arrive once, through
+    /// `ConvertedMatchSetup.Cancel` and `MenuNav`, and <see cref="Back"/> answers them innermost
+    /// first: the top popup, then the top screen, then HOME's own answer. `CLAUDE.md` § 6.3: a player
+    /// who learns Escape is reliable and then meets one screen where it is not has learned that it is
+    /// unreliable.
+    ///
+    /// ⚠️ THE LIVE COURT IS ONE LAYER UNDER EVERYTHING, AND IT IS THE RESERVED SLOT FOR THE OWNER'S
+    /// ANIMATED HOME SCENE. The brief: "leave a clean full-bleed background layer ready for it". The
+    /// layer is <see cref="Scene"/>; replacing what is in it touches nothing else in the hub.
+    /// </summary>
+    public sealed class TumpHub : MonoBehaviour
+    {
+        public static TumpHub Current { get; private set; }
+
+        public IHubHost Host { get; private set; }
+        public Canvas Canvas { get; private set; }
+
+        /// <summary>The full-bleed background slot. Today it holds the live court.</summary>
+        public RectTransform Scene { get; private set; }
+
+        private RectTransform _screens, _popups, _overlay;
+        private Image _shade;
+        private readonly List<HubScreen> _stack = new List<HubScreen>();
+        private HubQueuePlate _plate;
+        private HubToast _toast;
+        private bool _wasInRoom, _lobbyEntryPending;
+        private HubScreen _pendingScreen;
+        private GameObject _pendingDock;
+        private static readonly Unity.Profiling.ProfilerMarker PrepareNextMarker=new("Hub.PrepareView.MoveNext");
+        private static readonly Unity.Profiling.ProfilerMarker PrepareRevealMarker=new("Hub.PrepareView.Reveal");
+        private static readonly Unity.Profiling.ProfilerMarker PrepareFocusMarker=new("Hub.PrepareView.Focus");
+        private Coroutine _preparation;
+        private System.Collections.IEnumerator _preparationWork;
+
+        /// <summary>
+        /// Where the next open of the hub should land. ⚠️ A SESSION FACT, CONSUMED ON INSTALL,
+        /// for `SceneFlow.PendingJoinCode`'s reason: a one-shot fact that is not cleared fires for ever.
+        /// </summary>
+        public static HubEntry PendingEntry = HubEntry.Home;
+
+        public static TumpHub Install(Transform owner, IHubHost host)
+        {
+            var hub = HubKit.Ensure<TumpHub>(owner.gameObject);
+            hub.Host = host;
+            hub.Build(owner);
+            Current = hub;
+            return hub;
+        }
+
+        private void Build(Transform owner)
+        {
+            Canvas = OwnerUiLayout.Canvas(owner, "TumpHubCanvas", 60);
+            var root = (RectTransform)Canvas.transform;
+
+            Scene = HubKit.Stretch(HubKit.Rect(root, "HomeScene"));
+            var ground = Scene.gameObject.AddComponent<Image>();
+            ground.color = HubStyle.Night;
+            ground.raycastTarget = false;
+            AdoptCourt();
+            // ⚠️ THE OWNER'S ANIMATED HOME SCENE, in the slot this layer was reserved for, above the
+            // court. The court stays underneath as the fallback: if the clip is missing or cannot be
+            // decoded the scene shows its poster, and with no poster the court shows through.
+            HubSceneVideo.Install(Scene, Host.Preview);
+
+            _shade = HubKit.Stretch(HubKit.Rect(root, "CourtShade")).gameObject.AddComponent<Image>();
+            _shade.color = new Color(HubStyle.Night.r, HubStyle.Night.g, HubStyle.Night.b, 0);
+            _shade.raycastTarget = false;
+            var vignette = HubKit.Stretch(HubKit.Rect(root, "Vignette")).gameObject.AddComponent<HubVignette>();
+            vignette.raycastTarget = false;
+
+            var safe = UiSafeArea.Content(Canvas, "HubSafeArea");
+            _screens = HubKit.Stretch(HubKit.Rect(safe, "Screens"));
+            _overlay = HubKit.Stretch(HubKit.Rect(safe, "Overlay"));
+            _popups = HubKit.Stretch(HubKit.Rect(safe, "Popups"));
+
+            _plate = HubQueuePlate.Build(_overlay, this);
+            // ⚠️ THE TOAST IS OVER THE POPUPS, NOT UNDER THEM. The first capture drew the sentence
+            // a press had just produced beneath a popup's dim, where it read as a stale leftover.
+            _toast = HubToast.Build(HubKit.Stretch(HubKit.Rect(safe, "Toasts")));
+
+            var entry = PendingEntry;
+            PendingEntry = HubEntry.Home;
+            Push<HubHome>();
+
+            // ⚠️ ARRIVING IN A LIVE ROOM THAT IS NOT SEARCHING IS A LOBBY: a custom room, a friend's
+            // join, or a queue match's room coming back from the results board for a rematch. A
+            // queue flag left over from before that match is cleared, or HOME would sit there with a
+            // found match nobody can see.
+            var queue = Net.Matchmaker.Current;
+            bool searching = queue != null && queue.IsQueueing;
+            if (Host.InRoom && !searching) HubQueueWatch.End();
+            if (entry == HubEntry.Lobby || (Host.InRoom && !searching)) ShowLobby();
+            else if (entry == HubEntry.GameModes) Push<HubModeSelect>();
+            _wasInRoom = Host.InRoom;
+        }
+
+        /// <summary>
+        /// Take the controller's live court and make it full-bleed.
+        ///
+        /// ⚠️ ENVELOPED AT 16:9, NEVER STRETCHED. `MapPreviewSurface` renders 16:9; on the owner's
+        /// 1600x680 window a stretched court would squash every building. Enveloping crops the top
+        /// and bottom instead, which on a street shot is sky and asphalt (`CLAUDE.md` § 6.2c row 2:
+        /// an image is fitted to the region it is SEEN in).
+        /// </summary>
+        private void AdoptCourt()
+        {
+            var preview = Host.Preview;
+            if (preview == null) return;
+            var rect = (RectTransform)preview.transform;
+            rect.SetParent(Scene, false);
+            rect.anchorMin = rect.anchorMax = rect.pivot = HubKit.Centre;
+            rect.anchoredPosition = Vector2.zero;
+            var fitter = HubKit.Ensure<AspectRatioFitter>(rect.gameObject);
+            fitter.aspectMode = AspectRatioFitter.AspectMode.EnvelopeParent;
+            fitter.aspectRatio = 16f / 9f;
+            foreach (var layout in rect.GetComponents<LayoutElement>()) layout.ignoreLayout = true;
+            SetLayer(rect, Canvas.gameObject.layer);
+        }
+
+        private static void SetLayer(Transform t, int layer)
+        {
+            t.gameObject.layer = layer;
+            for (int i = 0; i < t.childCount; i++) SetLayer(t.GetChild(i), layer);
+        }
+
+        // ------------------------------------------------------------------ stack
+
+        public HubScreen Top => _stack.Count > 0 ? _stack[_stack.Count - 1] : null;
+
+        public T Find<T>() where T : HubScreen
+        {
+            for (int i = _stack.Count - 1; i >= 0; i--) if (_stack[i] is T found) return found;
+            return null;
+        }
+
+        public T Push<T>() where T : HubScreen => Push<T>(null);
+
+        public T Push<T>(System.Action<T> configure) where T : HubScreen
+        {
+            if(_pendingScreen is T pending)return pending;
+            CancelPreparation();
+            var host = new GameObject(typeof(T).Name, typeof(RectTransform));
+            var screen = host.AddComponent<T>();
+            bool popup = screen.IsPopup;
+            var rect = (RectTransform)host.transform;
+            rect.SetParent(popup ? _popups : _screens, false);
+            host.layer = Canvas.gameObject.layer;
+            HubKit.Stretch(rect);
+            if(screen.BuildAcrossFrames&&!popup)
+            {
+                screen.Hub=this;screen.Root=rect;configure?.Invoke(screen);
+                _pendingDock=new GameObject("Preparing hub view",typeof(RectTransform),typeof(CanvasGroup));
+                var hidden=_pendingDock.GetComponent<CanvasGroup>();
+                hidden.alpha=0;hidden.interactable=false;hidden.blocksRaycasts=false;
+                _pendingDock.transform.SetParent(Canvas.transform,false);
+                HubKit.Stretch((RectTransform)_pendingDock.transform);
+                rect.SetParent(_pendingDock.transform,false);HubKit.Stretch(rect);
+                _pendingScreen=screen;_preparationWork=screen.PrepareView();
+                _preparation=StartCoroutine(PrepareScreen(screen));
+                return screen;
+            }
+            if (popup)
+            {
+                screen.ReturnFocus = EventSystem.current?.currentSelectedGameObject;
+                // A popup's root is the scrim and owns a focus path of its own (HubKit.Modal).
+                var scrim = host.AddComponent<Image>();
+                scrim.color = HubStyle.Scrim;
+                ScreenFocus.Install(host);
+            }
+
+            if (!popup)
+            {
+                // ⚠️ A FULL SCREEN OPENED FROM A POPUP CLOSES THE POPUP. The owner's flow goes HOST /
+                // JOIN popup → HOST screen; the first capture drew the popup on top of the screen it
+                // had just opened, because popups live on a layer above the screens. BACK from the
+                // new screen then returns to the screen under the popup, which is where the popup
+                // was opened from.
+                while (Top != null && Top.IsPopup)
+                {
+                    var gone = Top;
+                    _stack.RemoveAt(_stack.Count - 1);
+                    gone.gameObject.SetActive(false);
+                    Destroy(gone.gameObject);
+                }
+                foreach (var below in _stack) if (!below.IsPopup) below.gameObject.SetActive(false);
+            }
+
+            screen.Hub=this;screen.Root=rect;configure?.Invoke(screen);
+            _stack.Add(screen);
+            screen.Build();
+            RefreshChrome();
+            RefreshFocus();
+            var first = screen.FirstFocus;
+            if (first != null && UnityEngine.EventSystems.EventSystem.current != null)
+                UnityEngine.EventSystems.EventSystem.current.SetSelectedGameObject(first.gameObject);
+            return screen;
+        }
+
+        private System.Collections.IEnumerator PrepareScreen(HubScreen screen)
+        {
+            while(_pendingScreen==screen)
+            {
+                bool moved;object current=null;
+                try{using(PrepareNextMarker.Auto()){moved=_preparationWork.MoveNext();if(moved)current=_preparationWork.Current;}}
+                catch(System.Exception error){Debug.LogException(error);CancelPreparation();yield break;}
+                if(!moved)break;
+                yield return current;
+            }
+            if(_pendingScreen!=screen)yield break;
+            (_preparationWork as System.IDisposable)?.Dispose();_preparationWork=null;_preparation=null;
+            _pendingScreen=null;
+            while (Top != null && Top.IsPopup)
+            {
+                var gone = Top;
+                _stack.RemoveAt(_stack.Count - 1);
+                gone.gameObject.SetActive(false);
+                Destroy(gone.gameObject);
+            }
+            using(PrepareRevealMarker.Auto())
+            {
+                foreach(var below in _stack)if(!below.IsPopup)below.gameObject.SetActive(false);
+                screen.Root.SetParent(_screens,false);HubKit.Stretch(screen.Root);
+                screen.RevealPreparedView();
+                Destroy(_pendingDock);_pendingDock=null;_stack.Add(screen);
+            }
+            using(PrepareFocusMarker.Auto())
+            {
+                RefreshChrome();RefreshFocus();
+                if(screen.FirstFocus!=null&&UnityEngine.EventSystems.EventSystem.current!=null)
+                    UnityEngine.EventSystems.EventSystem.current.SetSelectedGameObject(screen.FirstFocus.gameObject);
+            }
+        }
+
+        private bool CancelPreparation()
+        {
+            if(_pendingScreen==null)return false;
+            if(_preparation!=null)StopCoroutine(_preparation);
+            (_preparationWork as System.IDisposable)?.Dispose();_preparationWork=null;_preparation=null;
+            Destroy(_pendingDock);_pendingDock=null;_pendingScreen=null;
+            return true;
+        }
+
+        public void Pop(HubScreen screen)
+        {
+            CancelPreparation();
+            int index = _stack.IndexOf(screen);
+            if (index < 0) return;
+            var returnFocus = screen.ReturnFocus;
+            for (int i = _stack.Count - 1; i >= index; i--)
+            {
+                var gone = _stack[i];
+                _stack.RemoveAt(i);
+                if (gone == null) continue;
+                gone.gameObject.SetActive(false);
+                Destroy(gone.gameObject);
+            }
+            ResumeTop();
+            if (returnFocus != null && returnFocus.TryGetComponent(out Selectable opener) &&
+                opener.isActiveAndEnabled && opener.IsInteractable() &&
+                (Top == null || !Top.IsPopup || opener.transform.IsChildOf(Top.Root)))
+                EventSystem.current?.SetSelectedGameObject(returnFocus);
+        }
+
+        /// <summary>Close everything above <typeparamref name="T"/>, or everything but HOME if absent.</summary>
+        public void PopTo<T>() where T : HubScreen
+        {
+            CancelPreparation();
+            while (_stack.Count > 1 && !(Top is T))
+            {
+                var gone = Top;
+                _stack.RemoveAt(_stack.Count - 1);
+                gone.gameObject.SetActive(false);
+                Destroy(gone.gameObject);
+            }
+            ResumeTop();
+        }
+
+        public void Home() => PopTo<HubHome>();
+
+        /// <summary>
+        /// Enter a custom/rematch room once, regardless of which join path completed.
+        /// Existing lobby subpages stay open when both the button callback and room observer fire.
+        /// Queue rooms retain MATCH FOUND and their timed selection instead.
+        /// </summary>
+        public void ShowLobby()
+        {
+            if (Host == null || !Host.InRoom || QueuedRoom) return;
+            _wasInRoom = true;
+            _lobbyEntryPending = false;
+            if (Find<HubLobby>() != null) return;
+            Home();
+            Push<HubLobby>();
+        }
+
+        private static bool QueuedRoom => HubQueueWatch.QueueRoom ||
+            (Net.Matchmaker.Current != null && Net.Matchmaker.Current.IsQueueing);
+
+        private void ResumeTop()
+        {
+            // The newest full screen comes back; popups above it stay as they were.
+            for (int i = _stack.Count - 1; i >= 0; i--)
+            {
+                if (_stack[i].IsPopup) continue;
+                _stack[i].gameObject.SetActive(true);
+                break;
+            }
+            Top?.Resumed();
+            RefreshChrome();
+            RefreshFocus();
+        }
+
+        /// <summary>
+        /// Rebuild the pad's focus path: the canvas's, and the top popup's own when it has one.
+        /// ⚠️ `TryGetComponent`, never `GetComponent()?.`, for `HubKit.Ensure`'s reason: a missing
+        /// component is a fake null that `?.` calls straight into.
+        /// </summary>
+        public void RefreshFocus()
+        {
+            if (Canvas.TryGetComponent(out ScreenFocus canvasFocus)) canvasFocus.Rebuild();
+            var top = Top;
+            if (top == null || !top.TryGetComponent(out ScreenFocus popupFocus)) return;
+            popupFocus.Rebuild();
+            var system = EventSystem.current;
+            if (system == null || popupFocus.Order.Count == 0) return;
+            var current = system.currentSelectedGameObject;
+            if (current != null && current.transform.IsChildOf(top.Root) &&
+                current.TryGetComponent(out Selectable selected) && selected.isActiveAndEnabled && selected.IsInteractable()) return;
+            // The underlying screen remains drawn. Give the top modal custody of Submit.
+            var first = top.FirstFocus;
+            if (first == null || !first.isActiveAndEnabled || !first.IsInteractable()) first = popupFocus.Order[0];
+            system.SetSelectedGameObject(first.gameObject);
+        }
+
+        /// <summary>BACK from any device. Always answers; HOME's own answer leaves to the title.</summary>
+        public void Back()
+        {
+            if(CancelPreparation()){MenuSfx.Back();return;}
+            var top = Top;
+            if (top == null) return;
+            MenuSfx.Back();
+            if (top.Back()) return;
+            if (_stack.Count > 1) { Pop(top); return; }
+        }
+
+        public bool AtHome => Top is HubHome;
+
+        /// <summary>
+        /// HOME is the screen being drawn, even with a popup (the MENU, a toast card) over it.
+        /// ⚠️ NOT <see cref="AtHome"/>: a popup keeps the screen under it drawn and dimmed, so
+        /// anything that belongs to HOME's picture has to stay up under one. `HubSceneVideo` read
+        /// `AtHome` and hid the owner's HOME loop the moment the hamburger MENU opened, which swapped
+        /// the background behind the menu for the live court (owner, 2026-09-26).
+        /// </summary>
+        /// <summary>
+        /// HOME, or a page laid over HOME's scene (one whose ground is the HubScenery maroon wash,
+        /// 2026-10-22): the owner's animated HOME scene plays behind it instead of the live court.
+        /// </summary>
+        public bool ShowingHomeScene
+        {
+            get
+            {
+                for (int i = _stack.Count - 1; i >= 0; i--)
+                    if (!_stack[i].IsPopup)
+                        return _stack[i] is HubHome || (_stack[i].Root != null && _stack[i].Root.GetComponent<HubOverHomeScene>() != null);
+                return false;
+            }
+        }
+
+        public bool ShowingHome
+        {
+            get
+            {
+                for (int i = _stack.Count - 1; i >= 0; i--)
+                    if (!_stack[i].IsPopup) return _stack[i] is HubHome;
+                return false;
+            }
+        }
+
+        private void RefreshChrome()
+        {
+            float shade = 0;
+            bool plate = true, board = false;
+            for (int i = _stack.Count - 1; i >= 0; i--)
+            {
+                if (_stack[i].IsPopup) continue;
+                shade = _stack[i].CourtShade;
+                plate = _stack[i].ShowsQueuePlate;
+                board = _stack[i].WearsBoard;
+                break;
+            }
+            // ⚠️ A DIM, NOT A WALL, ON A BOARD SCREEN (2026-10-22): HOME's scene stays visible, pushed back
+            // in her maroon's deepest tone under the screen's maroon wash. Other screens keep the night shade.
+            _shade.color = board ? new Color(0.165f, 0.016f, 0.063f, shade * 0.40f)
+                                 : new Color(HubStyle.Night.r, HubStyle.Night.g, HubStyle.Night.b, shade * 0.88f);
+            _plate.Allowed = plate && !(Top != null && Top.IsPopup && !Top.ShowsQueuePlate);
+        }
+
+        // A hub that never ran Build (a screen built alone, as the EditMode room tests do) has no toast layer.
+        public void Toast(string words) { if (_toast != null) _toast.Show(words); }
+
+        private void Update()
+        {
+            if (Host == null) return;
+
+            // Invites and -tp-lobbyjoin can finish after Build without pressing a hub button.
+            // Observe before the overlay guard, then present when the overlay gives control back.
+            bool inRoom = Host.InRoom;
+            if (inRoom && !_wasInRoom && !QueuedRoom) _lobbyEntryPending = true;
+            if (!inRoom) _lobbyEntryPending = false;
+            _wasInRoom = inRoom;
+
+            // ⚠️ AN OLDER OVERLAY THE CONTROLLER OWNS DRAWS ON ITS OWN CANVAS, and the hub steps
+            // aside rather than competing with it for the screen and the pad.
+            bool overlay = Host.OverlayOpen;
+            if (Canvas.enabled == overlay) Canvas.enabled = !overlay;
+            if (overlay) return;
+
+            if (_lobbyEntryPending) ShowLobby();
+
+            HubQueueWatch.Tick(this);
+            // ⚠️ A SPECTATOR HAS NO SEAT, SO NO PICK AND NO BALLOT (owner, 2026-10-22: "ur a spectator,
+            // its weird af that u still do character select"). The host counts only seated players for
+            // both (`MatchRpc.HostDeclareReady`, `HostReceiveQueueMapVote`), so nothing waits on them; a
+            // spectator stays on the lobby, which says what the players are doing.
+            bool watching = Host.Spectating;
+            if (Net.MatchRpc.Instance != null && Net.MatchRpc.Instance.CharacterSelecting && !watching &&
+                (!(Top is HubCharacterSelect selection) || !selection.Timed))
+            {
+                Home();
+                Push<HubCharacterSelect>(screen => screen.Timed = true);
+            }
+            if (watching && Host.InRoom && (Top is HubCharacterSelect || Top is HubMapVote)) ShowLobby();
+            if (Host.MapVoting && !watching && !(Top is HubMapVote))
+            {
+                Home();
+                Push<HubMapVote>();
+            }
+            if (!QueuedRoom && Host.InRoom && !Host.MatchInProgress && !Host.MapVoting &&
+                Net.MatchRpc.Instance != null && !Net.MatchRpc.Instance.CharacterSelecting &&
+                Top is HubCharacterSelect customSelection && customSelection.Timed)
+            {
+                ShowLobby();
+                Toast("Match preparation cancelled. Check the players and room rules before starting again.");
+            }
+            var seatOffer = Host.SeatSwapOffer;
+            if (seatOffer != null && seatOffer.Incoming && !QueuedRoom && Host.InRoom && !Host.MatchInProgress
+                && !(Top is HubSeatSwapPopup))
+                Push<HubSeatSwapPopup>(popup => popup.Offer = seatOffer);
+            Top?.Tick();
+        }
+
+        private void OnDestroy()
+        {
+            CancelPreparation();
+            if (Current == this) Current = null;
+        }
+    }
+
+    public enum HubEntry
+    {
+        Home = 0,
+        Lobby = 1,
+        GameModes = 2,
+    }
+}

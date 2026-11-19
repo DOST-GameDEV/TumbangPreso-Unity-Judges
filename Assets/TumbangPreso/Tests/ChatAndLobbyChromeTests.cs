@@ -1,0 +1,424 @@
+using NUnit.Framework;
+using System.Reflection;
+using System.Text;
+using TumbangPreso.Net;
+using TumbangPreso.UI;
+using Unity.Netcode;
+using UnityEngine;
+
+namespace TumbangPreso.Tests
+{
+    /// <summary>
+    /// The two things in the PUBG lobby batch that are pure functions, and are therefore worth
+    /// asserting rather than photographing.
+    ///
+    /// ⚠️ EVERYTHING ELSE IN THAT BATCH IS LAYOUT OR NETWORK, and both need a running screen: the
+    /// chrome is checked by `LobbyStyleProbe` and the joins by the two-process run in
+    /// `docs/TODO.md` § 68.14. What lives here is the host's clamp on an untrusted string and the
+    /// palette rule the nameplates have to obey, because a test can settle both in milliseconds
+    /// and neither is visible in a screenshot.
+    /// </summary>
+    public class ChatAndLobbyChromeTests
+    {
+        [Test]
+        public void ConnectionApprovalRefusesThePreviousProtocolAndAcceptsTheCurrentLanHello()
+        {
+            var previousSession = NetSession.Instance;
+            var previousProvider = NetAuthority.Provider;
+            var root = new GameObject("Protocol approval contract");
+            root.SetActive(false);
+            try
+            {
+                var session = root.AddComponent<NetSession>();
+                Assert.IsNull(root.GetComponent<NetworkManager>(), "The inactive fixture ran session Awake.");
+                Assert.AreSame(previousSession, NetSession.Instance);
+                Assert.AreSame(previousProvider, NetAuthority.Provider);
+                const BindingFlags flags = BindingFlags.Instance | BindingFlags.NonPublic;
+                var helloType = typeof(NetSession).GetNestedType("ConnectionHello", BindingFlags.NonPublic);
+                var hello = System.Activator.CreateInstance(helloType, true);
+                helloType.GetField("Token").SetValue(hello, "protocol-contract-lan");
+                helloType.GetField("Name").SetValue(hello, "Protocol contract");
+                // Empty account/proof is the supported LAN identity, not an authentication bypass.
+                helloType.GetField("AccountPlayerId").SetValue(hello, "");
+                helloType.GetField("HandleProof").SetValue(hello, "");
+                helloType.GetField("SkillContract").SetValue(hello, SkillContractFingerprint.Current);
+                var approve = typeof(NetSession).GetMethod("ApproveConnection", flags);
+                var cached = (System.Collections.IDictionary)typeof(NetSession).GetField("_helloByClient", flags).GetValue(session);
+                NetworkManager.ConnectionApprovalResponse Submit(int protocol)
+                {
+                    helloType.GetField("Protocol").SetValue(hello, protocol);
+                    var request = new NetworkManager.ConnectionApprovalRequest
+                    {
+                        ClientNetworkId = 42,
+                        Payload = Encoding.UTF8.GetBytes(JsonUtility.ToJson(hello)),
+                    };
+                    var response = new NetworkManager.ConnectionApprovalResponse { Pending = true, CreatePlayerObject = true };
+                    approve.Invoke(session, new object[] { request, response });
+                    return response;
+                }
+                var old = Submit(NetSession.ProtocolVersion - 1);
+                Assert.IsFalse(old.Approved);
+                Assert.AreEqual($"Game version mismatch (network protocol {NetSession.ProtocolVersion})", old.Reason);
+                Assert.IsFalse(old.Pending);
+                Assert.IsFalse(cached.Contains(42UL), "The refused hello was cached as admitted.");
+                helloType.GetField("SkillContract").SetValue(hello, new string('0', 64));
+                var mismatched = Submit(NetSession.ProtocolVersion);
+                Assert.IsFalse(mismatched.Approved);
+                StringAssert.Contains("Skill rules differ", mismatched.Reason);
+                Assert.IsFalse(cached.Contains(42UL));
+                helloType.GetField("SkillContract").SetValue(hello, SkillContractFingerprint.Current);
+                var current = Submit(NetSession.ProtocolVersion);
+                Assert.IsTrue(current.Approved, "A valid current-protocol LAN hello failed the positive control.");
+                Assert.IsFalse(current.Pending);
+                Assert.IsFalse(current.CreatePlayerObject);
+                Assert.AreEqual("", current.Reason);
+                Assert.IsTrue(cached.Contains(42UL));
+                Assert.IsNull(root.GetComponent<NetworkManager>());
+                Assert.AreSame(previousSession, NetSession.Instance);
+                Assert.AreSame(previousProvider, NetAuthority.Provider);
+            }
+            finally
+            {
+                Object.DestroyImmediate(root);
+                Assert.AreSame(previousSession, NetSession.Instance);
+                Assert.AreSame(previousProvider, NetAuthority.Provider);
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // THE HOST'S CLAMP ON A CHAT LINE
+        //
+        // ⚠️⚠️ A CHAT LINE IS THE ONLY VARIABLE-LENGTH PAYLOAD A PEER CAN AUTHOR, and the only
+        // string in this game that reaches the screen without anybody on this machine having
+        // typed it. `docs/TODO.md` § 38.9 found two request channels any client could flood; this
+        // is the third and the first one whose SIZE is chosen by the sender.
+        // -------------------------------------------------------------------
+
+        [Test]
+        public void AChatLineIsCutToTheLengthTheHostWillRelay()
+        {
+            string huge = new string('x', MatchRpc.MaxChatLength * 4);
+
+            string clamped = MatchRpc.ClampChatLine(huge);
+
+            Assert.AreEqual(MatchRpc.MaxChatLength, clamped.Length,
+                "a line longer than the cap must come back at exactly the cap, or the bound is " +
+                "advisory and the panel it draws into has no height limit.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A LENGTH CAP ALONE BOUNDS THE CHARACTERS AND NOT THE HEIGHT, AND HEIGHT IS WHAT
+        /// THE PANEL HAS A FIXED AMOUNT OF. Legacy `Text` honours a `\n`, so 120 characters
+        /// arranged as sixty newlines is a sixty-line message inside a six-line log: it pushes
+        /// every other line out and, in a match, paints most of the frame. That is a `VISION.md`
+        /// § 2 rule 5 failure delivered from another machine.
+        /// </summary>
+        [Test]
+        public void AChatLineCannotBeMadeTallWithNewlines()
+        {
+            string sneaky = "one\ntwo\r\nthree\rfour";
+
+            string clamped = MatchRpc.ClampChatLine(sneaky);
+
+            Assert.IsFalse(clamped.Contains("\n"), "a newline survived the clamp.");
+            Assert.IsFalse(clamped.Contains("\r"), "a carriage return survived the clamp.");
+            StringAssert.Contains("one", clamped);
+            StringAssert.Contains("four", clamped);
+        }
+
+        [TestCase(118), TestCase(119)]
+        public void ChatLengthBoundaryKeepsWholeUnicodeCharacters(int prefixLength)
+        {
+            string prefix = new string('x', prefixLength);
+            string face = "\uD83D\uDE42";
+            string clamped = MatchRpc.ClampChatLine(prefix + face + "extra");
+            Assert.DoesNotThrow(() => new UTF8Encoding(false, true).GetByteCount(clamped),
+                "The length cap must not create an unmatched surrogate from a valid message.");
+            Assert.AreEqual(prefixLength == 118 ? prefix + face : prefix, clamped);
+            Assert.LessOrEqual(clamped.Length, MatchRpc.MaxChatLength);
+        }
+
+        [Test]
+        public void ChatFieldPreclippingCannotSendHalfAnEmoji()
+        {
+            var go = new GameObject("Chat boundary field", typeof(RectTransform));
+            try
+            {
+                var field = go.AddComponent<UnityEngine.UI.InputField>();
+                field.characterLimit = MatchRpc.MaxChatLength;
+                string prefix = new string('x', MatchRpc.MaxChatLength - 1);
+                field.text = prefix + "\uD83D\uDE42";
+                Assert.LessOrEqual(field.text.Length, MatchRpc.MaxChatLength);
+                string clamped = MatchRpc.ClampChatLine(field.text);
+                Assert.DoesNotThrow(() => new UTF8Encoding(false, true).GetByteCount(clamped));
+                Assert.AreEqual(prefix, clamped);
+            }
+            finally { Object.DestroyImmediate(go); }
+        }
+
+        [Test]
+        public void AnEmptyOrWhitespaceChatLineIsNothing()
+        {
+            Assert.AreEqual("", MatchRpc.ClampChatLine(null));
+            Assert.AreEqual("", MatchRpc.ClampChatLine(""));
+            Assert.AreEqual("", MatchRpc.ClampChatLine("     "));
+        }
+
+        /// <summary>
+        /// ⚠️ THE RATE LIMIT IS A REAL NUMBER, NOT A COMMENT. A zero or negative interval is a
+        /// flood gate that is open, and the failure is invisible until somebody holds ENTER.
+        /// </summary>
+        [Test]
+        public void TheChatRateLimitIsPositiveAndTheLengthCapFitsTheLog()
+        {
+            Assert.Greater(MatchRpc.MinChatInterval, 0.0f,
+                "a non-positive interval lets a peer send every frame.");
+
+            Assert.LessOrEqual(MatchRpc.MaxChatLength, 200,
+                "the log draws about 64 characters a line and keeps " +
+                $"{LobbyChat.MaxLines} lines; a cap this far above that is a panel that grows.");
+        }
+
+        // -------------------------------------------------------------------
+        // THE NAMEPLATE PALETTE RULE
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// ⚠️⚠️ THE LOBBY NAMEPLATES MUST NOT USE THE TWO ROLE COLOURS. `UiTheme`'s header names
+        /// `Offense` and `Defense` as the only colours in the game a player has to READ rather
+        /// than merely see, and `UiTheme.ForRole` records why a per-SEAT use of them is wrong: the
+        /// taya is derived as `(round - 1) % 4` and rotates every round, so a colour fixed to a
+        /// chair tells the player the wrong thing for three rounds out of four.
+        ///
+        /// This asserts the colours the plates actually use are the wood set, which is what stops
+        /// somebody "improving" the lobby by tinting P1 orange.
+        /// </summary>
+        [Test]
+        public void NameplatesUseTheWoodSetAndNeitherRoleColour()
+        {
+            foreach (var used in new[] { UiTheme.Cream, UiTheme.CreamMuted, UiTheme.Amber })
+            {
+                Assert.AreNotEqual(UiTheme.Offense, used,
+                    "a nameplate colour has drifted onto the ATTACKER colour.");
+                Assert.AreNotEqual(UiTheme.Defense, used,
+                    "a nameplate colour has drifted onto the DEFENDER colour.");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // THE PROTOCOL BUMP
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// ⚠️⚠️ ONE BUMP FOR THE WHOLE BATCH, AND IT IS THE CHAT'S. `docs/TODO.md` § 68.2 held
+        /// every other change in the PUBG lobby work to state that was already replicated so that
+        /// exactly one version bump was needed; § 59.4 records what a bump costs, which is that
+        /// both machines must be rebuilt from the same commit or they refuse each other at
+        /// approval. This is a tripwire rather than a truth: if somebody adds a message and
+        /// forgets the bump, the number here stops matching what they wrote and this fails.
+        ///
+        /// ⚠️⚠️ IT WENT STALE AT 7 WHILE THE CONSTANT REACHED 10, AND A TRIPWIRE NOBODY RE-ARMS
+        /// IS A TRIPWIRE THAT ONLY EVER REPORTS ITSELF. The constant was last moved by `886a981`
+        /// ("Land the last four slippers"); this assertion was last written by `ed082c8`, three
+        /// bumps earlier. Every EditMode run since has been one test red for a reason that was
+        /// true and finished, which is the state that teaches a reader to skim past the failure
+        /// list — and this suite's whole value is that the list is normally empty.
+        ///
+        /// ⚠️ THE LAN BEACON'S WIRE CHANGE ON 2026-08-29 DELIBERATELY DID **NOT** MOVE THIS.
+        /// `LanBeacon` versions its own payload with its own magic (`MagicV2`) and still parses
+        /// v1, so an old build is discovered rather than refused. `ProtocolVersion` gates the
+        /// netcode HELLO at approval and costs both machines a rebuild off the same commit
+        /// (§ 59.4); spending that on a discovery format that is explicitly backward compatible
+        /// would refuse peers who have no reason to be refused.
+        /// </summary>
+        [Test]
+        public void TheProtocolCarriesEveryRosterBump()
+        {
+            // ⚠️ 13 SINCE 2026-08-29: `Flair` was added (`Visual.MatchFlair`, docs/TODO.md
+            // § 83.16). A build without that handler drops every one of those messages and its
+            // players silently see none of the tags, blocks, bank shots or zaps the host is
+            // announcing, which is the half-working match this tripwire exists to refuse.
+            //
+            // ⚠⚠ 14 SINCE 2026-08-30: `ReqTime` and `SyncTime`, the spectator pause
+            // (docs/TODO.md § 86). This is the strongest case the number has ever had. A peer
+            // without the `SyncTime` handler **does not stop**: the pause is called, three
+            // screens freeze, one keeps playing, and the two builds then disagree about every
+            // position for as long as it lasts.
+            //
+            // ⚠⚠ 15 SINCE 2026-08-30: `MatchRecord`, the one message that carries a whole
+            // finished match to every peer (docs/TODO.md § 89.5). A peer without the handler
+            // plays the match correctly and then silently gets no end-of-match summary and no
+            // career entry for a game it just played, which is the same quiet kind of wrong the
+            // two entries above describe: nothing errors, and a player is simply missing what
+            // everybody else got.
+            //
+            // ⚠⚠ 16 SINCE 2026-08-30: the account id and the handle proof in the approval hello
+            // and in `Identify`, which is the impersonation guard (docs/TODO.md § 88.1c and
+            // § 90.1). `Identify` is read field by field in order, so a peer writing five values
+            // where the host reads seven misreads everything after the third, and that is the
+            // class of fault `audit_wire_payloads.py` cannot see because both ends of THIS build
+            // agree. The quiet half is worse than the loud one even so: a peer on 15 carries no
+            // proof, so every account handle it claims is demoted to a host-allocated tag and
+            // everybody on the older build is silently renamed in a lobby that looks fine.
+            //
+            // ⚠⚠ 17 SINCE 2026-08-31: cosmetics (docs/TODO.md § 101). One field on `Identify`,
+            // one on `SelectLobbyPick`, and **two per seat inside `SyncLobbyPicks`' loop**. That
+            // last one is the worst wire change this number has ever gated: the loop and its
+            // reader are kept in step by hand, so a peer on 16 goes out of phase on SEAT 0 and
+            // then reads the name, the picks and the ready flag of every seat after it from the
+            // wrong offset. A lobby in which everybody is wearing somebody else's face, ready
+            // state and character is not a cosmetic bug.
+            //
+            // ⚠️ AND THE TOLERANT TRICK DOES NOT APPLY HERE. `OnSyncLobbyPicksMsg` reads the
+            // trailing spectator count behind a `reader.Length > reader.Position` guard, which
+            // works for one value at the END of a payload. These two sit inside the per-seat
+            // loop with more fields after them, so there is no position at which "is there more"
+            // answers the right question.
+            // ⚠⚠ 18 SINCE 2026-08-31: the look frame (docs/TODO.md § 106.2). The per-seat
+            // `PaletteId` string became `Look` and carries a `LookCodec` frame rather than a bare
+            // palette id, so a 17 build and an 18 build read one another's seat table and dress
+            // every remote player from a string neither recognises.
+            //
+            // ⚠️ THE FIELD COUNT DID NOT CHANGE AND THE MEANING DID, WHICH IS WHY THIS BUMP IS
+            // EASY TO TALK YOURSELF OUT OF. `audit_wire_payloads.py` compares a writer to a
+            // reader inside ONE build and would stay green through a change that only breaks two
+            // builds against each other, which is the whole reason this constant exists.
+            // ⚠⚠ 19 SINCE 2026-09-01: the custom character (docs/TODO.md § 112.6). One field on
+            // `Identify`, one on `SelectLobbyPick`, and **one per seat inside `SyncLobbyPicks`'
+            // loop**, carrying a `CustomCharacterRules` `C3` frame.
+            //
+            // ⚠️⚠️ AND IT IS THE FIRST ENTRY IN THIS LIST THAT DECIDES A GAMEPLAY THING RATHER
+            // THAN A COSMETIC ONE. Inside that frame is `HeroKitId`: which hero's skills and
+            // ultimate the seat brings into Hero Strike. A peer that could not read the field
+            // would draw a stranger AND read the wrong ability tells off them, and
+            // `docs/VISION.md` § 4's whole competitive argument is that reading which ultimate an
+            // opponent has banked is a skill. The two peer-to-host messages read it behind a
+            // `reader.Length > reader.Position` guard; the per-seat one cannot, for the reason
+            // written four paragraphs up.
+            // ⚠⚠ 20 SINCE 2026-09-01: the Hero Strike BUILD (docs/TODO.md § 114.15 row 3). One
+            // field on `Identify`, one on `SelectLobbyPick`, and **one per seat inside
+            // `SyncLobbyPicks`' loop**, carrying a `HeroBuildRules` `B1` frame.
+            //
+            // ⚠️⚠️ IT IS THE SECOND ENTRY IN THIS LIST THAT DECIDES A GAMEPLAY THING, AND UNLIKE
+            // 19 IT DECIDES ONE ON EVERY SEAT IN EVERY HERO STRIKE MATCH. Inside the frame are
+            // the two ability readings that seat brought: whether Cheska's sheet is a wide slow
+            // one or a small vicious one, whether Zack's lane is wide or thin. A peer that could
+            // not read it would bind every remote body to the DEFAULT build and then simulate
+            // hazards at sizes the host never spawned, so the two machines would disagree about
+            // where the floor is dangerous. That is worse than a cosmetic misread and it is why
+            // this is a refusal at approval rather than a tolerated trailing field.
+            // ⚠⚠ 21 SINCE 2026-09-01: PHASE 12's MATCH FORMAT (`docs/TODO.md` § 115, and
+            // `docs/Formats.md`). A new `SelectFormat` / `SyncFormat` pair, and it is the THIRD
+            // entry that decides a gameplay thing and the first that decides the WIN CONDITION.
+            // A host running LAST TSINELAS STANDING and a peer that has never heard of it are two
+            // different games sharing one scoreboard: the peer sees attackers stop throwing for
+            // no reason and a round awarded to somebody it cannot account for. Cosmetic mismatch
+            // draws a stranger; this one disputes the result, so it is a refusal at approval.
+            // ⚠️⚠️ 22 SINCE 2026-09-03: LAST TSINELAS STANDING'S MATCH HALF (`docs/TODO.md`
+            // § 130.13). The paragraph above is the reason this had to move a SECOND time, and it
+            // is worth reading the two together: 21 bought "the peer knows about `MatchFormat`",
+            // which shipped a format the lobby could select and the match could not play. 22 buys
+            // "the peer knows how to run this one": a round that ends before the clock does, a new
+            // `ScoreEvent` an older peer drops rather than casts, and the `Tsinelas` stock table
+            // without which a peer never learns its own player is out and goes on letting them
+            // throw. The first bump agreed on a word; this one agrees on the rules behind it.
+            // ⚠️⚠️ 23 SINCE 2026-09-03: CUSTOM GAMES (`docs/FUTURE.md` § 12 and § 19.12). The
+            // `SelectFormat` / `SyncFormat` pair 21 bought is GONE, replaced by `SelectRules` /
+            // `SyncRules` carrying a whole `CustomGameRules.ToWire` record. **It is a replacement
+            // rather than an addition, and that is deliberate**: the format is one field of that
+            // record, so a message carrying it alone would be a second, narrower statement of the
+            // same fact, and `docs/TODO.md` § 38.5 found three dead protocols that each began as
+            // exactly that.
+            //
+            // ⚠️⚠️ AND IT IS THE FOURTH ENTRY THAT DECIDES A GAMEPLAY THING, AND THE FIRST THAT
+            // DECIDES HOW LONG THE GAME IS. `MatchDirector.TotalRounds` and
+            // `RoundDirector.RoundLength` read the rule set now, so a peer that has never heard
+            // of `SyncRules` plays the shipped four or eight rounds at ninety seconds while the
+            // host plays three at sixty. **Nothing errors.** The peer's clock simply reads
+            // 01:30 against the host's 01:00, and the match ends on a round it was not expecting,
+            // which is the same "two different games sharing one scoreboard" the 21 and 22
+            // paragraphs above describe, arriving through the clock instead of the win condition.
+            //
+            // ⚠️ THE OLD NAMES ARE NOT KEPT AS A COMPATIBILITY SHIM AND MUST NOT BE. A peer on 22
+            // that could still hear `SyncFormat` would agree about the FORMAT and disagree about
+            // the rounds and the clock, which is a worse failure than a clean refusal: it looks
+            // like it works.
+            //
+            // ⚠️⚠️ 23 TO 24 IS THE SEAT HANDOVER'S RATING, 2026-09-05, AND IT IS A FIELD RATHER
+            // THAN A MESSAGE. `ConnectionHello` gains one `int` and `JsonUtility` reads a payload
+            // without it as 0, so nothing breaks in the sense of throwing. What breaks is the
+            // RULING: `Attention.md` § 16.1 says a departing player's chair is finished by a bot
+            // at their own skill level, and a 23 peer cannot say what that is. A room with one of
+            // each hands two abandoned seats over by two different rules, and nobody in it can
+            // tell which rule they got. `docs/TODO.md` § 144.7.
+            //28 carries the accepted familiar facing through effect snapshots.
+            //29 adds phase/spin to both throw-charge messages; old players are refused.
+            //31 adds reliable CovenEffect and SkyEffect rejoin snapshots.
+            //32 requires owner confirmation before instant ice-world effects spawn.
+            //33 adds the atomic IceBegin/IceItem/IceEnd world snapshot.
+            //34 restores the joining world's held fire-charge state.
+            //37 extends atomic ground snapshots beyond the two ice field types.
+            //49 adds the seventh Hero roster index and bounded Rafi water snapshots.
+            //50 distinguishes an explicit peer leave from an unclassified disconnection.
+            //51 carries explicit edge-climb state and requests; mixed builds cannot decode it.
+            //52 derives the shared ultimate phase length from the accepted heroes' introductions.
+            //53 carries the Whirled and Chilled status clocks and the Carry message (ability overhaul).
+            //54 adds Paete: his roster index, the Rooted clock, SproutKnock, ReqBreakFree, ReqUproot.
+            //55 appends the struggle flag and plant-pull progress to SubmitMove and SyncUnit.
+            //56 appends Concussed, Feared, Disoriented, Vulnerable and the fear source to SyncUnit (ABILITY-2).
+            //57 lengthens Paete's introduction to 5.0 s, and with it the shared phase a cohort containing him derives.
+            //58 keeps Paete's guardian off the can and holds its prisoners 1.4 m out; every peer computes both.
+            //59 makes Paete's introduction 6.5 s, places his ultimate where he looks, and hands the grown guardian back at the catch.
+            //60 places THORN HARVEST where he looks (a trail runs to the spot, it bursts and catches there) and keeps BAKYA BLOOM out of the box.
+            //61 adds Featherfall pose/intent episode keys and timed restoration, with the updated 5 s / 40 s rules.
+            //62 and 63 (the world-field header and the shared ability serializer) are recorded in NetSession.
+            //64 adds the shared skill fingerprint, including Phaister's updated 5.0 s introduction.
+            //65 adds phase-aware world freshness and ability-owned prepared-effect recovery.
+            //87 changes what the map indices mean: LagoonCove at 4 (the first Lagoon vaulted), Kanto at 5.
+            //88 and 89 (intermission votes, rematch identities) are recorded in NetSession; this line was not moved with them.
+            //90 adds companion bodies (seats 4 to 7, `CompanionSet`).
+            //91 names the scoring body in `Score` and lengthens Phaister's introduction to 6.4 s (VOODOO DOLL v7).
+            //92 makes Phaister's introduction 6.35 s (THE TWIST) and the doll 0.5 of a player's speed.
+            //93 makes Phaister's introduction 6.0 s (it ends on the doll's stare).
+            //94 to 158 are recorded in `NetSession` beside the number; this line was not moved with them, so this test had
+            //been red since 94. It is moved now, deliberately, with:
+            //159 combines companion-aware clips with QoL movement, map and performance contracts.
+            //160 appends POSSESSED to SyncUnit and replaces Kuro's Haunt with LET THEM IN (first named PRUSISYON).
+            //161 appends BLINDED to SyncUnit and Blindfold to the world snapshot (Nemu's DON'T LOOK replaces KURO: SIT!).
+            //162 makes Nemu's SKITTER host-confirmed and LOOKOUT a can stand-up (no wire change; the rules differ).
+            //165 replaces Nemu's KURO! self speed with DEAD WEIGHT, a slow on rivals near her ghosts (no wire change; the rules differ).
+            //166 makes Concussed 5 s, the Wiki's number (no wire change; the rules differ).
+            //167 resolves CONTINENTAL DRIFT at the cutscene's cut: the lane throws everyone, Concussed on landing (no wire change).
+            //168 makes CONTINENTAL DRIFT's cascade play's again, band by band, each band throwing (no wire change).
+            //169 keeps the cutscenes' moves at the hand-back: Amihan's thrown mid-air, Nemu's where they ran (no wire change).
+            //170 makes a Concussed throw wobble harder and often misfire far off its aim (no wire change; the rules differ).
+            //171 gives Dante MOUNTAIN FORM after CONTINENTAL DRIFT: 30 s of status immunity, x1.25 throws that stagger and knock
+            //back, and its time left in the timed-kit snapshot's passive fields.
+            //QoLUpdates' own 159 (not the 159 above; the two lines took the number separately) makes Amihan's Whirlwind hit a
+            //circle under one whirlwind (radius 2.1 m, born 2.4 m ahead), not a bowed band.
+            //172 is where QoLUpdates and ASTRAReworks meet: one number above both (159 and 171), with both rule sets in.
+            //172 removes Bayan Plaza and Sa Bubong from the indexed map pool.
+            //173 joins the two 172s (the branch merge and the smaller pool) and appends Payo to the indexed map pool.
+            //174 merges the player's room: rules carry per-seat bots and an empty seat with no bot has no body.
+            //175 reworks Nemu: dormant ghosts ride her ghost frames and "ReqReclaim" joins the wire.
+            //176 is Sean's lava brawler kit: the hot can rides a second `SyncLata` suffix and his rules change on the same ids.
+            //177 sends Sean's hits as five appended flair kinds and his PRESSURE bars in the timed-kit passive float.
+            //178 appends LAVA RAM's SEARED clock to `SyncUnit`.
+            //179 makes the reset a held carry: the carry rides a third `SyncLata` suffix and COMPLETE no longer restores.
+            //180 is MAYON AWAKENS v2: the volcano's bombs ride an appended flair kind and the ultimate is aimed.
+            //181 retires the Cinder Gate: snapshot kind 17 is reserved and no longer carries a dynamic identity.
+            //183 lowers Live Wire to a jumpable ankle-height contact line.
+            //184 keeps Live Wire on the court with a reel-in request, adds Zack's Overclock zap messages and his Charge rates.
+            //185 lengthens Basilio's ultimate introduction to the 4.86 s longhorn cutscene.
+            //186 records Dante's mountain and the taya's headband in clip version 18.
+            //186 widens Ilyas's Baha to a 4.2 m half width, which the field check compares.
+            //187 merges those two 186 changes, so neither kind of 186 build meets a merged one.
+            //188 adds the vote to skip the match opening.
+            //189 trims Yasmin's shared introduction after the heart.
+            Assert.AreEqual(189, NetSession.ProtocolVersion,
+                "a message, a replicated roster index or a connection-hello field has been added " +
+                "or removed. Bump this number and `NetSession.ProtocolVersion` together, in the " +
+                "same commit.");
+        }
+    }
+}

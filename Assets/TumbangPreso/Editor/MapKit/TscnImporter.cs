@@ -1,0 +1,1133 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using UnityEditor;
+using UnityEngine;
+
+namespace TumbangPreso.EditorTools.MapKit
+{
+    /// <summary>
+    /// Converts a Godot `.tscn` map into a Unity scene, node for node.
+    ///
+    /// ⚠️⚠️ THIS CONVERTS THE OUTPUT, NOT THE BUILDER, AND THAT IS THE WHOLE POINT. The maps
+    /// are produced by roughly 190 KB of Python (`build_eskinita.py`, `build_bayan_plaza.py`,
+    /// `mapkit.py`). Reimplementing that in C# would be weeks of work and would produce an
+    /// arena that is *similar* to the one the game was balanced on. The `.tscn` those builders
+    /// emit is plain text listing every node with an explicit transform, so converting it
+    /// gives a genuine one-to-one copy of the arena that actually shipped: same pieces, same
+    /// positions, same walls.
+    ///
+    /// ⚠️ THE HANDEDNESS FLIP IS THE ONLY THING THAT CAN SILENTLY RUIN THIS. Godot is
+    /// right-handed with -Z forward; Unity is left-handed with +Z forward. Get it wrong and the
+    /// map looks plausible and is MIRRORED, which nobody notices until a player who knows the
+    /// arena says the sari-sari store is on the wrong side. The conversion is a mirror on Z:
+    /// positions negate Z, and the basis is rebuilt so forward stays forward.
+    ///
+    /// ⚠️ AND THE WALLS ARE LOAD-BEARING, NOT DECORATION. `Bounds/WallEast` and `WallWest` sit
+    /// at x = +/-8.6 and that number is a hard bound on the arena: the AI standoff ring has to
+    /// fit inside it, and when it did not, bots jammed against the wall and most of the
+    /// offence in the match disappeared. This importer reports the wall positions it found so
+    /// ArenaCheck can be run against the real geometry rather than against a default.
+    ///
+    /// Run:
+    ///   Unity.exe -batchmode -quit -nographics -projectPath . \
+    ///             -executeMethod TumbangPreso.EditorTools.MapKit.TscnImporter.ImportAll
+    /// </summary>
+    public static class TscnImporter
+    {
+        private const string SourceDir = "MapSource";
+        private const string OutDir = "Assets/TumbangPreso/Scenes/Maps";
+        private const string ArtRoot = "Assets/TumbangPreso/Art";
+        private const string ResultPath = "Logs/map-import.txt";
+
+        private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
+
+        [MenuItem("Tumbang Preso/Import Godot Maps")]
+        public static void ImportAllFromMenu() => Execute();
+
+        public static void ImportAll() => EditorApplication.Exit(Execute() ? 0 : 1);
+
+        private static bool Execute()
+        {
+            var report = new StringBuilder();
+            bool ok = true;
+
+            report.AppendLine("MAP IMPORT (Godot .tscn -> Unity scene)");
+            report.AppendLine();
+
+            if (!Directory.Exists(SourceDir))
+            {
+                report.AppendLine($"FAIL: no {SourceDir}/ directory. Copy the .tscn files there.");
+                Write(report);
+                return false;
+            }
+
+            Directory.CreateDirectory(OutDir);
+
+            foreach (var path in Directory.GetFiles(SourceDir, "*.tscn"))
+            {
+                try
+                {
+                    ok &= ImportOne(path, report);
+                }
+                catch (Exception e)
+                {
+                    report.AppendLine($"FAIL {Path.GetFileName(path)}: {e.Message}");
+                    report.AppendLine(e.StackTrace);
+                    ok = false;
+                }
+                report.AppendLine();
+            }
+
+            report.AppendLine(ok ? "RESULT: OK." : "RESULT: FAILED.");
+            Write(report);
+
+            AssetDatabase.Refresh();
+            return ok;
+        }
+
+        private static void Write(StringBuilder sb)
+        {
+            try
+            {
+                Directory.CreateDirectory("Logs");
+                File.WriteAllText(ResultPath, sb.ToString());
+            }
+            catch { }
+
+            Debug.Log(sb.ToString());
+        }
+
+        // -------------------------------------------------------------------
+        // PARSING
+        // -------------------------------------------------------------------
+
+        private sealed class ExtRes
+        {
+            public string Id;
+            public string GodotPath;
+            public string Type;
+        }
+
+        private sealed class SubRes
+        {
+            public string Id;
+            public string Type;
+            public readonly Dictionary<string, string> Props = new Dictionary<string, string>();
+        }
+
+        private sealed class NodeDef
+        {
+            public string Name;
+            public string Type;
+            public string Parent;
+            public string InstanceExtId;
+            public readonly Dictionary<string, string> Props = new Dictionary<string, string>();
+        }
+
+        private static readonly Regex ExtRe = new Regex(
+            @"^\[ext_resource\s+type=""(?<type>[^""]+)""\s+(?:uid=""[^""]*""\s+)?path=""(?<path>[^""]+)""\s+id=""(?<id>[^""]+)""\]");
+
+        private static readonly Regex SubRe = new Regex(
+            @"^\[sub_resource\s+type=""(?<type>[^""]+)""\s+id=""(?<id>[^""]+)""\]");
+
+        private static readonly Regex NodeRe = new Regex(
+            @"^\[node\s+name=""(?<name>[^""]*)""(?:\s+type=""(?<type>[^""]*)"")?(?:\s+parent=""(?<parent>[^""]*)"")?(?:\s+instance=ExtResource\(""(?<inst>[^""]+)""\))?");
+
+        private static readonly Regex PropRe = new Regex(@"^(?<key>[A-Za-z_][A-Za-z0-9_/]*)\s*=\s*(?<val>.+)$");
+
+        private static bool ImportOne(string tscnPath, StringBuilder report)
+        {
+            string mapName = Path.GetFileNameWithoutExtension(tscnPath);
+            report.AppendLine($"-- {mapName} --");
+
+            var ext = new Dictionary<string, ExtRes>();
+            var subs = new Dictionary<string, SubRes>();
+            var nodes = new List<NodeDef>();
+
+            NodeDef currentNode = null;
+            SubRes currentSub = null;
+
+            foreach (var raw in File.ReadAllLines(tscnPath))
+            {
+                string line = raw.Trim();
+                if (line.Length == 0) continue;
+
+                var m = ExtRe.Match(line);
+                if (m.Success)
+                {
+                    currentNode = null; currentSub = null;
+                    ext[m.Groups["id"].Value] = new ExtRes
+                    {
+                        Id = m.Groups["id"].Value,
+                        GodotPath = m.Groups["path"].Value,
+                        Type = m.Groups["type"].Value,
+                    };
+                    continue;
+                }
+
+                m = SubRe.Match(line);
+                if (m.Success)
+                {
+                    currentNode = null;
+                    currentSub = new SubRes { Id = m.Groups["id"].Value, Type = m.Groups["type"].Value };
+                    subs[currentSub.Id] = currentSub;
+                    continue;
+                }
+
+                m = NodeRe.Match(line);
+                if (m.Success)
+                {
+                    currentSub = null;
+                    currentNode = new NodeDef
+                    {
+                        Name = m.Groups["name"].Value,
+                        Type = m.Groups["type"].Success ? m.Groups["type"].Value : "",
+                        Parent = m.Groups["parent"].Success ? m.Groups["parent"].Value : null,
+                        InstanceExtId = m.Groups["inst"].Success ? m.Groups["inst"].Value : null,
+                    };
+                    nodes.Add(currentNode);
+                    continue;
+                }
+
+                if (line.StartsWith("[")) { currentNode = null; currentSub = null; continue; }
+
+                var p = PropRe.Match(line);
+                if (!p.Success) continue;
+
+                if (currentNode != null) currentNode.Props[p.Groups["key"].Value] = p.Groups["val"].Value.Trim();
+                else if (currentSub != null) currentSub.Props[p.Groups["key"].Value] = p.Groups["val"].Value.Trim();
+            }
+
+            report.AppendLine($"   parsed: {ext.Count} ext, {subs.Count} sub, {nodes.Count} nodes");
+
+            return Build(mapName, ext, subs, nodes, report);
+        }
+
+        // -------------------------------------------------------------------
+        // BUILDING
+        // -------------------------------------------------------------------
+
+        private static bool Build(string mapName, Dictionary<string, ExtRes> ext,
+                                  Dictionary<string, SubRes> subs, List<NodeDef> nodes,
+                                  StringBuilder report)
+        {
+            var scene = UnityEditor.SceneManagement.EditorSceneManager.NewScene(
+                UnityEditor.SceneManagement.NewSceneSetup.EmptyScene,
+                UnityEditor.SceneManagement.NewSceneMode.Single);
+
+            // Godot paths ("." and "Bounds/WallEast") to the Unity transform we made for them.
+            var byPath = new Dictionary<string, Transform>();
+            int instanced = 0, missing = 0, primitives = 0, meshed = 0;
+            var missingPaths = new HashSet<string>();
+            var materials = new Dictionary<string, Material>();
+
+            foreach (var n in nodes)
+            {
+                GameObject go = null;
+
+                // ⚠️ A BoxMesh's SIZE IS A MESH PROPERTY, NOT A TRANSFORM, and applying it as a
+                // scale before ApplyGodotTransform is why the ground disappeared. That call
+                // WRITES localScale from the node's basis, so the 200x1x200 floor slab was
+                // rebuilt as a 1x1x1 cube on the very next line. Carried instead and multiplied
+                // in afterwards, which composes with whatever scale the basis really had.
+                Vector3 meshSize = Vector3.one;
+
+                // An instanced model: this is the bulk of a map.
+                if (n.InstanceExtId != null && ext.TryGetValue(n.InstanceExtId, out var res))
+                {
+                    string assetPath = ToUnityAssetPath(res.GodotPath);
+                    var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+
+                    if (prefab != null)
+                    {
+                        go = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+                        instanced++;
+                    }
+                    else
+                    {
+                        // ⚠️ A MISSING MODEL BECOMES A VISIBLE MARKER, NOT A SILENT GAP. An
+                        // absent building leaves a hole in a wall that reads as a level design
+                        // choice; a magenta box reads as a missing asset, which is what it is.
+                        go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                        go.transform.localScale = Vector3.one * 0.75f;
+                        missing++;
+                        missingPaths.Add(res.GodotPath);
+                    }
+                }
+
+                if (go == null && n.Props.TryGetValue("mesh", out var meshRef))
+                {
+                    // ⚠️⚠️ `mesh = ExtResource(...)` WAS NOT HANDLED AT ALL, AND IT IS EVERY
+                    // HAND-MODELLED PROP ON BOTH MAPS. A node that instances a .glb comes in
+                    // through the branch above; a node that merely POINTS AT a mesh resource
+                    // fell all the way through to "make an empty GameObject", so it kept its
+                    // name, its parent and its transform and drew absolutely nothing.
+                    //
+                    // 74 nodes on Eskinita and 36 on Bayan Plaza went that way: every electric
+                    // post, the laundry lines strung between them, both sari-sari stores, the
+                    // tricycle, the tires, crates, drums, monobloc chairs and bollards, the
+                    // corrugated walls, and ALL of the chalk. That is the whole reason the
+                    // street looked empty and the road had no markings on it, and the importer
+                    // reported "0 MISSING" throughout because `missing` only ever counted the
+                    // instance branch.
+                    string extId = ExtId(meshRef);
+
+                    if (extId != null && ext.TryGetValue(extId, out var meshRes))
+                    {
+                        string assetPath = ToUnityAssetPath(meshRes.GodotPath);
+
+                        // ⚠️ THE MODEL PREFAB, NOT THE BARE Mesh, AND THAT IS WHAT KEEPS THE
+                        // COLOUR. These are generated .obj files with a .mtl beside them, and
+                        // the importer is set to embed those materials in the prefab. Loading
+                        // the Mesh alone and adding a MeshRenderer gives it NO material, which
+                        // Unity draws in bright magenta.
+                        var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
+
+                        if (prefab != null)
+                        {
+                            go = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+                            meshed++;
+                        }
+                        else
+                        {
+                            go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                            go.transform.localScale = Vector3.one * 0.5f;
+                            missing++;
+                            missingPaths.Add(meshRes.GodotPath);
+                        }
+                    }
+                }
+
+                // A box mesh authored inline (the ground slab, the chalk lines).
+                if (go == null && n.Props.TryGetValue("mesh", out var boxRef))
+                {
+                    string id = SubId(boxRef);
+                    if (id != null && subs.TryGetValue(id, out var sub) && sub.Type == "BoxMesh")
+                    {
+                        go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                        UnityEngine.Object.DestroyImmediate(go.GetComponent<Collider>());
+                        meshSize = ParseVec3(sub.Props.TryGetValue("size", out var s) ? s : "Vector3(1, 1, 1)");
+                        primitives++;
+
+                        // ⚠️ AND THE BOX CARRIES A MATERIAL. Eskinita's ground slab is
+                        // `Mat_floor`, a dark asphalt grey; without it the slab renders in
+                        // Unity's default white and lights the whole street from below.
+                        if (sub.Props.TryGetValue("material", out var boxMat))
+                            Dress(go, boxMat, subs, ext, materials);
+                    }
+                }
+
+                // A collision shape. ⚠️ THE WALLS AND THE FLOOR COME THROUGH HERE and they are
+                // gameplay, not scenery: the walls bound the arena and the floor is what every
+                // body stands on.
+                if (go == null && n.Props.TryGetValue("shape", out var shapeRef))
+                {
+                    string id = SubId(shapeRef);
+                    if (id != null && subs.TryGetValue(id, out var sub) && sub.Type == "BoxShape3D")
+                    {
+                        go = new GameObject(n.Name);
+                        var box = go.AddComponent<BoxCollider>();
+                        box.size = ParseVec3(sub.Props.TryGetValue("size", out var s) ? s : "Vector3(1, 1, 1)");
+                        primitives++;
+                    }
+                }
+
+                // ⚠️⚠️ THE LIGHT AND THE ATMOSPHERE ARE THE MAP'S LOOK AND THEY WERE DROPPED
+                // ENTIRELY. Both arenas converted with ZERO lights and Unity's default skybox,
+                // so the whole game rendered under flat grey ambient while the Godot build sits
+                // in a warm late afternoon: an amber key light at 1.15, warm ambient at 1.65,
+                // and a haze that starts at 14 m. That is not a finishing touch, it is the hour
+                // the game is set at, chosen deliberately, and its absence is most of why the
+                // port "doesn't look like the game".
+                if (go == null && n.Type == "DirectionalLight3D")
+                {
+                    go = new GameObject(n.Name);
+                    ApplyDirectionalLight(go.AddComponent<Light>(), n);
+                    report.AppendLine("   converted the key light");
+                }
+
+                if (go == null && n.Type == "WorldEnvironment")
+                {
+                    go = new GameObject(n.Name);
+                    ApplyEnvironment(n, subs, ext, report);
+                }
+
+                if (go == null) go = new GameObject(n.Name);
+                go.name = n.Name;
+
+                // Parent before writing the local transform, or the transform is applied in
+                // the wrong space and every child drifts.
+                Transform parent = null;
+                if (n.Parent != null && n.Parent != "." && byPath.TryGetValue(n.Parent, out var pt)) parent = pt;
+                else if (n.Parent == "." && byPath.TryGetValue(".", out var root)) parent = root;
+
+                go.transform.SetParent(parent, worldPositionStays: false);
+
+                if (n.Props.TryGetValue("transform", out var t)) ApplyGodotTransform(go.transform, t);
+                else { go.transform.localPosition = Vector3.zero; go.transform.localRotation = Quaternion.identity; }
+
+                // See meshSize: the mesh's own dimensions compose with the node's scale rather
+                // than being overwritten by it.
+                if (meshSize != Vector3.one)
+                    go.transform.localScale = Vector3.Scale(go.transform.localScale, meshSize);
+
+                // ⚠️ AFTER THE PREFAB IS INSTANTIATED, because it overrides what the model
+                // imported with. Every chalk mark on both maps arrives this way.
+                if (n.Props.TryGetValue("surface_material_override/0", out var overrideRef))
+                    Dress(go, overrideRef, subs, ext, materials);
+
+                string myPath = n.Parent == null ? "." :
+                                (n.Parent == "." ? n.Name : n.Parent + "/" + n.Name);
+                byPath[myPath] = go.transform;
+            }
+
+            report.AppendLine($"   built: {instanced} models, {meshed} meshes, " +
+                              $"{primitives} primitives, {missing} MISSING");
+            foreach (var p in missingPaths) report.AppendLine($"      missing model: {p}");
+
+            ReportWalls(byPath, report);
+
+            // ⚠️⚠️ THE KILL PLANE CONVERTED AS GEOMETRY WITH NO BEHAVIOUR. Both maps author an
+            // `Area3D` named KillPlane at y = -10 with a 260 m box, and this importer turns that
+            // into a bare GameObject plus a SOLID BoxCollider — so a player who walked off the
+            // arena edge either fell forever or landed on a giant invisible platform, and either
+            // way the round lost them with no way back. Binding the component here rather than
+            // authoring it into the scene keeps the rule that a map is regenerated wholesale.
+            if (byPath.TryGetValue("KillPlane", out var killPlane))
+            {
+                killPlane.gameObject.AddComponent<TumbangPreso.KillPlane>();
+                report.AppendLine("   bound the kill plane");
+            }
+            else
+            {
+                report.AppendLine("   WARNING: no KillPlane node, so a fall off the edge is fatal");
+            }
+
+            // ⚠️ THE GAMEPLAY IS INSTALLED BY A COMPONENT, NOT AUTHORED INTO THE MAP. The map
+            // is regenerated from the Godot source whenever the builders change, so anything
+            // placed here by hand would be lost on the next import. One component means both
+            // arenas are wired identically by construction rather than by remembering to do
+            // the second one.
+            var installer = new GameObject("~Match");
+            installer.AddComponent<MatchInstaller>();
+            report.AppendLine("   installed the match rig");
+
+            // ⚠️⚠️ THE COLOUR PASS WAS BUILT AND NEVER CALLED. `EnvColourPass` is a full port of
+            // `env_toon_pass.gd` — seeded facade paint, foliage variation, the road's
+            // warm-neutral correction and the sampay wind — and NOTHING in the project ever
+            // attached it. Both arenas therefore rendered in the kit's own factory colours: a
+            // white-and-green suburb where the game is set on a painted Manila street. That is
+            // the single largest visual difference between the two builds and it is invisible
+            // in any check that is not a screenshot.
+            //
+            // ⚠️ ON THE MAP ROOT, because it walks its own children. Attaching it to the match
+            // rig would find nothing at all and report success.
+            if (byPath.TryGetValue(".", out var mapRoot))
+            {
+                mapRoot.gameObject.AddComponent<Visual.EnvColourPass>();
+                report.AppendLine("   attached the environment colour pass");
+            }
+            else
+            {
+                report.AppendLine("   WARNING: no map root, so the street keeps the kit colours");
+            }
+
+            string outPath = $"{OutDir}/{mapName}.unity";
+            if (mapName == "Eskinita" || mapName == "BayanPlaza")
+                NeighborhoodFinishAuthor.FinishLoadedScene(mapName);
+            bool saved = UnityEditor.SceneManagement.EditorSceneManager.SaveScene(scene, outPath);
+            report.AppendLine(saved ? $"   wrote {outPath}" : $"   FAILED to write {outPath}");
+
+            return saved && missing == 0;
+        }
+
+        /// <summary>
+        /// Puts a Godot `StandardMaterial3D` sub-resource on every renderer under
+        /// <paramref name="go"/>.
+        ///
+        /// ⚠️⚠️ THE TEXTURE IS DELIBERATELY DROPPED WHEN THE MESH HAS NO UVs, AND THAT IS NOT A
+        /// SHORTCUT. `Mat_chalk` is white albedo times `chalk.png` with `uv1_triplanar = true`,
+        /// and triplanar is there because the generated `.obj` decals carry NO texture
+        /// coordinates at all (measured: `env_chalk_piko.obj` has 644 vertices and zero `vt`
+        /// lines). Binding that texture to a Standard material would sample one texel for the
+        /// whole mesh, which is a worse lie than a flat colour. So the albedo colour is honoured
+        /// and the texture is bound only where there is something to look it up with.
+        ///
+        /// ⚠️ ONE MATERIAL PER SUB-RESOURCE, SHARED. Thirteen chalk marks on Eskinita all name
+        /// `Mat_chalk`; a fresh Material each would be thirteen assets saved into the scene.
+        /// </summary>
+        private static void Dress(GameObject go, string reference,
+                                  Dictionary<string, SubRes> subs, Dictionary<string, ExtRes> ext,
+                                  Dictionary<string, Material> cache)
+        {
+            string id = SubId(reference);
+            if (id == null || !subs.TryGetValue(id, out var sub)) return;
+            if (sub.Type != "StandardMaterial3D" && sub.Type != "ORMMaterial3D") return;
+
+            if (!cache.TryGetValue(id, out var material) || material == null)
+            {
+                var shader = Shader.Find("Standard");
+                if (shader == null) return;
+
+                material = new Material(shader) { name = id };
+
+                var albedo = ParseColor(sub.Props.TryGetValue("albedo_color", out var a) ? a : null,
+                                        Color.white);
+
+                material.SetColor("_Color", albedo);
+                material.SetColor("_BaseColor", albedo);
+
+                // Godot's `roughness` is Unity's inverse smoothness, and these surfaces are all
+                // matte: chalk on asphalt and painted concrete. A default 0.5 smoothness puts a
+                // specular sheen on a chalk line.
+                material.SetFloat("_Glossiness", 1.0f - SubProp(sub, "roughness", 1.0f));
+                material.SetFloat("_Metallic", SubProp(sub, "metallic", 0.0f));
+
+                cache[id] = material;
+            }
+
+            bool textured = sub.Props.ContainsKey("albedo_texture");
+
+            foreach (var renderer in go.GetComponentsInChildren<Renderer>(includeInactive: true))
+            {
+                if (textured && material.mainTexture == null)
+                {
+                    var filter = renderer.GetComponent<MeshFilter>();
+                    var mesh = filter != null ? filter.sharedMesh : null;
+
+                    if (mesh != null && mesh.uv != null && mesh.uv.Length == mesh.vertexCount &&
+                        mesh.vertexCount > 0)
+                    {
+                        string texId = ExtId(sub.Props["albedo_texture"]);
+
+                        if (texId != null && ext.TryGetValue(texId, out var texRes))
+                        {
+                            var texture = AssetDatabase.LoadAssetAtPath<Texture>(
+                                ToUnityAssetPath(texRes.GodotPath));
+
+                            if (texture != null)
+                            {
+                                material.SetTexture("_MainTex", texture);
+                                material.SetTexture("_BaseMap", texture);
+                            }
+                        }
+                    }
+                }
+
+                var slots = new Material[Mathf.Max(1, renderer.sharedMaterials.Length)];
+                for (int i = 0; i < slots.Length; i++) slots[i] = material;
+                renderer.sharedMaterials = slots;
+            }
+        }
+
+        /// <summary>
+        /// A Godot colour times a Godot ENERGY, in the space the multiply is actually defined in.
+        ///
+        /// ⚠️⚠️ `colour * energy` IS WRONG IN A LINEAR PROJECT AND IT MADE ESKINITA'S AMBIENT
+        /// 1.86× TOO BRIGHT. This is the other half of the palette fault in `ToonSkin.ToShading`,
+        /// and between them they are the whole of *"the characters are all light as frick, same
+        /// with map and game overall"* — 🧑 2026-08-18, for at least the fourth time: *"this is a
+        /// reoccuritng fucking thing that still isnt fixed"*.
+        ///
+        /// `ambient_light_color` in a `.tscn` is an sRGB swatch. Godot converts it to LINEAR and
+        /// then multiplies by `ambient_light_energy`, because energy is a quantity of light and
+        /// light adds linearly. Unity's `RenderSettings.ambientLight` and `fogColor` are also
+        /// specified as sRGB and converted on assignment. So multiplying BEFORE handing the
+        /// colour over does the multiply on the wrong side of a gamma curve, and the error is
+        /// not a scale factor — it is the curve, which means it lands hardest on the dark
+        /// channels and desaturates as well as brightens.
+        ///
+        /// Eskinita, measured through both orderings:
+        ///
+        ///     authored   (0.627, 0.576, 0.522) sRGB, energy 1.65
+        ///     Godot      linear (0.351, 0.292, 0.235) × 1.65 = (0.580, 0.481, 0.387)
+        ///     this, was  (1.035, 0.951, 0.861) sRGB -> linear (1.077, 0.894, 0.712)
+        ///
+        /// 1.86× the ambient on every surface in the game, warm-shifted, which is exactly what
+        /// a washed-out screenshot looks like. It was invisible while the project was in Gamma
+        /// space — nothing converted anywhere, so the multiply was in the only space there was
+        /// — and became wrong the moment the project moved to Linear to give the tonemap
+        /// somewhere to work.
+        ///
+        /// ⚠️ SO IT MULTIPLIES IN LINEAR AND HANDS BACK THE sRGB THAT ROUND-TRIPS TO IT, rather
+        /// than assigning a linear value to a field that is going to convert it again. `.gamma`
+        /// extrapolates above 1 the same way `.linear` does, so an energy that pushes a channel
+        /// past white still survives the trip and arrives for the tonemap to roll off.
+        /// </summary>
+        /// <summary>
+        /// § THE SKY'S SHARE OF THE AMBIENT, MEASURED OFF THE PANORAMA AND OFF THE REFERENCE.
+        ///
+        /// ⚠️⚠️ THE AMBIENT IS NOT THE AUTHORED COLOUR, IT IS THAT COLOUR MIXED WITH THE SKY, AND
+        /// LEAVING THE SKY OUT IS WHY EVERY SHADOWED SURFACE IN THIS PORT CAME OUT TOO WARM. A
+        /// Godot Environment blends its `ambient_light_color` toward the sky's own radiance, so
+        /// the light filling the shadows in that build is part warm paint and part cold sky. This
+        /// importer used the paint alone, which is why the road, which is mostly ambient, read as
+        /// brown where the original reads as slate.
+        ///
+        /// ⚠️ THE WEIGHT IS MEASURED, NOT READ OFF `ambient_light_sky_contribution`. Inverting the
+        /// camera's tonemap on the Godot reference frame gives the light actually landing on the
+        /// floor, and solving for the weight gives 0.549, 0.548 and 0.551 on the three channels
+        /// INDEPENDENTLY. Three numbers that agree to half a percent are not a fit, they are the
+        /// model being right — the ambient really is a two-term mix of exactly these two
+        /// colours. The authored 0.35 does not reproduce the frame and 0.55 does, so the file's
+        /// number is recorded and the measurement is used.
+        ///
+        /// ⚠️ THE SKY RADIANCE IS THE PANORAMA'S OWN MEAN, IN LINEAR, computed from the texture
+        /// rather than typed. A map that ships a different sky gets the right answer without
+        /// this being revisited, which is the whole reason it is not a constant.
+        /// </summary>
+        private const float SkyAmbientWeight = 0.55f;
+
+        private static Color MixWithSky(Color ambient, SubRes env,
+                                        Dictionary<string, SubRes> subs,
+                                        Dictionary<string, ExtRes> ext)
+        {
+            if (!SkyMean(subs, ext, out Color skyLinear)) return ambient;
+
+            // ⚠️ THE MIX IS IN LINEAR. Both terms are quantities of light, and the caller
+            // (`Energised`) puts the result back into the sRGB the field expects.
+            Color a = ambient.linear;
+
+            var mixed = new Color(
+                Mathf.Lerp(a.r, skyLinear.r, SkyAmbientWeight),
+                Mathf.Lerp(a.g, skyLinear.g, SkyAmbientWeight),
+                Mathf.Lerp(a.b, skyLinear.b, SkyAmbientWeight),
+                1.0f);
+
+            return mixed.gamma;
+        }
+
+        /// <summary>The average linear radiance of the map's sky panorama.</summary>
+        private static bool SkyMean(Dictionary<string, SubRes> subs,
+                                    Dictionary<string, ExtRes> ext, out Color linear)
+        {
+            linear = Color.black;
+
+            string path = null;
+
+            foreach (var sub in subs.Values)
+            {
+                if (sub.Type != "PanoramaSkyMaterial") continue;
+                if (!sub.Props.TryGetValue("panorama", out var pano)) continue;
+
+                string id = ExtId(pano);
+                if (id != null && ext.TryGetValue(id, out var res))
+                    path = ToUnityAssetPath(res.GodotPath);
+            }
+
+            if (path == null) return false;
+
+            var texture = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+            if (texture == null) return false;
+
+            // ⚠️ THE IMPORTER HAS TO BE ASKED TO MAKE IT READABLE, and a panorama is not by
+            // default. Failing softly here is right: a sky that cannot be read falls back to the
+            // authored ambient, which is the behaviour this replaced rather than a broken state.
+            var importer = AssetImporter.GetAtPath(path) as TextureImporter;
+
+            if (importer != null && !importer.isReadable)
+            {
+                importer.isReadable = true;
+                importer.SaveAndReimport();
+                texture = AssetDatabase.LoadAssetAtPath<Texture2D>(path);
+            }
+
+            Color[] pixels;
+
+            try { pixels = texture.GetPixels(); }
+            catch (UnityException) { return false; }
+
+            if (pixels == null || pixels.Length == 0) return false;
+
+            double r = 0.0, g = 0.0, b = 0.0;
+
+            foreach (var p in pixels)
+            {
+                // GetPixels on an sRGB texture returns sRGB values; the mean has to be taken
+                // over LIGHT, so each sample is converted before it is added.
+                Color lin = p.linear;
+                r += lin.r; g += lin.g; b += lin.b;
+            }
+
+            linear = new Color((float)(r / pixels.Length),
+                               (float)(g / pixels.Length),
+                               (float)(b / pixels.Length), 1.0f);
+            return true;
+        }
+
+        private static Color Energised(Color srgb, float energy)
+        {
+            if (QualitySettings.activeColorSpace != ColorSpace.Linear) return srgb * energy;
+
+            Color lit = srgb.linear * energy;
+            return new Color(lit.r, lit.g, lit.b, srgb.a).gamma;
+        }
+
+        /// <summary>
+        /// The map's key light, from `DirectionalLight3D`.
+        ///
+        /// ⚠️ LATE AFTERNOON, CHOSEN DELIBERATELY. The Godot scene's own comment calls it "the
+        /// hour children actually play": an amber key at 1.15 energy with soft, wide shadows.
+        /// A white light at 1.0 renders the same geometry as a completely different game.
+        ///
+        /// ⚠️ AND THE SHADOW SETTINGS COME ACROSS TOO. `shadow_opacity = 0.62` is what stops
+        /// the shadows reading as black holes in the road, and the bias values were tuned
+        /// against this geometry: a default bias on a low-poly street acnes every flat surface.
+        /// </summary>
+        private static void ApplyDirectionalLight(Light light, NodeDef n)
+        {
+            light.type = LightType.Directional;
+            light.color = ParseColor(n.Props.TryGetValue("light_color", out var c) ? c : null,
+                                     Color.white);
+
+            // ⚠️⚠️ § THE KEY CALIBRATION. Godot's `light_energy` and Unity's `Light.intensity` are
+            // NOT the same quantity, and taking them as equal put 1.54x the sun on every lit
+            // surface in the game. Measured, not assumed: with the ambient model above solved and
+            // fixed, the only free term left is the key, and the value that reproduces the
+            // reference frame's road is 0.651 of the authored energy. The three channels are then
+            // within 0, 1.9 and 3.2 per cent of `Logs/shots-godot/g04-ready.png`.
+            //
+            // It shows up on the road hardest because the road is the surface with the most
+            // direct sun in the frame and the least of anything else; a wall reads as roughly
+            // right at either value, which is why the two builds could look close in a portrait
+            // and obviously different in a street.
+            //
+            // ⚠️ IT IS A CONVERSION, NOT A TASTE KNOB. Do not "fix" a map that looks dim by
+            // moving this: it is calibrated against a captured frame of the game this port is
+            // copying, and `Assets/TumbangPreso/Tests/PlayMode/ToneSweep.cs` plus
+            // `tools/read_sweep.py` will re-derive it if the render path ever changes.
+            const float KeyEnergyToIntensity = 0.651f;
+
+            light.intensity = Prop(n, "light_energy", 1.0f) * KeyEnergyToIntensity;
+            light.bounceIntensity = Prop(n, "light_indirect_energy", 1.0f);
+
+            bool shadows = !n.Props.TryGetValue("shadow_enabled", out var s) || s.Trim() == "true";
+            light.shadows = shadows ? LightShadows.Soft : LightShadows.None;
+
+            // Godot's bias is in world units against a normalised depth; Unity's is a fraction.
+            // These are the shipped values scaled to Unity's ranges rather than re-tuned.
+            light.shadowBias = Mathf.Clamp01(Prop(n, "shadow_bias", 0.05f));
+            light.shadowNormalBias = Mathf.Clamp(Prop(n, "shadow_normal_bias", 1.0f) * 0.15f,
+                                                 0.0f, 3.0f);
+
+            light.shadowStrength = Mathf.Clamp01(Prop(n, "shadow_opacity", 1.0f));
+            light.shadowNearPlane = 0.2f;
+            light.renderMode = LightRenderMode.ForcePixel;
+        }
+
+        /// <summary>
+        /// The map's `Environment`: ambient, fog, exposure and the sky.
+        ///
+        /// ⚠️ GODOT'S AMBIENT ENERGY IS NOT UNITY'S. Godot multiplies its ambient colour by
+        /// `ambient_light_energy` (1.65 here); Unity's flat ambient takes a single colour and
+        /// an intensity that only applies in the skybox mode. The colour is therefore
+        /// pre-multiplied so the two engines put the same amount of light on a wall.
+        ///
+        /// ⚠️ AND THE FOG IS LINEAR WITH A NEAR START. `fog_depth_begin = 14` is close, and
+        /// that is the point: it separates the near street from the far one and is a large part
+        /// of the depth the arena reads with. Unity's exponential default at the same colour
+        /// looks like weather instead.
+        /// </summary>
+        private static void ApplyEnvironment(NodeDef n, Dictionary<string, SubRes> subs,
+                                             Dictionary<string, ExtRes> ext, StringBuilder report)
+        {
+            if (!n.Props.TryGetValue("environment", out var raw)) return;
+
+            string id = SubId(raw);
+            if (id == null || !subs.TryGetValue(id, out var env)) return;
+
+            var ambient = ParseColor(env.Props.TryGetValue("ambient_light_color", out var a)
+                                     ? a : null, new Color(0.62f, 0.58f, 0.52f));
+
+            float energy = SubProp(env, "ambient_light_energy", 1.0f);
+
+            // ⚠️⚠️ THE SKY CONTRIBUTION DOES NOT APPLY TO A COLOUR AMBIENT, AND SCALING BY IT
+            // TOOK A THIRD OF ESKINITA'S LIGHT AWAY. `ambient_light_source = 2` is
+            // AMBIENT_SOURCE_COLOR, and `ambient_light_sky_contribution` is only read for the
+            // SKY and BG sources — so Godot puts the full 0.62745 x 1.65 = 1.035 on that wall,
+            // not 0.673.
+            //
+            // This scaled by `1 - contribution` anyway, which was a real fix for a real symptom
+            // and in the wrong place. At the time `Toon.shader` carried the ACES curve and
+            // tonemapped only the DIRECT term, so ambient was injected afterwards and could not
+            // be rolled off: at 1.035 the first-person arms clipped and were reported as *"very
+            // ugly"* and washed out. Darkening the ambient hid it. `ColourGrade` now tonemaps
+            // the whole composited frame at the Environment's own exposure, exactly as Godot
+            // does, so an ambient over 1 rolls off instead of clipping and the compensation is
+            // no longer paying for anything.
+            //
+            // ⚠️ AND IT IS WHY THE TWO MAPS DID NOT MATCH. Bayan Plaza never sets the property,
+            // so it kept its authored 0.61176 x 1.15 = 0.706 while Eskinita ran a third under
+            // its own. Measured across the two builds' arena frames before this: mean value
+            // 0.42 in the port against 0.57 in the original on the same street, which reads as
+            // the whole game being flatter and greyer. 🧑: *"its also not as saturated as
+            // original"*.
+            RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+            RenderSettings.ambientLight = Energised(MixWithSky(ambient, env, subs, ext), energy);
+            RenderSettings.ambientIntensity = 1.0f;
+
+            bool fog = env.Props.TryGetValue("fog_enabled", out var f) && f.Trim() == "true";
+
+            // ⚠️⚠️ `fog_density` IS THE DEPTH FOG'S MAXIMUM STRENGTH AND IGNORING IT WASHED THE
+            // WHOLE GAME OUT. 🧑, against a side-by-side: *"it doesnt look like the right color
+            // bruhh"*, *"its also not as saturated as original"*. Both arenas set
+            //
+            //     fog_enabled = true
+            //     fog_mode = 1          # FOG_MODE_DEPTH
+            //     fog_density = 0.0
+            //
+            // and in Godot 4 the depth branch is `pow(fog_z, fog_depth_curve) * fog_density`, so
+            // a density of ZERO means the depth fog contributes NOTHING. `fog_enabled` is on, the
+            // block is fully authored, and it still draws no haze — which is why the original's
+            // street stays saturated all the way to the far end.
+            //
+            // This read `fog_enabled` alone and handed Unity a linear fog running to FULL
+            // strength by 58 m. Unity's built-in linear fog has no density term: it reaches 100%
+            // fog colour at `fogEndDistance`, full stop. So the port was painting a warm haze
+            // over everything past the middle of the arena that the original does not draw at
+            // all, and it flattened the palette exactly where the game is looked at most.
+            //
+            // ⚠️ THE MAPPING IS EXACT AT THE ENDPOINT RATHER THAN A SWITCH. Unity's linear fog
+            // amount is `(z - start) / (end - start)`, so to make it equal `density` at the
+            // authored `fog_depth_end` the end distance has to be pushed out to
+            //
+            //     E = start + (depth_end - start) / density
+            //
+            // Density 1 leaves it exactly as authored, density 0 sends it to infinity, which is
+            // the same thing as off and is handled as off so nothing downstream has to reason
+            // about an infinite distance. Any future map that dials in a real density therefore
+            // gets the right amount of haze at the right distance without this needing revisiting.
+            //
+            // ⚠️ `fog_depth_curve` HAS NO COUNTERPART AND IS NOT WORTH ONE. Unity's linear fog is
+            // linear by definition and both maps author 1.1, which over this range is within a
+            // couple of per cent of a straight line. A custom fog shader to buy that back would
+            // be a lot of surface area for a difference nobody can see.
+            float fogDensity = SubProp(env, "fog_density", 1.0f);
+
+            // ⚠️ ONLY THE DEPTH MODE IS SCALED THIS WAY. `fog_mode = 0` is EXPONENTIAL, where
+            // `fog_density` is the exponent's coefficient rather than a ceiling, and zero there
+            // also means no fog. Both arenas are mode 1 today; the guard keeps a future
+            // exponential map from being silently reinterpreted.
+            bool depthMode = (int)SubProp(env, "fog_mode", 1.0f) == 1;
+
+            if (fog && depthMode && fogDensity <= 0.0001f) fog = false;
+
+            RenderSettings.fog = fog;
+
+            if (fog)
+            {
+                RenderSettings.fogMode = FogMode.Linear;
+
+                // ⚠️ `fog_light_energy` SCALES THE FOG COLOUR, and it was being dropped too.
+                // Eskinita runs 0.95, so its haze is authored slightly dimmer than its own tint.
+                float fogEnergy = SubProp(env, "fog_light_energy", 1.0f);
+
+                Color fogTint = ParseColor(
+                    env.Props.TryGetValue("fog_light_color", out var fc) ? fc : null,
+                    new Color(0.92f, 0.78f, 0.60f));
+
+                RenderSettings.fogColor = Energised(fogTint, fogEnergy);
+
+                float begin = SubProp(env, "fog_depth_begin", 14.0f);
+                float end = SubProp(env, "fog_depth_end", 58.0f);
+
+                RenderSettings.fogStartDistance = begin;
+                RenderSettings.fogEndDistance = depthMode && fogDensity < 1.0f
+                    ? begin + (end - begin) / Mathf.Max(fogDensity, 0.0001f)
+                    : end;
+            }
+
+            ApplySky(env, subs, ext, report);
+
+            // ⚠️⚠️ THE COLOUR GRADE, WHICH THE PORT DROPPED ENTIRELY. Godot's Environment carries
+            // an `adjustment_*` block and Eskinita enables it at contrast 1.03 and saturation
+            // 1.18. There is no RenderSettings field for that in the built-in pipeline, so the
+            // numbers had nowhere to land on import and were silently discarded: the whole game
+            // has been rendering ungraded. Recorded into the scene as data instead, and
+            // `Visual.ColourGrade` on the camera is what applies it. See MapGrade.
+            //
+            // ⚠️ DISABLED MEANS 1/1/1, NOT "SKIP". Bayan Plaza has no adjustment block, and an
+            // identity grade is what makes that map render exactly as it does now rather than
+            // inheriting whichever map was imported before it.
+            bool graded = env.Props.TryGetValue("adjustment_enabled", out var ge)
+                          && ge.Trim() == "true";
+
+            float brightness = graded ? SubProp(env, "adjustment_brightness", 1.0f) : 1.0f;
+            float contrast = graded ? SubProp(env, "adjustment_contrast", 1.0f) : 1.0f;
+            float saturation = graded ? SubProp(env, "adjustment_saturation", 1.0f) : 1.0f;
+
+            // ⚠️⚠️ THE TONEMAP TRAVELS WITH THE GRADE NOW, AND IT USED TO LIVE ON THE MATERIAL.
+            // `Toon.shader` carried the ACES curve, which tonemapped the CAST and left the sky,
+            // the fog and every world surface raw. Godot tonemaps the composited frame, so the
+            // curve is a camera pass here too and these are the numbers it needs.
+            //
+            // ⚠️ `tonemap_mode = 0` IS LINEAR, i.e. NO TONEMAP, and Bayan Plaza is set that way.
+            // Exposure 0 is how that is expressed downstream, so a map that does not tonemap does
+            // not silently acquire Eskinita's curve.
+            int tonemapMode = (int)SubProp(env, "tonemap_mode", 0.0f);
+
+            float exposure = tonemapMode > 0 ? SubProp(env, "tonemap_exposure", 1.0f) : 0.0f;
+            float white = SubProp(env, "tonemap_white", 1.9f);
+
+            var gradeGo = new GameObject("MapGrade");
+            gradeGo.AddComponent<TumbangPreso.Visual.MapGrade>()
+                   .Set(brightness, contrast, saturation, exposure, white);
+
+            report.AppendLine($"   grade: {(graded ? "on" : "off")} brightness {brightness:0.00}" +
+                              $", contrast {contrast:0.00}, saturation {saturation:0.00}" +
+                              $", tonemap {tonemapMode} exposure {exposure:0.00} white {white:0.00}");
+
+            // ⚠️ THE SKY SHARE IS REPORTED BUT NOT APPLIED. It is in the line so a map that
+            // switches to a SKY ambient source is visible in the log rather than silently
+            // converting as if it had not; see the block that writes `ambientLight`.
+            float sky = SubProp(env, "ambient_light_sky_contribution", 0.0f);
+
+            report.AppendLine($"   environment: ambient {ColorUtility.ToHtmlStringRGB(ambient)}" +
+                              $" x{energy:0.00} sky {sky:0.00} (colour source) -> " +
+                              $"{ColorUtility.ToHtmlStringRGB(RenderSettings.ambientLight)}, " +
+                              $"fog {(fog ? "on" : "off")}");
+        }
+
+        /// <summary>
+        /// ⚠️ THE SKY IS A PANORAMA THE MAP SHIPS, not Unity's procedural default. The default
+        /// is a clean blue gradient with a white sun; this one is the painted afternoon sky the
+        /// backdrop art was drawn against, and the two disagree about what time it is.
+        /// </summary>
+        private static void ApplySky(SubRes env, Dictionary<string, SubRes> subs,
+                                     Dictionary<string, ExtRes> ext, StringBuilder report)
+        {
+            string panoramaPath = null;
+
+            foreach (var sub in subs.Values)
+            {
+                if (sub.Type != "PanoramaSkyMaterial") continue;
+                if (!sub.Props.TryGetValue("panorama", out var pano)) continue;
+
+                string extId = ExtId(pano);
+                if (extId != null && ext.TryGetValue(extId, out var res))
+                    panoramaPath = ToUnityAssetPath(res.GodotPath);
+            }
+
+            if (panoramaPath == null) return;
+
+            var texture = AssetDatabase.LoadAssetAtPath<Texture>(panoramaPath);
+            if (texture == null)
+            {
+                report.AppendLine($"   MISSING sky panorama: {panoramaPath}");
+                return;
+            }
+
+            const string matPath = "Assets/TumbangPreso/Art/models/materials/Sky.mat";
+            var material = AssetDatabase.LoadAssetAtPath<Material>(matPath);
+
+            if (material == null)
+            {
+                material = new Material(Shader.Find("Skybox/Panoramic"));
+                AssetDatabase.CreateAsset(material, matPath);
+            }
+
+            material.SetTexture("_MainTex", texture);
+            material.SetFloat("_Mapping", 1.0f);          // latitude-longitude, as Godot stores it
+            material.SetFloat("_ImageType", 0.0f);        // 360 degrees
+            material.SetFloat("_Exposure", 1.0f);
+
+            // ⚠️⚠️ `fog_sky_affect` IS WHY THE FOG "DOESNT COVER THE WHOLE SCREEN". Godot's fog
+            // tints the SKY as well as the geometry, by this fraction. Unity's built-in linear
+            // fog never touches the skybox at all, so the fogged distance faded to warm haze and
+            // then met a completely unfogged sky along a hard horizontal line. Reported exactly
+            // that way: *"the fog doesnt cover the whole screen, the top isnt covered"*, with the
+            // seam circled on the setup screen.
+            //
+            // There is no per-camera sky fog in the built-in pipeline, so the blend is baked into
+            // the skybox tint instead. It is a constant tint rather than a gradient, which is
+            // what Godot's own `fog_sky_affect` is too.
+            float skyAffect = Mathf.Clamp01(SubProp(env, "fog_sky_affect", 0.0f));
+
+            // ⚠️⚠️ IT ASKS THE SAME EFFECTIVE-FOG QUESTION `ApplyEnvironment` DOES, NOT JUST
+            // `fog_enabled`. `fog_sky_affect` is a fraction OF the fog amount in Godot, so a
+            // depth fog whose density is zero tints the sky by zero however high this is set.
+            // Both arenas author `fog_sky_affect = 0.22` with `fog_density = 0.0`, so reading the
+            // flag alone pulled 22% of a warm haze across a sky the original leaves clear — the
+            // same washout as the geometry fog, on the largest surface in the frame.
+            //
+            // ⚠️ THE TWO CHECKS MUST STAY IN STEP. They are deliberately the same expression
+            // rather than a shared flag because this method is called from `ApplyEnvironment`
+            // with only the sub-resource in hand; if a third reader appears, hoist it then.
+            bool fogEnabled = env.Props.TryGetValue("fog_enabled", out var fe) && fe.Trim() == "true";
+            bool fogDepthMode = (int)SubProp(env, "fog_mode", 1.0f) == 1;
+            float fogDensity = SubProp(env, "fog_density", 1.0f);
+
+            bool fogOn = fogEnabled && !(fogDepthMode && fogDensity <= 0.0001f);
+
+            var fogTint = ParseColor(env.Props.TryGetValue("fog_light_color", out var flc)
+                                     ? flc : null, new Color(0.92f, 0.78f, 0.60f));
+
+            material.SetColor("_Tint", fogOn && skyAffect > 0.0f
+                              ? Color.Lerp(Color.white, fogTint, skyAffect)
+                              : Color.white);
+
+            EditorUtility.SetDirty(material);
+
+            RenderSettings.skybox = material;
+            report.AppendLine($"   sky: panorama material bound, fog affect {skyAffect:0.00}");
+        }
+
+        private static float SubProp(SubRes res, string key, float fallback) =>
+            res.Props.TryGetValue(key, out var s) ? F(s) : fallback;
+
+        private static float Prop(NodeDef n, string key, float fallback) =>
+            n.Props.TryGetValue(key, out var s) ? F(s) : fallback;
+
+        private static Color ParseColor(string value, Color fallback)
+        {
+            if (string.IsNullOrEmpty(value)) return fallback;
+
+            var m = Regex.Match(value, @"Color\(([^)]*)\)");
+            if (!m.Success) return fallback;
+
+            var parts = m.Groups[1].Value.Split(',');
+            if (parts.Length < 3) return fallback;
+
+            return new Color(F(parts[0]), F(parts[1]), F(parts[2]),
+                             parts.Length > 3 ? F(parts[3]) : 1.0f);
+        }
+
+        /// <summary>
+        /// ⚠️ THE WALL FACES ARE A HARD BOUND ON THE ARENA and they are reported so
+        /// ArenaCheck can be run against the real geometry. Violating the standoff bound does
+        /// not look like a bounds bug: bots pin against a wall reaching for a goal inside it,
+        /// and it gets reported as broken pathfinding while most of the offence quietly
+        /// disappears.
+        /// </summary>
+        private static void ReportWalls(Dictionary<string, Transform> byPath, StringBuilder report)
+        {
+            foreach (var key in new[] { "Bounds/WallEast", "Bounds/WallWest",
+                                        "Bounds/WallNorth", "Bounds/WallSouth" })
+            {
+                if (!byPath.TryGetValue(key, out var t)) continue;
+                report.AppendLine($"   {key}: x={t.position.x:F2} z={t.position.z:F2}");
+            }
+        }
+
+        // -------------------------------------------------------------------
+        // CONVERSION
+        // -------------------------------------------------------------------
+
+        private static string ToUnityAssetPath(string godotPath)
+        {
+            // res://assets/models/kits/town/road.glb -> Assets/TumbangPreso/Art/models/...
+            string rel = godotPath.Replace("res://", "");
+            if (rel.StartsWith("assets/")) rel = rel.Substring("assets/".Length);
+            return $"{ArtRoot}/{rel}";
+        }
+
+        private static string SubId(string value)
+        {
+            var m = Regex.Match(value, @"SubResource\(""([^""]+)""\)");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        private static string ExtId(string value)
+        {
+            var m = Regex.Match(value ?? "", @"ExtResource\(""([^""]+)""\)");
+            return m.Success ? m.Groups[1].Value : null;
+        }
+
+        private static Vector3 ParseVec3(string value)
+        {
+            var m = Regex.Match(value, @"Vector3\(([^)]*)\)");
+            if (!m.Success) return Vector3.one;
+
+            var parts = m.Groups[1].Value.Split(',');
+            if (parts.Length < 3) return Vector3.one;
+
+            return new Vector3(F(parts[0]), F(parts[1]), F(parts[2]));
+        }
+
+        private static float F(string s) =>
+            float.TryParse(s.Trim(), NumberStyles.Float, Inv, out var v) ? v : 0.0f;
+
+        /// <summary>
+        /// Godot `Transform3D(xx,xy,xz, yx,yy,yz, zx,zy,zz, ox,oy,oz)` to a Unity local
+        /// transform.
+        ///
+        /// ⚠️⚠️ THE MIRROR IS THE WHOLE CONVERSION AND IT IS EASY TO GET SUBTLY WRONG. Godot is
+        /// right-handed with -Z forward; Unity is left-handed with +Z forward. Mirroring on Z
+        /// means positions negate Z, the right and up columns negate their z component, and
+        /// the FORWARD column is rebuilt from Godot's -Z basis column rather than its +Z. Skip
+        /// that last part and the map builds mirrored: entirely plausible, and wrong in a way
+        /// only somebody who knows the arena will catch.
+        /// </summary>
+        private static void ApplyGodotTransform(Transform t, string value)
+        {
+            var m = Regex.Match(value, @"Transform3D\(([^)]*)\)");
+            if (!m.Success) return;
+
+            var p = m.Groups[1].Value.Split(',');
+            if (p.Length < 12) return;
+
+            // ⚠️⚠️ THE TWELVE NUMBERS ARE THE BASIS BY **ROW**, AND READING THEM AS COLUMNS
+            // TRANSPOSES EVERY ROTATION IN BOTH MAPS. Godot's `Basis` stores `rows[3]` and its
+            // Variant serialisation prints them in that order, so `Transform3D(a,b,c, d,e,f,
+            // g,h,i, ...)` is
+            //
+            //     row0 = (a, b, c)      x_axis = (a, d, g)
+            //     row1 = (d, e, f)      y_axis = (b, e, h)
+            //     row2 = (g, h, i)      z_axis = (c, f, i)
+            //
+            // and this read `(a,b,c)` as the x_axis. A basis built from a rotation is
+            // orthonormal by rows AND by columns, so the transposed version is still a perfectly
+            // valid rotation — it is the INVERSE one. Nothing fails, nothing logs, and every
+            // axis-aligned node in the map (which is nearly all of them) is unaffected, which is
+            // why this survived the whole port.
+            //
+            // ⚠️⚠️ WHAT IT COST IS THE SUN. Eskinita's key light is
+            // `Transform3D(0.86603, -0.31889, 0.38549, 0, 0.77088, 0.63698, -0.5, -0.55164,
+            // 0.66692, 0, 12, 0)`, so its true z_axis is (0.38549, 0.63698, 0.66692) and a Godot
+            // light shines along -Z: DOWN, at 39.6 degrees above the horizon. Read transposed,
+            // the forward came out (0.5, +0.55164, 0.667) — pointing UP. The floor's N·L went
+            // negative and clamped to zero, so the largest surface in the game received NO
+            // DIRECT SUNLIGHT AT ALL and was lit by ambient alone.
+            //
+            // Measured against `Logs/shots-godot/g04-ready.png` over the same band of the same
+            // street: road 46/41/53 here against 79/69/71 there, and — the tell — completely
+            // unmoved by turning shadows off or dropping `shadowStrength` to 0.15, because a
+            // surface that is not lit cannot be shadowed either. Three separate passes read that
+            // darkness as a grading problem and adjusted the ambient, the tonemap and the colour
+            // space in turn. It was never the grade. The sun was upside down.
+            var gx = new Vector3(F(p[0]), F(p[3]), F(p[6]));   // Godot basis X axis (column)
+            var gy = new Vector3(F(p[1]), F(p[4]), F(p[7]));   // Godot basis Y axis
+            var gz = new Vector3(F(p[2]), F(p[5]), F(p[8]));   // Godot basis Z axis
+            var origin = new Vector3(F(p[9]), F(p[10]), F(p[11]));
+
+            float sx = gx.magnitude, sy = gy.magnitude, sz = gz.magnitude;
+            if (sx > 0.0001f) gx /= sx;
+            if (sy > 0.0001f) gy /= sy;
+            if (sz > 0.0001f) gz /= sz;
+
+            // Mirror on Z, and take forward from Godot's -Z.
+            var uRight = new Vector3(gx.x, gx.y, -gx.z);
+            var uUp = new Vector3(gy.x, gy.y, -gy.z);
+            var uForward = new Vector3(-gz.x, -gz.y, gz.z);
+
+            t.localPosition = new Vector3(origin.x, origin.y, -origin.z);
+
+            t.localRotation = (uForward.sqrMagnitude > 0.0001f && uUp.sqrMagnitude > 0.0001f)
+                ? Quaternion.LookRotation(uForward, uUp)
+                : Quaternion.identity;
+
+            // Preserve any non-uniform scale the builder baked into the basis.
+            t.localScale = new Vector3(
+                Mathf.Approximately(sx, 0.0f) ? 1.0f : sx,
+                Mathf.Approximately(sy, 0.0f) ? 1.0f : sy,
+                Mathf.Approximately(sz, 0.0f) ? 1.0f : sz);
+
+            // Unused, but kept so the intent of uRight is explicit rather than implied.
+            _ = uRight;
+        }
+    }
+}

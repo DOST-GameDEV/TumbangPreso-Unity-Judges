@@ -1,0 +1,1315 @@
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.Rendering;
+
+namespace TumbangPreso.Visual
+{
+    /// <summary>
+    /// A full-world ink outline, as a screen-space pass over the camera's depth and normals.
+    /// PROTOTYPE. Off by default, and it must stay off until it is measured.
+    ///
+    /// ⚠️⚠️ A WORLD OUTLINE ALREADY SHIPPED ONCE AND WAS REVERTED ON 2026-07-29. Do not treat
+    /// this as new ground. The full history lives on <see cref="EnvColourPass"/> and is repeated
+    /// on <see cref="ToonSkin"/>: Phase 8 put the whole map on the toon shader with an
+    /// inverted-hull border, it was played, and it came back as *"the current shaders look
+    /// terrible and are causing severe lag on other PCs. The toon shader is creating ugly,
+    /// horizontal banded shadows."*
+    ///
+    /// Two faults, both structural rather than tuning:
+    ///
+    ///  1. **BANDING**, from a two-band toon ramp stepping across large flat surfaces.
+    ///  2. **COST**, from an inverted hull on every mesh in a dressed street. Eskinita is
+    ///     roughly 450 renderers, so that is 450 extra draw calls and their vertex work.
+    ///
+    /// ⚠️ A SCREEN-SPACE PASS AVOIDS BOTH BY CONSTRUCTION, WHICH IS THE ONLY REASON THIS RETRY
+    /// IS WORTH DOING RATHER THAN A SECOND MISTAKE.
+    ///
+    ///  * It applies **no toon lighting to the world at all**. The world keeps its plainly lit
+    ///    materials exactly as `EnvColourPass` leaves them, and this pass only draws an edge
+    ///    overlay. There is no ramp anywhere in it, so fault 1 has no mechanism to recur.
+    ///  * It needs **no per-mesh hull**. One full-screen pass finds every edge in the frame, so
+    ///    the cost stops scaling with how dressed the street is. Fault 2 is bounded differently.
+    ///
+    /// ⚠️ IT IS STILL NOT FREE, AND THE HONEST NUMBER MATTERS MORE THAN THE FEATURE.
+    /// `DepthTextureMode.DepthNormals` in the built-in pipeline is a real depth-normals PREPASS:
+    /// one extra rasterisation of the whole opaque scene through a replacement shader, plus the
+    /// full-screen pass itself. So the trade is "one extra scene pass, no extra per-mesh draw"
+    /// against "one extra draw per mesh". On a dressed street the prepass wins; on a bare one it
+    /// loses. Nobody has measured either on the machines that reported the lag, which is exactly
+    /// why <see cref="_prototypeEnabled"/> defaults to false.
+    /// </summary>
+    /// <remarks>
+    /// § WHY THIS IS AN `OnRenderImage` PASS AND NOT A RENDERER FEATURE.
+    ///
+    /// ⚠️ THE PROJECT IS ON THE BUILT-IN RENDER PIPELINE, NOT URP.
+    /// `ProjectSettings/GraphicsSettings.asset` carries `m_CustomRenderPipeline: {fileID: 0}`,
+    /// so there is no `ScriptableRenderer` and no `ScriptableRendererFeature` to hang this off.
+    /// `Graphics.Blit` from `OnRenderImage` is the whole toolbox. <see cref="ColourGrade"/> is
+    /// the working precedent in this repo and this follows its shape deliberately: the same
+    /// `Shader.Find` with the same stripping note, the same lazily built hidden material, the
+    /// same pass-through when the effect is a no-op.
+    /// </remarks>
+    [RequireComponent(typeof(Camera))]
+    [DisallowMultipleComponent]
+    public sealed class WorldOutline : MonoBehaviour
+    {
+        /// <summary>
+        /// How the pass handles surfaces that already carry an inverted-hull border.
+        /// See the long note on <see cref="_exclusion"/> for which of these to use and why.
+        /// </summary>
+        public enum Exclusion
+        {
+            /// <summary>Outline everything, cast included. Cheapest, and wrong. See the note.</summary>
+            Overlap = 0,
+
+            /// <summary>Anything already rendering on `TumbangPreso/Toon` is masked out.</summary>
+            ToonSurfaces = 1,
+
+            /// <summary>Anything on <see cref="_excludedLayers"/> is masked out.</summary>
+            Layers = 2,
+        }
+
+        // ------------------------------------------------------------------ the toggle
+        //
+        // ⚠️⚠️ OFF BY DEFAULT, AND THE NAME SAYS PROTOTYPE ON PURPOSE. This is a retry of a
+        // feature that shipped, was played and was reverted. A prototype that quietly becomes
+        // the look because it happened to be enabled on one camera in one scene is the failure
+        // mode to guard against here, not a rendering bug. Nothing in the game turns this on:
+        // it has to be switched on by hand, or by a probe that says in its own log that it did.
+
+        [Header("Prototype")]
+        [SerializeField] private bool _prototypeEnabled;
+
+        // ⚠️⚠️ THE OPACITY IS 0.6, DOWN FROM A FULLY OPAQUE 1.0. 🧑 2026-08-29, over a live
+        // frame: *"as well as overall effect of shader, lessen it"*, *"makes it ugly"*, *"cant
+        // see some details anymore"*.
+        //
+        // This pass is SCREEN-SPACE and it stacks on top of the per-model ink hull that
+        // `ToonSkin` already draws, so every silhouette in the street was being lined twice: once
+        // by an inflated hull and again by a full-strength depth-and-normal edge. Neither was
+        // wrong on its own and the sum is what reads as heavy. `ToonSkin.PropOutlineWidth` is the
+        // other half of this change and carries the measurement; this half is what brings the
+        // whole frame down rather than only the props.
+        //
+        // ⚠️ OPACITY RATHER THAN `_thickness`. A thinner screen-space line breaks up and
+        // shimmers under camera motion, because the edge is found per pixel and a sub-pixel line
+        // is either on or off; a softer line of the same width stays continuous. The pass is
+        // deliberately still fully present at 0.6 — the ink IS the art direction (`VISION.md`
+        // § 6) and this is a dimmer, not a removal.
+        //
+        // ⚠️ IT REACHES BOTH CAMERAS AS OF THIS SESSION. `SpectatorCamera` was given this pass
+        // in the same batch, so lowering it here lowers it for gameplay and for every recording
+        // and screenshot at once, which is the point: they must match.
+        [Header("Ink")]
+        [SerializeField] private Color _colour = new Color(0.02f, 0.02f, 0.03f, 1.0f);
+        [SerializeField, Range(0.0f, 1.0f)] private float _opacity = 0.6f;
+
+        // ------------------------------------------------------------------ § THE FAR PLANE
+        //
+        // ⚠️⚠️ THE PRECISION OF THIS WHOLE FEATURE IS SET BY A NUMBER THAT HAS NOTHING TO DO
+        // WITH IT, AND THAT IS THE FIRST THING TO CHANGE IF THE EDGES COME OUT SPECKLED.
+        //
+        // The built-in pipeline's `_CameraDepthNormalsTexture` is one 32-bit texel per pixel:
+        // two 8-bit channels of depth and two of normal. So depth is 65,536 steps spread EVENLY
+        // over the frustum, and the step size is far/65536 at every distance. `CameraRig` never
+        // sets `farClipPlane`, so the match camera runs Unity's default of 1000 m and the step
+        // is 15 mm. Worked through against `_depthBias`'s default of 0.035, that quantisation
+        // contributes about 0.003 to the relative depth difference at 10 m, 0.03 at 1 m, and
+        // 0.06 at half a metre. In other words the deadzone covers it comfortably at arm's
+        // length and further, and runs out when the camera is pressed against a surface.
+        //
+        // ⚠️ THE FIX IS NOT A BIGGER DEADZONE, IT IS A SHORTER FRUSTUM. Both arenas are tens of
+        // metres across: `SpectatorCamera` sets its own far plane and every probe in this repo
+        // picks something between 40 and 260. A match camera at 1000 m
+        // is spending 95 percent of a 16-bit depth range on empty space beyond the map. Dropping
+        // it to 200 divides every number above by five and costs nothing else. That is a change
+        // to `CameraRig`, which this prototype has no business making, so it is recorded here.
+        //
+        // ⚠️ THE NORMALS HAVE THEIR OWN LIMIT AND NO EQUIVALENT FIX. They are packed by a
+        // spheremap transform into two 8-bit channels, which is roughly a degree of angular
+        // resolution and worse for normals pointing away from the camera. So the normals term
+        // finds a wall corner easily and finds a SHALLOW crease unreliably: a fold of a couple
+        // of degrees sits inside the packing error, and pushing `_normalSensitivity` up far
+        // enough to catch it starts painting noise on curved surfaces instead. A G-buffer would
+        // not have this problem. Built-in forward rendering does, and saying so is more useful
+        // than tuning around it.
+
+        [Header("Edge")]
+        [SerializeField, Range(0.5f, 4.0f)] private float _thickness = 1.0f;
+        [SerializeField, Range(0.0f, 200.0f)] private float _depthSensitivity = 40.0f;
+        [SerializeField, Range(0.0f, 0.25f)] private float _depthBias = 0.035f;
+        [SerializeField, Range(0.0f, 8.0f)] private float _normalSensitivity = 1.6f;
+        [SerializeField, Range(0.0f, 1.0f)] private float _normalBias = 0.18f;
+
+        // ------------------------------------------------------------------ § SUPERSAMPLING
+        //
+        // ⚠️⚠️ MSAA CANNOT ANTI-ALIAS THIS PASS, AND THAT WAS MEASURED BEFORE ANY OF THIS WAS
+        // WRITTEN. In play mode on 2026-08-28: quality level Ultra, `QualitySettings.antiAliasing`
+        // 4, `Camera.allowMSAA` true, and a render target requested with four samples really
+        // coming back with four. MSAA is on and it is working. It anti-aliases GEOMETRY during
+        // rasterisation, out of coverage samples taken per triangle, and this outline is painted
+        // by a fragment shader INTO AN IMAGE THAT HAS ALREADY BEEN RESOLVED. There were never any
+        // coverage samples for the ink. So every line it draws is hard-edged by construction,
+        // which is the stair-stepping, and a wire narrower than a pixel is detected at some pixels
+        // and not others, which is the dashing.
+        //
+        // ⚠️⚠️ THE FIX IS TO EVALUATE THE EDGE TERM AT N² SUB-PIXEL POSITIONS AND AVERAGE. That
+        // gives an edge covering half a pixel half-strength ink instead of all or nothing. What it
+        // costs and what it genuinely buys are written out in full in the § SUPERSAMPLING note in
+        // `WorldOutline.shader`; the two lines worth repeating here are:
+        //
+        //   * THE EDGE TERM GAINS RESOLUTION. It is a function of position, so asking it four
+        //     questions instead of one produces five ink levels instead of two.
+        //   * THE DEPTH DATA DOES NOT. `_CameraDepthNormalsTexture` is generated at camera
+        //     resolution and point filtered, so sub-pixel taps re-read the same texels in
+        //     different combinations. Geometry the prepass never rasterised is not recovered. The
+        //     dashed wires get softer and shorter gaps; they do not become solid lines. The only
+        //     thing that would fix them is rendering the prepass itself at 2x, which is a SECOND
+        //     full rasterisation of roughly 450 renderers on Eskinita, and this whole feature's
+        //     claim to being worth retrying after 2026-07-29 is that it costs one scene pass
+        //     rather than 450 extra draws. It was costed and rejected, not overlooked.
+        //
+        // ⚠️ THE DEFAULT IS 2, AND THE NUMBER COMES FROM WHAT THE REST OF THE FRAME ALREADY GETS.
+        // `QualitySettings.antiAliasing` is 4 on Ultra, so geometry edges in this game resolve
+        // from four coverage samples. Two sub-samples per axis is four sub-samples per pixel, so
+        // the ink resolves at the same granularity as the geometry it is drawn beside. Matching it
+        // is the point: ink noticeably coarser than the silhouette under it is what the report was
+        // about, and ink noticeably finer would be paying for a difference nobody can see.
+        //
+        // ⚠️ AND THE COST IS ONE NUMBER: the composite pass goes from 8 texture taps to 4·N² + 4,
+        // so 8 at 1, 20 at 2, 40 at 3. No extra full-screen pass, no extra render target, no extra
+        // memory of any kind. 1 restores the pre-2026-08-28 sampling exactly.
+        [Header("Anti-aliasing")]
+        [SerializeField, Range(1, 3)] private int _supersample = 2;
+
+        // A negative value adopts `RenderSettings.fogStartDistance` and `fogEndDistance`.
+        [Header("Distance")]
+        [SerializeField] private float _fadeStart = -1.0f;
+        [SerializeField] private float _fadeEnd = -1.0f;
+
+        /// <summary>A map may name the ink's own distances in place of its fog's
+        /// (`MapCameraRange`: the Arena's fog runs out to its city, kilometres past its stands).
+        /// Negative values adopt the fog again. Nothing calls this on a map that names none.</summary>
+        public void SetFade(float start, float end) { _fadeStart = start; _fadeEnd = end; }
+
+        [Header("Exclusion")]
+        [SerializeField] private Exclusion _exclusion = Exclusion.ToonSurfaces;
+        [SerializeField] private LayerMask _excludedLayers;
+        [SerializeField, Range(0.0f, 1.0f)] private float _maskStrength = 1.0f;
+        /// <summary>
+        /// Anything narrower than this on its smallest world axis is excluded from the outline.
+        /// See <see cref="IsTooThinToOutline"/> for why dashes are a rasterisation limit rather
+        /// than a tuning failure.
+        ///
+        /// ⚠️ 0.12 m SITS ABOVE THE WIRES AND BELOW EVERYTHING STRUCTURAL. The utility poles this
+        /// pass should still ink measure 0.634 m across (the dither work measured the post's half
+        /// width at 0.317 m off the `.obj` vertices), so they clear this by a factor of five. Cables,
+        /// washing lines and aerials are centimetres. Nothing in the arena sits between the two,
+        /// which is what makes a single threshold safe here rather than lucky.
+        /// </summary>
+        private const float ThinMetres = 0.12f;
+
+        [SerializeField] private float _maskDepthTolerance = 0.0008f;
+        [SerializeField] private float _rescanSeconds = 1.0f;
+
+        /// <summary>The whole feature, in one switch. Nothing in the game sets this true.</summary>
+        public bool PrototypeEnabled
+        {
+            get => _prototypeEnabled;
+            set => _prototypeEnabled = value;
+        }
+
+        public void SetInk(Color colour, float opacity)
+        {
+            _colour = colour;
+            _opacity = Mathf.Clamp01(opacity);
+        }
+
+        /// <summary>
+        /// Sub-samples per axis for the edge term, 1 to 3. See the § SUPERSAMPLING note above for
+        /// where the default of 2 comes from and for what it does and does not fix.
+        ///
+        /// ⚠️ CLAMPED ON THE WAY IN AND AGAIN IN THE SHADER. A probe sweeping this looking for the
+        /// point of diminishing returns is exactly the caller that will try 0 or 8, and a zero
+        /// would divide by zero building the sub-sample grid.
+        /// </summary>
+        public int Supersample
+        {
+            get => _supersample;
+            set => _supersample = Mathf.Clamp(value, MinSupersample, MaxSupersample);
+        }
+
+        public void SetEdge(float thickness, float depthSensitivity, float normalSensitivity)
+        {
+            _thickness = Mathf.Clamp(thickness, 0.5f, 4.0f);
+            _depthSensitivity = Mathf.Max(0.0f, depthSensitivity);
+            _normalSensitivity = Mathf.Max(0.0f, normalSensitivity);
+        }
+
+        public void SetExclusion(Exclusion mode, LayerMask layers)
+        {
+            _exclusion = mode;
+            _excludedLayers = layers;
+            _nextScan = 0.0f;
+        }
+
+        // ------------------------------------------------------------------
+
+        private static readonly int MainTexId = Shader.PropertyToID("_MainTex");
+        private static readonly int OutlineColorId = Shader.PropertyToID("_OutlineColor");
+        private static readonly int ThicknessId = Shader.PropertyToID("_Thickness");
+        private static readonly int OpacityId = Shader.PropertyToID("_Opacity");
+        private static readonly int DepthSensitivityId = Shader.PropertyToID("_DepthSensitivity");
+        private static readonly int DepthBiasId = Shader.PropertyToID("_DepthBias");
+        private static readonly int NormalSensitivityId = Shader.PropertyToID("_NormalSensitivity");
+        private static readonly int NormalBiasId = Shader.PropertyToID("_NormalBias");
+        private static readonly int FadeStartId = Shader.PropertyToID("_FadeStart");
+        private static readonly int FadeEndId = Shader.PropertyToID("_FadeEnd");
+        private static readonly int MaskId = Shader.PropertyToID("_WorldOutlineMask");
+        private static readonly int MaskStrengthId = Shader.PropertyToID("_MaskStrength");
+        private static readonly int MaskToleranceId = Shader.PropertyToID("_MaskDepthTolerance");
+        private static readonly int NearFadeMaskId = Shader.PropertyToID("_WorldOutlineNearFadeBand");
+        private static readonly int NormalDetailFadeId = Shader.PropertyToID("_NormalDetailFade");
+        private static readonly int ViewRayId = Shader.PropertyToID("_ViewRay");
+        private static readonly int SupersampleId = Shader.PropertyToID("_Supersample");
+
+        /// <summary>1 is the pre-2026-08-28 sampling: one evaluation at the pixel centre.</summary>
+        private const int MinSupersample = 1;
+
+        // ⚠️ THE CEILING IS 3 AND IT IS A SHADER LIMIT AS WELL AS A TASTE ONE. The loop in pass 0
+        // carries `[unroll(3)]`, so 3 is what the compiler is told to unroll to; a larger value
+        // would still run, as a rolled loop, at 4·N² + 4 taps. It is capped here because 3 is
+        // already 40 taps for a difference that has to be looked for, and because a knob that can
+        // be dragged to 8 in an inspector will be.
+        private const int MaxSupersample = 3;
+
+        /// <summary>Pass 0 in `WorldOutline.shader`. See the note there: blitting without a pass
+        /// index runs the mask pass over the whole frame and paints it white.</summary>
+        private const int CompositePass = 0;
+
+        private const int MaskPass = 1;
+
+        // ⚠️ PASSES 2 AND 3 ARE THE AMBIENT OCCLUSION AND ITS BLUR (LIGHT-3.6). Appended rather
+        // than inserted, so the composite and the mask keep the indices every other line here
+        // and in the shader already names.
+        private const int AmbientOcclusionPass = 2;
+        /// <summary>A debug session's test value for the cast's share of the ambient occlusion (F8,
+        /// `Hud`): negative means "use the player's setting" (`GameSettings.CharacterShading`).</summary>
+        public static float CharacterAoTest = -1f;
+        /// <summary>A debug session's test value for the RADIUS of the cast's own occlusion kernel, in
+        /// metres: zero or less means "use the look's own" (`WorldLookProfile.CharacterAmbientOcclusionRadius`,
+        /// a third of a metre). The redesigned cast's creases are centimetres deep (piping, a fringe
+        /// over a brow, a cuff on a wrist), and a third of a metre spreads the shade past them; a
+        /// smaller radius keeps it IN the crease. Owner, 2026-10-05: "the ao isnt being applied to the
+        /// character creases properly". Like `CharacterAoTest`, never set by the game itself.</summary>
+        public static float CharacterAoRadiusTest = -1f;
+        private const int AmbientOcclusionBlurPass = 3;
+        /// <summary>
+        /// ⚠️⚠️ THE OCCLUSION'S COST FOLLOWS THE GRAPHICS TIER (owner, 2026-10-04: the game is
+        /// "primarily not laggy for the server host but it is for players joining too", then "add
+        /// these optimization fixes"). Pass 2 is the dearest thing this component draws: sixteen
+        /// dependent depth-normal reads for every pixel of the frame, on every tier but Low.
+        /// On the top tier (High) it is unchanged. On the tiers between (Balanced, the DEFAULT)
+        /// the shader's `WORLD_AO_LITE` variant takes EIGHT probes: the same four rings, two
+        /// probes a ring, the same radius, bias and falloff, the same 4x4 tile of rotations, so
+        /// pass 3's blur still cancels the pattern (it now averages 128 probes, not 256).
+        /// ⚠️ STILL FULL RESOLUTION. Half resolution is the cheaper cut and it is the one the
+        /// owner turned down (see the note in `OnRenderImage`: the rotation tile reads as a grid).
+        /// Tests/PlayMode/IlalimPerfProbe.cs renders the same frame both ways and reports how
+        /// far the picture moves.
+        /// </summary>
+        private const string AmbientOcclusionLiteKeyword = "WORLD_AO_LITE";
+        /// <summary>REVIEW ONLY: 16 or 8 forces that many probes whatever the tier; 0 (the game)
+        /// lets the tier decide. Like `CharacterAoTest`, never set by the game itself.</summary>
+        public static int AmbientOcclusionSamplesTest;
+        /// <summary>A MAP WITH ITS OCCLUSION BAKED (owner, 2026-10-29: asked whether the world AO can be baked, then
+        /// "continue" to a Payo bake test). Set each frame by `Map.PayoBakedAO` while its switch is on, false everywhere
+        /// else. While it is true passes 2 and 3 work ONLY under the mask: the cast's crease kernel where the exclusion
+        /// mask (R) covers the cast, and the world's kernel where <see cref="LiveAOProps"/> are drawn (G); every other pixel
+        /// returns clean at once, since the static world carries its occlusion in its vertices.</summary>
+        public static bool BakedWorldAO;
+        /// <summary>Benchmark only (`-tp-no-rescan`): scans once, an A/B for the uneven frames (owner, 2026-10-31).</summary>
+        internal static bool BenchNoRescan;
+        /// <summary>Benchmark only: the look tests for the plant outlines showing through walls (owner, 2026-10-31).</summary>
+        internal static bool BenchNoExcluded;
+        internal static float BenchMaskTolerance = -1f;
+        /// <summary>
+        /// DETAILED PROPS KEEP THE LIVE CREASE AO ON A BAKED MAP (owner, 2026-10-30, of the bake beside the screen AO: "no ao
+        /// on the creases of the statue face", then "continue with these fixes"). A vertex bake is only as fine as the mesh,
+        /// and a bulul's face, a plinth's carving or a small offering is finer than any vertex spacing that keeps the asset
+        /// small. Their renderers are filled in here by `Map.PayoBakedAO` (the bake leaves them out and lists them); the
+        /// mask draw paints the visible ones into the mask's G channel, and pass 2 runs the world kernel on those pixels
+        /// only, the way it ran over the whole frame before the bake. Empty on every other map.
+        /// </summary>
+        public static readonly List<Renderer> LiveAOProps = new List<Renderer>();
+        /// <summary>Merged meshes holding such props among other pieces: only vertices with UV3.x = 1 are painted into G.</summary>
+        public static readonly List<Renderer> LiveAOPropsByVertex = new List<Renderer>();
+        private static readonly int MaskLiveId = Shader.PropertyToID("_WorldOutlineMaskLive");
+        private static readonly int WorldAOMaskedId = Shader.PropertyToID("_WorldAOMasked");
+        /// <summary>How many live-AO props the last mask draw painted (0: nothing of theirs on screen).</summary>
+        public static int LiveAOPropDraws { get; private set; }
+        private static bool AmbientOcclusionLite => AmbientOcclusionSamplesTest != 0
+            ? AmbientOcclusionSamplesTest <= 8
+            : Settings.GraphicsProfiles.Current < Settings.GraphicsProfiles.All.Length - 1;
+        private static readonly int WorldAOId = Shader.PropertyToID("_WorldAO");
+        private static readonly int WorldAOParamsId = Shader.PropertyToID("_WorldAOParams");
+
+        private const string ToonShaderName = "TumbangPreso/Toon";
+
+        private Camera _camera;
+        private Material _material;
+        private Material _maskMaterial;
+        private RenderTexture _mask;
+        private CommandBuffer _maskBuffer;
+        private bool _bufferAttached;
+        private bool _depthNormalsRequested;
+        private bool _missing;
+
+        private readonly List<Renderer> _excluded = new List<Renderer>();
+        private readonly List<NearFadeMask> _nearFade = new List<NearFadeMask>();
+        private struct NearFadeMask
+        {
+            public Renderer Renderer;public Bounds Bounds;public bool Stationary;
+            public int Submesh;public float Start,End;
+        }
+        public int NearFadeMaskDraws { get; private set; }
+        public bool FadeOccluderOutlines { get; set; } = true;
+        public bool FadeDistantNormalDetail { get; set; } = true;
+        private float _nextScan;
+
+        private void Awake()
+        {
+            _camera = GetComponent<Camera>();
+        }
+
+        /// <summary>
+        /// § THE DEPTH-NORMALS PREPASS, AND PUTTING IT BACK WHEN THIS IS SWITCHED OFF.
+        ///
+        /// ⚠️⚠️ THE FLAG IS OR-ED IN AND CLEARED ONLY IF THIS COMPONENT WAS THE ONE THAT SET IT.
+        /// `Camera.depthTextureMode` is a shared bitfield with no owner, so assigning it outright
+        /// would silently switch off anything else that had asked for depth, and clearing it
+        /// unconditionally on disable would do the same thing one frame later. Nothing else in
+        /// this project asks for it TODAY, which is precisely why a future second caller would
+        /// break in a way nobody could reproduce.
+        ///
+        /// ⚠️ AND IT IS RECONCILED EVERY FRAME RATHER THAN ONLY IN OnEnable, because the toggle
+        /// is a serialized field somebody flips in the inspector while the game is running. That
+        /// is the whole point of it being a prototype knob.
+        /// </summary>
+        private void RequestDepthNormals(bool want)
+        {
+            // The Low tier builds the ink's depth-normals from the camera's depth (see `InkFromDepth`), so it asks
+            // for that depth and not for the engine's second full draw of the scene.
+            bool fromDepth = want && InkFromDepth;
+            RequestFineDepth(want && (FineDepth || fromDepth));
+            want &= !fromDepth;
+            if (_camera == null || want == _depthNormalsRequested) return;
+
+            if (want) _camera.depthTextureMode |= DepthTextureMode.DepthNormals;
+            else _camera.depthTextureMode &= ~DepthTextureMode.DepthNormals;
+
+            _depthNormalsRequested = want;
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE RENDER STYLE IS A SECOND, INDEPENDENT VETO ON THIS PASS, AND IT IS CHECKED
+        /// HERE RATHER THAN BY CLEARING `PrototypeEnabled`. `Settings.RenderStyles`'s Chromatic
+        /// row draws the game with no ink edge anywhere, and the hull outline and this
+        /// screen-space one are one look: turning off the cast's border and leaving the street's
+        /// on would ink the buildings and not the people standing in front of them.
+        ///
+        /// It cannot be done by writing `PrototypeEnabled` false, because `CameraRig.Awake` sets
+        /// it TRUE on every match camera it builds and would put the outline back on the next
+        /// respawn or scene load. It also must not be, for a reason the toggle's own note gives:
+        /// that flag is the prototype's switch and is meant to be read as "is this prototype
+        /// being evaluated at all", which is a different question from "does the style the player
+        /// picked have ink in it". Two answers, two fields.
+        ///
+        /// ⚠️ READ EVERY FRAME OFF A STATIC, exactly as `Visual.PostAntiAlias` reads
+        /// `AntiAliasModes.FxaaActive`, which is what makes the settings pick change the frame
+        /// while the panel is still open. It gates `LateUpdate` as well as `OnRenderImage`, so
+        /// the Chromatic style also stops paying for the depth-normals request and the exclusion
+        /// mask rebuild rather than only for the composite.
+        /// </summary>
+        /// <summary>
+        /// ⚠️⚠️ PAST THIS FAR PLANE THE OCCLUSION READS THE CAMERA'S OWN DEPTH TEXTURE (owner, 2026-10-18, on Payo:
+        /// "theres also some striping on the AO for both world and characters, this doesnt show on other maps").
+        /// The depth-normals texture's 16-bit depth steps by far / 65536: 240 m (every map but two) is 4 mm, the
+        /// Arena's 1300 m is 2 cm, Payo's 3700 m is 5.6 cm, past the occlusion's 3 cm bias, so smooth slopes and
+        /// bodies shaded in bands. Only a camera past this far plane (Payo) switches `WORLD_AO_FINE_DEPTH` on and asks
+        /// for `DepthTextureMode.Depth`; every other map keeps exactly what it had. With a shadowed sun the built-in
+        /// pipeline renders that depth texture for its screen-space shadows anyway.
+        /// </summary>
+        public const float FineDepthFar = 1500f;
+        /// <summary>The exclusion mask's depth tolerance past `FineDepthFar`, in metres (see where the mask is drawn).</summary>
+        private const float MaskToleranceMetres = 0.2f;
+        private const string FineDepthKeyword = "WORLD_AO_FINE_DEPTH";
+        private bool FineDepth => _camera != null && !_camera.orthographic
+            && (FineDepthTest >= 0 ? FineDepthTest > 0 : _camera.farClipPlane > FineDepthFar);
+        /// <summary>A probe's switches, never set by the game: `FineDepthTest` -1 lets the far plane decide, 0 forces
+        /// the old depth, 1 the fine one; `FineDepthView` 0 normal, 1 paints where the two depths agree (white) or
+        /// not (black), 2 the fine depth as a metre ramp, 3 the old one.</summary>
+        public static int FineDepthTest = -1, FineDepthView;
+        private bool _depthRequested;
+
+        private void RequestFineDepth(bool want)
+        {
+            if (_camera == null || want == _depthRequested) return;
+            // Only ever takes back what it added: a camera that already asked for depth keeps it, untouched.
+            if (want)
+            {
+                if ((_camera.depthTextureMode & DepthTextureMode.Depth) != 0) return;
+                _camera.depthTextureMode |= DepthTextureMode.Depth;
+            }
+            else _camera.depthTextureMode &= ~DepthTextureMode.Depth;
+            _depthRequested = want;
+        }
+
+        private bool HasWorldContact => WorldLookPresentation.HandlesCamera(_camera)
+            && WorldCueProfile.LightingWeight>0 && WorldLookProfile.Current.EnvironmentContact>0
+            && Settings.GraphicsProfiles.Current>0 && WorldCueProfile.PartOn(WorldCueProfile.PartOutlineContact);
+        // ⚠️ THE APPLIED TIER, NOT THE STORED SETTING (owner, 2026-10-29: "are you able to bake in the bright lighting
+        // look/optimize it?"). In a match the two are the same number (every settings path calls `GraphicsProfiles.Apply`
+        // with the stored value), but the graphics probe applies each tier without touching the store, so its "Low" ran
+        // Balanced's full-resolution occlusion and its extra depth pass: that, not the look, was the 40-60 ms the Radeon
+        // measured on Low (Logs/perf-igpu/parts/look-parts.csv).
+        /// <summary>
+        /// Whether this frame draws ambient occlusion: the contact term's gate (the look owns the
+        /// camera, the weight is up, not the Low tier), a perspective camera, since the pass
+        /// rebuilds points from a perspective view ray, and a non-zero strength.
+        /// </summary>
+        private bool AmbientOcclusionLive => HasWorldContact && !_camera.orthographic
+            && WorldLookPresentation.Current!=null && WorldLookProfile.Current.AmbientOcclusion>0;
+        private bool InkLive => _prototypeEnabled && Settings.RenderStyles.InkOutlinesActive && _opacity>0;
+        private bool Live => !_missing && (InkLive || HasWorldContact);
+
+        private void LateUpdate() => RequestDepthNormals(Live);
+
+        /// <summary>
+        /// THE LOW TIER SKIPS THE DEPTH-NORMALS PREPASS (owner, 2026-10-29: "its crazy laggy without a gpu. which
+        /// is not optimal. even more so for the payo map"). That prepass draws every opaque renderer a second time,
+        /// about 900 set-passes on Payo by day, and on Low nothing but the ink edge reads it (the occlusion and the
+        /// ground contact are already off there). The camera's depth texture is drawn anyway for the sun's
+        /// screen-space shadows, so `_inkDepthBuffer` turns that into the same encoding (shader pass 4) and publishes
+        /// it under the engine's own name. Perspective cameras only: pass 4 rebuilds points from a perspective ray.
+        /// Every other tier keeps the prepass exactly as it was.
+        /// </summary>
+        private bool InkFromDepth => Settings.GraphicsProfiles.Current == 0 && _camera != null
+            && !_camera.orthographic && !HasWorldContact;
+        private const int InkFromDepthPass = 4;
+        private static readonly int DepthNormalsId = Shader.PropertyToID("_CameraDepthNormalsTexture");
+        private static readonly int InkViewRayId = Shader.PropertyToID("_InkViewRay");
+        private CommandBuffer _inkDepthBuffer;
+        private bool _inkDepthAttached;
+        private RenderTexture _inkDepthNormals;
+
+        /// <summary>Attaches the Low tier's depth-to-normals buffer AHEAD of the exclusion mask, which reads it.</summary>
+        private void PrepareInkFromDepth(bool want)
+        {
+            if (!want)
+            {
+                if (_inkDepthAttached && _camera != null) _camera.RemoveCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, _inkDepthBuffer);
+                _inkDepthAttached = false;
+                return;
+            }
+            int width = Mathf.Max(1, _camera.pixelWidth), height = Mathf.Max(1, _camera.pixelHeight);
+            if (_inkDepthNormals == null || _inkDepthNormals.width != width || _inkDepthNormals.height != height)
+            {
+                if (_inkDepthNormals != null) { _inkDepthNormals.Release(); DestroyImmediate(_inkDepthNormals); }
+                _inkDepthNormals = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.Linear)
+                { name = "WorldOutlineInkDepthNormals", filterMode = FilterMode.Point, antiAliasing = 1, hideFlags = HideFlags.HideAndDontSave };
+                _inkDepthNormals.Create();
+            }
+            float tan = Mathf.Tan(_camera.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            _material.SetVector(InkViewRayId, new Vector4(tan * _camera.aspect, tan, 0, 0));
+            if (_inkDepthBuffer == null) _inkDepthBuffer = new CommandBuffer { name = "World Outline Ink Depth-Normals (Low)" };
+            _inkDepthBuffer.Clear();
+            _inkDepthBuffer.Blit((Texture)null, _inkDepthNormals, _material, InkFromDepthPass);
+            _inkDepthBuffer.SetGlobalTexture(DepthNormalsId, _inkDepthNormals);
+            _inkDepthBuffer.SetRenderTarget(BuiltinRenderTextureType.CurrentActive);
+            if (!_inkDepthAttached)
+            {
+                // Command buffers on one event run in the order added, and the mask reads this one's output.
+                bool mask = _bufferAttached;
+                if (mask) DetachBuffer();
+                _camera.AddCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, _inkDepthBuffer);
+                _inkDepthAttached = true;
+                if (mask) { _camera.AddCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, _maskBuffer); _bufferAttached = true; }
+            }
+        }
+
+        private void OnDisable()
+        {
+            RequestDepthNormals(false);
+            DetachBuffer();
+            PrepareInkFromDepth(false);
+        }
+
+        private void OnDestroy()
+        {
+            DetachBuffer();
+            PrepareInkFromDepth(false);
+            if (_inkDepthNormals != null) { _inkDepthNormals.Release(); DestroyImmediate(_inkDepthNormals); }
+
+            if (_material != null) DestroyImmediate(_material);
+            if (_maskMaterial != null) DestroyImmediate(_maskMaterial);
+
+            if (_mask != null)
+            {
+                _mask.Release();
+                DestroyImmediate(_mask);
+            }
+        }
+
+        // ------------------------------------------------------------------ the exclusion mask
+        //
+        // ⚠️⚠️ § THE DOUBLE-OUTLINE PROBLEM, WHICH IS THE REAL DESIGN QUESTION IN THIS FEATURE.
+        //
+        // Every character, both hero props and the first-person arms already carry an ink border
+        // from `Toon.shader`'s OUTLINE pass. A world pass that knows nothing about them draws a
+        // second border on the same silhouettes. Three things were considered:
+        //
+        //  A. **ACCEPT THE OVERLAP.** Cheapest, and it is worse than it first sounds. Work out
+        //     where each border actually lands. The depth-normals prepass renders the object
+        //     through a replacement shader chosen by the SubShader's `RenderType` tag, so the
+        //     hull Pass is NOT in it: the prepass records the character's TRUE silhouette, while
+        //     the hull paints a band just OUTSIDE that silhouette. A Roberts cross therefore
+        //     fires straddling the true silhouette, half of it landing on ink the hull already
+        //     drew and half of it landing inside the character. The visible result is a border
+        //     thickened INWARD, in screen space, on top of a hull border that is measured in
+        //     WORLD space. Those two disagree with distance by construction: at two metres the
+        //     hull is fat and the screen line adds a rim, at thirty metres the hull has shrunk
+        //     under a pixel and the screen line is the whole border. The cast's edge weight would
+        //     change as they run away from you.
+        //
+        //     ⚠️ AND THE SILHOUETTE IS NOT THE WORST OF IT. The normals term draws CREASES, which
+        //     is exactly what it is for on a building. On a character it puts lines down the
+        //     elbows, across the chest, and along every fold the mesh happens to have. Godot
+        //     draws no such lines: a Person is a two-band face inside one ink silhouette, and
+        //     that is the look the art was signed off against. Worse, those creases are computed
+        //     from `_CameraDepthNormalsTexture`, whose normals are two 8-bit channels through a
+        //     spheremap transform, so a crease that sits right on the threshold flickers between
+        //     frames as the limb swings. A shimmering line across a running character is the kind
+        //     of thing that gets reported as "the shaders look terrible" in exactly those words.
+        //
+        //  B. **A LAYER MASK.** Rejected as the DEFAULT, kept as an option. `TagManager.asset`
+        //     defines no custom layers at all: the whole game is on Default, and the only
+        //     layer work in the project is `ModelPreview` and `MapPreviewSurface` re-layering
+        //     whole subtrees to isolate a preview camera. Introducing a Characters layer means
+        //     touching every spawn path, and it collides head-on with those two, which overwrite
+        //     `gameObject.layer` across the subtree and would have to learn to put it back.
+        //     Layer bits are also load-bearing for physics queries in this project. That is a lot
+        //     of blast radius for a prototype, so <see cref="Exclusion.Layers"/> exists for
+        //     whoever wants it later and is not what this ships pointing at.
+        //
+        //  C. **A STENCIL.** The technically neatest answer, and it is closed off right now: the
+        //     hull and lit passes in `Toon.shader` would have to write a stencil reference, and
+        //     that file is owned elsewhere this cycle. Worth revisiting if this feature survives
+        //     measurement, because it costs nothing per frame and needs no second renderer walk.
+        //
+        // ⚠️ SO THE RECOMMENDATION IS D, WHICH IS B'S MECHANISM WITHOUT B'S BLAST RADIUS: MASK BY
+        // THE SHADER THE SURFACE IS ALREADY ON. "Carries `TumbangPreso/Toon`" and "already has a
+        // hull outline" are the same set, by definition rather than by bookkeeping, and the
+        // project states the invariant that makes it safe out loud in `ColourGrade.shader`:
+        // *"the world is deliberately not on the toon shader"*. So the query needs no new layer,
+        // no new tag, no change to any spawn path, and it cannot drift out of date the way a
+        // hand-maintained list would. It is the same style of derivation the match rules use for
+        // the taya, where the role is computed rather than accumulated.
+        //
+        // ⚠️ THE SET IS FOUND BY SCANNING RATHER THAN BY REGISTRATION, AND THAT IS THE ONE PART
+        // OF THIS THAT IS PROTOTYPE-GRADE. `ToonSkin.Apply` is the single funnel every outlined
+        // surface in the game passes through, so the shipping version of this should have the
+        // renderer register itself there and this walk should disappear. That file is owned
+        // elsewhere this cycle, so a rescan on a timer stands in. It is one
+        // `FindObjectsByType<Renderer>` per second over roughly 450 renderers, which is cheap
+        // enough to prototype behind and too rude to ship.
+
+        /// <summary>
+        /// ⚠️⚠️ THE AO NEAR GATE IS ON ONLY WHILE A NEAR-FADE PROP IS AT THE LENS (owner,
+        /// 2026-09-27, on Kanto: "i still see it. do we need the ao gate?"). The gate (the
+        /// shaders ignore every pixel nearer than NearFade.FadeStartMetres) exists for ONE fault:
+        /// a NearFade prop you stand beside (Ilalim's LRT pillars) dissolves in the colour pass
+        /// but lands in the depth-normals prepass as a solid wall at the lens, and the AO read the
+        /// whole frame as occluded. Always on, it drew a screen-wide line wherever a flat floor
+        /// crossed 1.8 m, on every map. It now returns the guard distance only while one of the
+        /// near-fade renderers found by Rescan is within the guard (plus a metre) of the camera,
+        /// and 0 otherwise, so maps with no near-fade props (Kanto, the Lagoon Cove) never gate.
+        /// </summary>
+        private float NearGuard()
+        {
+            if (_camera == null || _nearFade.Count == 0) return 0f;
+            var eye = _camera.transform.position;
+            float reach = NearFade.FadeStartMetres + 1f;
+            foreach (var item in _nearFade)
+            {
+                var r = item.Renderer;
+                if (r == null || !r.enabled) continue;
+                var bounds = item.Stationary ? item.Bounds : r.bounds;
+                if (bounds.SqrDistance(eye) < reach * reach) return NearFade.FadeStartMetres;
+            }
+            return 0f;
+        }
+
+        private void Rescan()
+        {
+            _excluded.Clear();_nearFade.Clear();
+
+            if (_exclusion == Exclusion.Overlap) return;
+
+            foreach (var renderer in FindObjectsByType<Renderer>(FindObjectsSortMode.None))
+            {
+                if (renderer == null || !renderer.enabled) continue;
+                // ⚠️ ONLY MESHES ARE MASKED (owner, 2026-10-19: shading outlines flashed through the platforms while
+                // ability effects were up; the recorder caught it with the mask list full of new effect parts). A line,
+                // trail, particle or billboard renderer builds its geometry per camera and is not meant for
+                // `CommandBuffer.DrawRenderer`; such effects also never write the depth-normals prepass, so masking them
+                // protects nothing.
+                if (!(renderer is MeshRenderer) && !(renderer is SkinnedMeshRenderer)) continue;
+
+                bool wanted = _exclusion == Exclusion.Layers
+                    ? (_excludedLayers.value & (1 << renderer.gameObject.layer)) != 0
+                    : IsToonSurface(renderer);
+
+                if (!wanted) wanted = IsTooThinToOutline(renderer);
+
+                if (wanted) _excluded.Add(renderer);
+                else
+                {
+                    var materials=renderer.sharedMaterials;
+                    for(int i=0;i<materials.Length;i++)
+                    {
+                        var material=materials[i];
+                        if(material==null||material.shader==null||ShaderNamed(material.shader)!=NearFade.ShaderName)continue;
+                        _nearFade.Add(new NearFadeMask{Renderer=renderer,Bounds=renderer.bounds,Stationary=renderer.gameObject.isStatic,
+                            Submesh=i,Start=material.GetFloat("_NearFadeStart"),End=material.GetFloat("_NearFadeEnd")});
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// § WHY THE WIRES CAME OUT AS DASHES, AND WHY NO AMOUNT OF TUNING FIXES IT.
+        ///
+        /// ⚠️⚠️ IT IS RASTERISATION, NOT THE EDGE TEST. This pass finds edges by comparing the
+        /// depth of neighbouring pixels in `_CameraDepthNormalsTexture`, and that buffer is filled
+        /// by rendering the scene once through a replacement shader. Rasterisation is BINARY per
+        /// pixel: a triangle writes to a pixel only when it covers that pixel's centre. An
+        /// overhead wire is a few centimetres thick and tens of metres away, so it is far thinner
+        /// than one pixel, and it covers some pixel centres while missing the ones between them.
+        ///
+        /// So the wire does not exist as a line in the depth buffer at all. It exists as a
+        /// scattering of pixels. The edge detector then does its job perfectly and finds edges
+        /// exactly where the wire landed, which is the choppy dotted look. The outline is
+        /// reporting the depth buffer honestly; the depth buffer is what lost the wire.
+        ///
+        /// ⚠️ AND THAT IS WHY SUPERSAMPLING DID NOT RESCUE IT. Evaluating the edge term at
+        /// sub-pixel positions re-reads the SAME texels in different combinations. A wire absent
+        /// from a pixel is absent from every sub-sample of that pixel. It softens the ends of each
+        /// dash and shortens the gaps; it cannot draw a line through data that was never captured.
+        /// The only real cure is rendering the depth prepass at higher resolution, which means a
+        /// second full rasterisation of roughly 450 renderers on a dressed street, and the whole
+        /// argument for this feature over the 2026-07-29 revert is that it does not do that.
+        ///
+        /// ⚠️⚠️ SO THE THIN THINGS ARE EXCLUDED INSTEAD, AND EXCLUSION IS THE HONEST ANSWER RATHER
+        /// THAN A WORKAROUND. A wire's ink was never going to be a clean line at this resolution.
+        /// Drawing nothing is better than drawing a dotted approximation of one, because the dots
+        /// read as a rendering fault and the absence reads as a choice. The poles the wires hang
+        /// from are thick and keep their outline, so the structure still reads.
+        ///
+        /// ⚠️ MEASURED ON THE SMALLEST BOUNDING AXIS, IN WORLD UNITS, NOT BY NAME. A name list
+        /// would need editing every time a map gained a cable, a washing line or an aerial, and
+        /// would be wrong on the other arena the day it shipped. "Thinner than
+        /// <see cref="ThinMetres"/> on its narrowest axis" is a property of the geometry, so it
+        /// classifies anything a future map adds without being told about it.
+        /// </summary>
+        private static bool IsTooThinToOutline(Renderer renderer)
+        {
+            var size = renderer.bounds.size;
+
+            // ⚠️ THE SMALLEST AXIS, AND ONLY THE SMALLEST. A wire is long and tall and hair-thin;
+            // testing the largest axis or the volume would call it big. What decides whether the
+            // rasteriser can hold on to it is its NARROWEST cross-section.
+            float thinnest = Mathf.Min(size.x, Mathf.Min(size.y, size.z));
+
+            return thinnest > 0.0f && thinnest < ThinMetres;
+        }
+
+        private const string KantoFoliageShaderName = "TumbangPreso/KantoFoliage";
+
+        /// <summary>`Shader.name` builds a new string on every read, and the rescan asks it for each material once a
+        /// second, so the answer is kept per shader (owner, 2026-10-29: "optimizing the game"). Same names, no garbage.</summary>
+        private static readonly Dictionary<Shader, string> ShaderNames = new Dictionary<Shader, string>();
+        private static string ShaderNamed(Shader shader)
+        {
+            if (!ShaderNames.TryGetValue(shader, out string name)) ShaderNames[shader] = name = shader.name;
+            return name;
+        }
+
+        private static bool IsToonSurface(Renderer renderer)
+        {
+            var materials = renderer.sharedMaterials;
+            if (materials == null) return false;
+
+            foreach (var material in materials)
+            {
+                if (material == null || material.shader == null) continue;
+                string shaderName = ShaderNamed(material.shader);
+                if (shaderName == ToonShaderName) return true;
+                // ⚠️ KANTO'S LEAF CARDS TOO (owner, 2026-09-27: "tree leaves look off in-game",
+                // twice). A canopy is thousands of tiny card-to-card creases in the depth-normals
+                // texture, so the bright look's crease shade, sun-caught bevel and the AO painted
+                // dark blotches and yellow rims all over it. Masked like the cast: foliage keeps
+                // its own shading. Kanto's shader only, so the approved Lagoon Cove look is
+                // unchanged.
+                if (shaderName == KantoFoliageShaderName) return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// ⚠️ REFILLED IN OnPreRender AND ATTACHED ONCE, rather than added and removed per frame.
+        /// A `CommandBuffer` the camera holds a reference to can be cleared and rewritten in
+        /// place, and the add/remove pair is the half of this API that leaks: a component
+        /// disabled between the two leaves a buffer executing against a dead material for the
+        /// life of the camera.
+        ///
+        /// ⚠️ AT `BeforeImageEffectsOpaque`, WHICH IS BOTH LATE ENOUGH AND PATH-AGNOSTIC. The
+        /// depth-normals prepass has run by then, so `_CameraDepthNormalsTexture` is bound for
+        /// the mask pass's own occlusion test, and the event exists in forward and deferred
+        /// alike. `AfterForwardOpaque` would have quietly stopped firing if any camera in this
+        /// game were ever switched to deferred.
+        /// </summary>
+        private void OnPreRender()
+        {
+            NearFadeMaskDraws=0;
+            // ⚠️⚠️ THE DEPTH-NORMALS REQUEST IS REPEATED HERE BECAUSE `LateUpdate` DOES NOT RUN IN
+            // EDIT MODE, AND WITHOUT THIS THE WHOLE PASS IS A SILENT NO-OP IN EVERY PROBE. Unity
+            // does not tick `Update`/`LateUpdate` on a component outside play mode, but it DOES
+            // call `OnPreRender` and `OnRenderImage` for `Camera.Render()`. So an edit-mode
+            // capture reached the compositing code with `_CameraDepthNormalsTexture` never
+            // requested and therefore never generated: the edge test sampled an empty texture,
+            // found no edges, and blitted the frame through unchanged.
+            //
+            // ⚠️ MEASURED, NOT REASONED. `WorldOutlineProbe` rendered the same angle with the
+            // prototype off and on and the two PNGs came back visually identical, differing by
+            // about 30 bytes of compression noise. That is what sent me here. Requesting it from
+            // the callback that actually runs makes the pass work in a probe as well as in play,
+            // which is the difference between a feature that can be judged and one that cannot.
+            //
+            // `LateUpdate` is kept: it is what CLEARS the request when the prototype is switched
+            // off at runtime, and clearing on the render callback would fight the frame it is
+            // drawing.
+            RequestDepthNormals(Live);
+            PrepareInkFromDepth(Live && InkFromDepth && EnsureMaterials());
+
+            if (!Live || (_exclusion == Exclusion.Overlap && !HasWorldContact))
+            {
+                DetachBuffer();
+                return;
+            }
+
+            if (!EnsureMaterials())
+            {
+                DetachBuffer();
+                return;
+            }
+
+            if (Time.unscaledTime >= _nextScan && (!BenchNoRescan || _nextScan == 0f))
+            {
+                _nextScan = Time.unscaledTime + Mathf.Max(0.1f, _rescanSeconds);
+                Rescan();
+            }
+
+            EnsureMaskTexture();
+
+            if (_maskBuffer == null)
+                _maskBuffer = new CommandBuffer { name = "World Outline Exclusion Mask" };
+
+            _maskBuffer.Clear();
+            _maskBuffer.SetRenderTarget(_mask);
+            _maskBuffer.ClearRenderTarget(false, true, Color.black);
+
+            // ⚠️ THE TOLERANCE IS A SHARE OF THE FAR PLANE: 0.0008 is 19 cm at 240 m but 3 m at Payo's 3700 m, so a vine up to
+            // 3 m BEHIND a platform passed as visible and cut its shape out of the platform's AO (owner, 2026-10-19: "the AO
+            // of the vines across the basin are visible through the platforms"). Past the fine-depth far plane it is held
+            // to `MaskToleranceMetres`; every other map keeps exactly its old value.
+            float tolerance = BenchMaskTolerance >= 0f ? BenchMaskTolerance : _maskDepthTolerance;
+            if (FineDepth) tolerance = Mathf.Min(tolerance, MaskToleranceMetres / _camera.farClipPlane);
+            _maskMaterial.SetFloat(MaskToleranceId, tolerance);
+            _maskBuffer.SetGlobalVector(NearFadeMaskId,Vector4.zero);NearFadeMaskDraws=0;
+            _maskBuffer.SetGlobalFloat(MaskLiveId,0);
+            DrawLiveAOProps();
+
+            foreach (var renderer in _excluded)
+            {
+                if (BenchNoExcluded) break;
+                if (renderer == null || !renderer.enabled || !renderer.gameObject.activeInHierarchy)
+                    continue;
+
+                // ⚠️⚠️ A RENDERER THAT IS NOT DRAWN TO THE SCREEN MUST NOT MASK THE SCREEN, AND
+                // SKIPPING THIS IS WHY THE OUTLINE APPEARED INSIDE A HEAD-SHAPED WINDOW.
+                // 🧑 2026-08-28: *"the edges of the outline shader clip to a character head shape
+                // (ours)"*.
+                //
+                // `CameraRig.ApplyFppSelfHide` hides the player's own body in first person by
+                // setting `ShadowCastingMode.ShadowsOnly` rather than by disabling the renderer,
+                // deliberately, so the player keeps their own ground shadow. `enabled` therefore
+                // stays TRUE on every part of the body the camera is sitting inside.
+                //
+                // `CommandBuffer.DrawRenderer` does not consult `shadowCastingMode`. It draws what
+                // it is told to draw. So the local player's head, which is invisible in the colour
+                // pass and roughly a metre from the near plane, was being painted into the
+                // exclusion mask at enormous screen size. Everything under it lost its outline, and
+                // the boundary of the surviving region was the silhouette of that head.
+                //
+                // ⚠️ THE TEST IS "IS IT DRAWN", NOT "IS IT MINE". Keying on the bound character
+                // would miss a body hidden by anything else and would need this pass to know about
+                // seats. Shadows-only already means "present for lighting, absent from the frame",
+                // and a surface absent from the frame has nothing to exclude.
+                if (renderer.shadowCastingMode == ShadowCastingMode.ShadowsOnly) continue;
+
+                var materials = renderer.sharedMaterials;
+                int submeshes = materials == null || materials.Length == 0 ? 1 : materials.Length;
+
+                for (int i = 0; i < submeshes; i++)
+                    _maskBuffer.DrawRenderer(renderer, _maskMaterial, i, MaskPass);
+            }
+
+            // ⚠️ PUT THE CAMERA'S TARGET BACK. A command buffer leaves whatever it last bound
+            // bound, and this one binds a one-channel mask texture. Everything the camera draws
+            // after this event, the image effect chain included, would land in it. This is the
+            // single most common way a `CameraEvent` buffer breaks a frame.
+            //
+            // ⚠️⚠️ `CurrentActive`, NOT `CameraTarget`, AND GETTING THIS WRONG CLIPS THE OUTLINE TO
+            // A SUB-RECTANGLE OF THE SCREEN. 🧑 2026-08-28: *"the outline doesnt work for the whole
+            // screen theres something clipping it"*.
+            //
+            // A camera carrying ANY `OnRenderImage` does not draw into `CameraTarget`. It draws
+            // into an engine-allocated intermediate, and `ColourGrade` guarantees there is always
+            // one here. `CameraTarget` names the FINAL destination, the backbuffer or the camera's
+            // `targetTexture`. Binding it at `BeforeImageEffectsOpaque` therefore does not restore
+            // anything: it switches rendering away from the intermediate the frame is being built
+            // in, and it resets the VIEWPORT to the final target's dimensions. Whenever those two
+            // differ, and they differ whenever the game view is scaled or the intermediate is
+            // allocated at a different size for HDR or MSAA, everything drawn afterwards lands
+            // inside a rectangle the wrong size. The outline is what draws afterwards.
+            //
+            // `CurrentActive` means "whatever was bound before this buffer ran", which is the
+            // intermediate, at its own size, which is the actual restore this line was written to
+            // perform.
+            // Only nearby occluders need this extra mask. Static map bounds and
+            // material/submesh bindings are cached by the normal rescan; distant
+            // city geometry neither loses its ink nor adds a draw every frame.
+            Vector3 eye=_camera.transform.position;
+            // While a cutscene has the sky opened through the map (`NearFade.SkyRevealId`), a wall at any distance may be
+            // dissolved, so every near-fade renderer is masked for those seconds, not only the ones at the lens.
+            bool skyOpen=Shader.GetGlobalVector(NearFade.SkyRevealId).w>.01f;
+            if(FadeOccluderOutlines)foreach(var item in _nearFade)
+            {
+                var renderer=item.Renderer;if(renderer==null)continue;
+                var bounds=item.Stationary?item.Bounds:renderer.bounds;
+                if(!skyOpen&&bounds.SqrDistance(eye)>item.Start*item.Start)continue;
+                if(!renderer.enabled||!renderer.gameObject.activeInHierarchy||renderer.forceRenderingOff||
+                    renderer.shadowCastingMode==ShadowCastingMode.ShadowsOnly)continue;
+                _maskBuffer.SetGlobalVector(NearFadeMaskId,new Vector4(item.Start,item.End,1,0));
+                _maskBuffer.DrawRenderer(renderer,_maskMaterial,item.Submesh,MaskPass);NearFadeMaskDraws++;
+            }
+            _maskBuffer.SetGlobalVector(NearFadeMaskId,Vector4.zero);
+
+            _maskBuffer.SetRenderTarget(BuiltinRenderTextureType.CurrentActive);
+
+            if (!_bufferAttached)
+            {
+                _camera.AddCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, _maskBuffer);
+                _bufferAttached = true;
+            }
+        }
+
+        private void DetachBuffer()
+        {
+            if (!_bufferAttached || _camera == null || _maskBuffer == null) return;
+
+            _camera.RemoveCommandBuffer(CameraEvent.BeforeImageEffectsOpaque, _maskBuffer);
+            _bufferAttached = false;
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE MASK STAYS AT CAMERA RESOLUTION, AND THAT IS A DECISION THE SUPERSAMPLING HAD
+        /// TO MAKE RATHER THAN A LINE NOBODY REVISITED.
+        ///
+        /// The obvious way to supersample this pass is to blit the composite into a 2x target and
+        /// downsample. That way is a trap, and this is where it springs: the mask is sized from
+        /// `_camera.pixelWidth/pixelHeight`, so a 2x composite would be reading a 1x mask, and the
+        /// exclusion would slide by half a pixel across the frame. The fix would then be to
+        /// allocate the mask at 2x as well, at four times the memory and four times the clear
+        /// every frame.
+        ///
+        /// ⚠️ SUB-SAMPLING INSIDE THE FRAGMENT AVOIDS THE QUESTION ENTIRELY. Nothing changed
+        /// resolution, so nothing can misalign: the edge taps and the mask taps are read in the
+        /// same normalised UV space, off targets of the same size, through the same
+        /// `UNITY_UV_STARTS_AT_TOP` flip, exactly as they were before.
+        ///
+        /// ⚠️ THE ONE THING THAT DID HAVE TO FOLLOW IS THE DILATION RADIUS, and it is in the
+        /// shader rather than here. The mask is max-sampled at the tap radius to cover the hull's
+        /// ink band, and the supersampled kernel reaches a further `centre/N` of a texel, a quarter
+        /// of a pixel at the default of 2. The shader adds that to the radius. Without it a ring
+        /// that thin around every character would have been outside the mask's reach and inside
+        /// the edge term's, which would have put back the faint second hairline the dilation exists
+        /// to remove, and only at supersample > 1.
+        ///
+        /// ⚠️ RAISING IT IS ALSO WORTH LESS THAN IT LOOKS, which is the other half of why it did
+        /// not happen. The mask is dilated with `max`, so its boundary is hardened again by the
+        /// dilation whatever resolution it was drawn at, and that boundary sits roughly one tap
+        /// radius outside the character, underneath the ink the hull has already drawn there.
+        /// </summary>
+        /// <summary>
+        /// Paints the visible <see cref="LiveAOProps"/> into the mask's G channel (owner, 2026-10-30: "no ao on the creases of
+        /// the statue face"; see the list's note). Only while a map's occlusion is baked, and only a renderer some camera
+        /// draws this frame (`isVisible`), so a plaza out of view costs no draw and pass 2 finds no pixel to work on.
+        /// </summary>
+        private void DrawLiveAOProps()
+        {
+            LiveAOPropDraws = 0;
+            if (!BakedWorldAO || LiveAOProps.Count + LiveAOPropsByVertex.Count == 0) return;
+            // 1: the whole renderer; 2: only its vertices flagged in UV3.x (a merged chunk; see the mask pass).
+            for (int mode = 1; mode <= 2; mode++)
+            {
+                _maskBuffer.SetGlobalFloat(MaskLiveId, mode);
+                foreach (var renderer in mode == 1 ? LiveAOProps : LiveAOPropsByVertex)
+                {
+                    if (renderer == null || !renderer.enabled || !renderer.isVisible || !renderer.gameObject.activeInHierarchy) continue;
+                    if (renderer.shadowCastingMode == ShadowCastingMode.ShadowsOnly) continue;
+                    var materials = renderer.sharedMaterials;
+                    int submeshes = materials == null || materials.Length == 0 ? 1 : materials.Length;
+                    for (int i = 0; i < submeshes; i++) _maskBuffer.DrawRenderer(renderer, _maskMaterial, i, MaskPass);
+                    LiveAOPropDraws++;
+                }
+            }
+            _maskBuffer.SetGlobalFloat(MaskLiveId, 0);
+        }
+
+        private void EnsureMaskTexture()
+        {
+            int width = Mathf.Max(1, _camera.pixelWidth);
+            int height = Mathf.Max(1, _camera.pixelHeight);
+            // A baked map's mask needs a second channel (G, the live-AO props); every other map keeps its one-channel R8.
+            bool two = BakedWorldAO && LiveAOProps.Count + LiveAOPropsByVertex.Count > 0;
+            var wanted = !two
+                ? (SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.R8) ? RenderTextureFormat.R8 : RenderTextureFormat.ARGB32)
+                : (SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.RG16) ? RenderTextureFormat.RG16 : RenderTextureFormat.ARGB32);
+
+            if (_mask != null && _mask.width == width && _mask.height == height && _mask.format == wanted) return;
+
+            if (_mask != null)
+            {
+                _mask.Release();
+                DestroyImmediate(_mask);
+            }
+
+            // ⚠️ ONE CHANNEL, NO DEPTH BUFFER, NO MSAA. The mask carries a single 0-or-1 coverage
+            // value, the occlusion test happens in the fragment against the prepass rather than
+            // against an attached depth buffer (see the shader), and a multisampled mask would
+            // have to agree with the camera's own sample count, which is somebody else's setting.
+            var format = wanted;
+
+            // ⚠️ This is coverage data, not color. Requesting the default sRGB R8
+            // format caused a fallback to four channels on this Windows GPU and
+            // logged a warning on every allocation. Linear R8 is the supported
+            // one-channel format the coverage shader expects.
+            _mask = new RenderTexture(width, height, 0, format, RenderTextureReadWrite.Linear)
+            {
+                name = "WorldOutlineMask",
+                filterMode = FilterMode.Bilinear,
+                antiAliasing = 1,
+                hideFlags = HideFlags.HideAndDontSave,
+            };
+
+            _mask.Create();
+        }
+
+        private bool EnsureMaterials()
+        {
+            if (_material != null && _maskMaterial != null) return true;
+
+            // ⚠️ THE SHADER IS NOT IN `GameBuilder.EnsureRuntimeShaders` AND THAT IS DELIBERATE.
+            // Everything reached only by `Shader.Find` is stripped from a player build, which is
+            // the rule that file exists to enforce, and adding this one would ship a prototype's
+            // shader variants into every build of a feature that is switched off. So the miss
+            // path here names the fix instead of merely warning: if this outline is ever wanted
+            // in a BUILD rather than in the editor, add "TumbangPreso/WorldOutline" to the
+            // `wanted` array in `Assets/TumbangPreso/Editor/GameBuilder.cs`.
+            var shader = Shader.Find("TumbangPreso/WorldOutline");
+
+            if (shader == null)
+            {
+                Debug.LogError(
+                    "[WorldOutline] TumbangPreso/WorldOutline was not found. In a player build " +
+                    "that means it was stripped: a shader only Shader.Find reaches is dropped " +
+                    "unless it is listed in GameBuilder.EnsureRuntimeShaders. The prototype is " +
+                    "off for this camera.");
+
+                _missing = true;
+                RequestDepthNormals(false);
+                return false;
+            }
+
+            if (_material == null)
+                _material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+
+            // ⚠️ A SECOND MATERIAL INSTANCE ON THE SAME SHADER. The two passes are written into
+            // one shader file so there is only one thing to find and one thing to strip, but they
+            // are used at different points in the frame: the mask is drawn per renderer during
+            // camera rendering and the composite is blitted afterwards. Two instances means
+            // neither pass has to reason about what the other left set on the shared uniforms,
+            // which is the sort of coupling that shows up as the mask flickering on alternate
+            // frames rather than as an error anybody can search for.
+            if (_maskMaterial == null)
+                _maskMaterial = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
+
+            return true;
+        }
+
+        /// <summary>
+        /// § WHY THIS RUNS BEFORE <see cref="ColourGrade"/>, AND HOW THAT ORDER IS GUARANTEED.
+        ///
+        /// ⚠️⚠️ THE INK HAS TO GO THROUGH THE SAME GRADE THE HULL'S INK GOES THROUGH, OR THE TWO
+        /// BORDERS IN ONE FRAME ARE TWO DIFFERENT COLOURS. This is not a matter of taste and it
+        /// is not close.
+        ///
+        /// The hull border is geometry: `Toon.shader`'s OUTLINE pass writes `_OutlineColor` into
+        /// the frame like any other surface, so `ColourGrade` tonemaps and grades it along with
+        /// everything else. Eskinita runs exposure 0.92, contrast 1.03 and saturation 1.18, and
+        /// the ACES curve is steepest exactly where a near-black navy sits. Run this pass AFTER
+        /// the grade and the world's ink is the raw swatch while the cast's ink is the graded
+        /// one, in the same picture, on adjacent pixels. Run it BEFORE and the two are the same
+        /// number going into the same curve, so they are the same number coming out. Exactly,
+        /// not approximately.
+        ///
+        /// ⚠️ AND `SkyEvent` MAKES IT MOVE. `ColourGrade.SetEventGrade` multiplies brightness
+        /// down as far as 0.15 for the length of an event. The cast's border darkens with the
+        /// world during one whether anybody planned it or not, so a world border that did not
+        /// would separate from it for those five seconds and then rejoin.
+        ///
+        /// ⚠️ THE EDGE DETECTION ITSELF DOES NOT CARE, which is what makes the choice clean. The
+        /// Roberts cross reads depth and normals, never colour, so no grade can shift where a
+        /// line lands. Only the ink's final colour is at stake, and that argument runs one way.
+        ///
+        /// ⚠️⚠️ THE ORDER IS ENFORCED BY `[ImageEffectOpaque]`, NOT BY COMPONENT ORDER, AND THAT
+        /// IS THE LOAD-BEARING PART. Unity runs image effects on one camera in COMPONENT ORDER,
+        /// and `ColourGrade` is added from code in three different places at three different
+        /// times (`CameraRig.Awake`, `SpectatorCamera`, `MapPreviewSurface`), so which of the two
+        /// components ends up first on a given camera is an accident of who called AddComponent
+        /// first. `[ImageEffectOpaque]` takes it out of the question: an opaque-tagged effect
+        /// runs after opaque geometry and before transparents, which is unconditionally before
+        /// every untagged effect on the same camera.
+        ///
+        /// ⚠️ AND THAT SLOT IS INDEPENDENTLY THE RIGHT ONE. The depth-normals prepass only
+        /// contains opaque geometry, so an edge detector has nothing to gain by waiting for the
+        /// transparents, and quite a lot to lose: running after them would ink a hard line across
+        /// smoke and impact bursts using the depth of whatever is behind them. Compositing before
+        /// them means the VFX draw over the ink, which is what they already do over the hull.
+        /// </summary>
+        [ImageEffectOpaque]
+        private void OnRenderImage(RenderTexture source, RenderTexture destination)
+        {
+            // ⚠️ SWITCHED OFF STILL COSTS ONE PASS-THROUGH BLIT, exactly as an identity
+            // `ColourGrade` does and for the same reason: a camera carrying an `OnRenderImage`
+            // component renders to an intermediate target whether the effect does anything or
+            // not. So the way to pay nothing for this prototype is to REMOVE the component from
+            // the camera, not to leave it on the camera with the toggle off. Nothing in the game
+            // adds it, so no camera pays this unless somebody put it there.
+            if (!Live || !EnsureMaterials())
+            {
+                Graphics.Blit(source, destination);
+                return;
+            }
+
+            _material.SetColor(OutlineColorId, _colour);
+            _material.SetFloat(OpacityId, InkLive?_opacity:0);
+            _material.SetFloat(ThicknessId, _thickness);
+            _material.SetFloat(DepthSensitivityId, _depthSensitivity);
+            _material.SetFloat(DepthBiasId, _depthBias);
+            _material.SetFloat(NormalSensitivityId, _normalSensitivity);
+            _material.SetFloat(NormalBiasId, _normalBias);
+            // Keep silhouette depth edges. Only normal creases which shrink below
+            // useful detail in the distant city fade; zoomed/orthographic previews
+            // retain their detail instead of inheriting a fixed distance penalty.
+            _material.SetVector(NormalDetailFadeId,new Vector4(30,80,FadeDistantNormalDetail?1:0,_camera.orthographic?0:1));
+
+            // ⚠️ WRITTEN AS A FLOAT, AND THE SHADER ROUNDS IT BACK. A float uniform is the one
+            // kind every graphics API in this project's build set agrees about without a
+            // deprecation or a per-backend caveat, and the value is only ever 1, 2 or 3. The
+            // clamp is repeated here rather than trusted from the `[Range]` attribute, because
+            // the attribute constrains the inspector and does not constrain a value that arrives
+            // from an older serialised scene or from code.
+            // The Low tier takes one edge sample a pixel (8 taps rather than 20 at the default 2x2; owner, 2026-10-29).
+            _material.SetFloat(SupersampleId, Settings.GraphicsProfiles.Current == 0 ? MinSupersample
+                               : Mathf.Clamp(_supersample, MinSupersample, MaxSupersample));
+
+            ApplyFade();
+            ApplyViewRay();
+
+            bool maskReady=_mask!=null && _bufferAttached;
+            bool masked=_exclusion!=Exclusion.Overlap && maskReady;
+            _material.SetTexture(MaskId,maskReady?(Texture)_mask:Texture2D.blackTexture);
+            _material.SetFloat(MaskStrengthId,masked?_maskStrength:0);
+            float contact=HasWorldContact?WorldLookProfile.Current.EnvironmentContact*WorldCueProfile.LightingWeight:0;
+            _material.SetVector("_WorldGroundContact",new Vector4(WorldLookPresentation.Current!=null?WorldLookPresentation.Current.Floor:0,0,contact,.5f));
+            _material.SetFloat("_WorldContactMask",maskReady?1:0);
+            _material.SetMatrix("_WorldContactToWorld",_camera.cameraToWorldMatrix);
+            _material.SetVector("_WorldContactProjection",new Vector4(_camera.farClipPlane,_camera.orthographic?1:0,_camera.orthographicSize,_camera.aspect));
+            ApplyBrightLookEdges();
+            bool lagoonDeck=WorldLookPresentation.HandlesCamera(_camera) && WorldLookPresentation.Current.Look.Map==UI.SceneFlow.Lagoon;
+            _material.SetFloat("_LagoonDeckDetail",lagoonDeck?WorldCueProfile.Current.LagoonDeckDetail:0);
+            // The player's own setting (`GameSettings.CharacterShading`, Full by default); F8 in a debug session tests over it.
+            float castShare=CharacterAoTest>=0?CharacterAoTest:Settings.GameSettings.CharacterShadingShare(Settings.SettingsStore.Current.CharacterShading);
+            _material.SetFloat("_CharacterAO",castShare);
+            // The cast's own kernel (pass 2, CastAO): on only with a share, at a body's scale.
+            float castRadius=CharacterAoRadiusTest>0?CharacterAoRadiusTest:WorldLookProfile.Current.CharacterAmbientOcclusionRadius;
+            // The bias follows the radius down, or a tight kernel sits wholly inside its own bias.
+            float castBias=Mathf.Min(.02f,castRadius*.1f);   // was .006 / .02: a smooth slope shaded itself in stripes (owner, 2026-10-05: "weird lining effect too from the ao")
+            _material.SetVector("_CharacterAOParams",new Vector4(castShare,castRadius,castBias,0));
+            RenderTexture occlusion=null,occlusionBlur=null;
+            float aoStrength=AmbientOcclusionLive?WorldLookProfile.Current.AmbientOcclusion*WorldLookPresentation.Current.Weight:0;
+            // A map with its world occlusion baked (Payo) still runs this pass, but only UNDER THE MASK (owner, 2026-10-30:
+            // "turn it on by default, keep character crease ao", then of the statues "no ao on the creases of the statue
+            // face"): the cast's creases where R covers the cast, the world kernel where G covers a live-AO prop, and every
+            // other pixel returns clean at its first read. The strength stays the look's, so the composite applies both
+            // exactly as it does on a live map. ⚠️ It was 0 here before, and the composite's gate (strength above 0)
+            // then dropped the cast's creases it had just drawn.
+            bool underMask=BakedWorldAO && aoStrength>0;
+            _material.SetFloat(WorldAOMaskedId,underMask?1:0);
+            if(underMask && (!maskReady || (castShare<=0 && LiveAOPropDraws==0)))aoStrength=0;   // no mask, or nothing under it to work on
+            if(aoStrength>0)
+            {
+                // ⚠️ FULL RESOLUTION. It was half, on the reasoning that occlusion is soft; the
+                // owner then saw its noise, and at half resolution the 4x4 rotation tile the blur
+                // cancels spans 8x8 screen pixels, big enough to read as a grid wherever the
+                // cancellation is imperfect. Full resolution also keeps the crease ramps crisp,
+                // which is what Minecraft's corners look like.
+                int w=Mathf.Max(1,source.width),h=Mathf.Max(1,source.height);
+                var format=SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.R8)?RenderTextureFormat.R8:RenderTextureFormat.ARGB32;
+                // Two channels when the cast has a share: R the world's occlusion, G the cast's.
+                if(castShare>0)format=SystemInfo.SupportsRenderTextureFormat(RenderTextureFormat.RG16)?RenderTextureFormat.RG16:RenderTextureFormat.ARGB32;
+                occlusion=RenderTexture.GetTemporary(w,h,0,format,RenderTextureReadWrite.Linear);
+                occlusionBlur=RenderTexture.GetTemporary(w,h,0,format,RenderTextureReadWrite.Linear);
+                _material.SetVector(WorldAOParamsId,new Vector4(aoStrength,WorldLookProfile.Current.AmbientOcclusionRadius,.03f,NearGuard()));
+                // Eight probes below the top tier, sixteen on it (see `AmbientOcclusionLiteKeyword`).
+                if(AmbientOcclusionLite)_material.EnableKeyword(AmbientOcclusionLiteKeyword);else _material.DisableKeyword(AmbientOcclusionLiteKeyword);
+                if(FineDepth)_material.EnableKeyword(FineDepthKeyword);else _material.DisableKeyword(FineDepthKeyword);
+                _material.SetFloat("_FineDepthView",FineDepthView);
+                Graphics.Blit(source,occlusion,_material,AmbientOcclusionPass);
+                Graphics.Blit(occlusion,occlusionBlur,_material,AmbientOcclusionBlurPass);
+                _material.SetTexture(WorldAOId,occlusionBlur);
+            }
+            else
+            {
+                // w still carries the near-fade guard: the ground occlusion reads it with AO off.
+                _material.SetVector(WorldAOParamsId,new Vector4(0,0,0,NearGuard()));
+                _material.SetTexture(WorldAOId,Texture2D.whiteTexture);
+            }
+            _material.SetTexture(MainTexId, source);
+            // The composite's edge term reads the same refined depth as the occlusion (see `FineDepthFar`).
+            if(FineDepth)_material.EnableKeyword(FineDepthKeyword);else _material.DisableKeyword(FineDepthKeyword);
+            _material.SetVector("_WorldContactProjectionFar",new Vector4(_camera.farClipPlane,0,0,0));
+            // Payo's aerial haze reads the world from the same depth (`Map.PayoHaze`; nothing elsewhere).
+            if(FineDepth){_material.SetMatrix("_HazeToWorld",_camera.cameraToWorldMatrix);_material.SetMatrix("_HazeToView",_camera.worldToCameraMatrix);}
+
+            // ⚠️ THE PASS INDEX IS NOT OPTIONAL. `Graphics.Blit` without one runs EVERY pass in
+            // the SubShader, and pass 1 is the exclusion mask: blitted full-screen it writes
+            // white over the entire frame. See the note at the top of the shader.
+            Graphics.Blit(source, destination, _material, CompositePass);
+            if(occlusion!=null)RenderTexture.ReleaseTemporary(occlusion);
+            if(occlusionBlur!=null)RenderTexture.ReleaseTemporary(occlusionBlur);
+        }
+
+        /// <summary>
+        /// ⚠️ THE FADE DEFAULTS TO THE MAP'S OWN FOG RATHER THAN TO A CONSTANT HERE, for the same
+        /// reason `ColourGrade` reads its numbers off `MapGrade` rather than hard-coding
+        /// Eskinita's: the two arenas fog differently. Ilalim ng Tulay runs linear fog to 110 m
+        /// and Eskinita's starts at 14 m, so one baked pair of distances would be wrong on one of
+        /// them. A map with fog switched off falls back to the camera's far plane, which fades
+        /// nothing and is the honest answer to "this map has no haze to match".
+        /// </summary>
+        // ⚠️⚠️ § THE BRIGHT LOOK'S EDGES. Only a camera the map's world look owns trades the
+        // black ink for PEAK-style edges (see the shader's note of the same name), and it does so
+        // by the look's own weight, so WorldLighting 0 is the old ink exactly. A menu portrait
+        // that happens to carry this component keeps its ink. The map preview wears these edges
+        // since LIGHT-1.8, because its camera is tagged WorldLookCamera, and its sun is the
+        // preview's own through KeyLight rather than SkyEvent.RecordedSun, whose menu fallback is
+        // the first active directional light and can be the portrait's key.
+        private static readonly int PeakEdgeId = Shader.PropertyToID("_PeakEdge");
+        private static readonly int PeakSunViewId = Shader.PropertyToID("_PeakSunView");
+#if UNITY_EDITOR
+        // Native review only: reproduce the old ambiguous menu key in the same
+        // camera frame. This switch does not exist in a built player.
+        [System.NonSerialized] public bool LegacyKeyForReview;
+#endif
+        private static readonly int PeakShadeId = Shader.PropertyToID("_PeakShade");
+        private static readonly int PeakLightId = Shader.PropertyToID("_PeakLight");
+        private static readonly int PeakDepthId = Shader.PropertyToID("_PeakDepth");
+        private void ApplyBrightLookEdges()
+        {
+            var look=WorldLookPresentation.Current;
+            float weight=WorldLookPresentation.HandlesCamera(_camera)?look.Weight:0;
+            var profile=WorldLookProfile.Current;
+            _material.SetVector(PeakEdgeId,new Vector4(profile.SilhouetteShade,profile.EdgeHighlight,profile.CreaseShade,weight));
+            // The ground occlusion rides the contact term's gate: it needs the same rebuilt world
+            // position, so it is off wherever that is (the Low tier, a camera the look does not own).
+            _material.SetVector(PeakDepthId,new Vector4(profile.GroundOcclusion,Mathf.Max(.1f,profile.GroundOcclusionHeight),
+                look!=null?look.Floor:0,HasWorldContact?weight:0));
+            if(weight<=0)return;
+            var sun=look.KeyLight;
+#if UNITY_EDITOR
+            if(LegacyKeyForReview)sun=SkyEvent.RecordedSun;
+#endif
+            Vector3 toLight=sun!=null?-sun.transform.forward:Vector3.up;
+            _material.SetVector(PeakSunViewId,_camera.worldToCameraMatrix.MultiplyVector(toLight).normalized);
+            // ⚠️ A VECTOR OF THE AUTHORED NUMBERS, NOT A COLOUR: it is a multiplier on the pixel
+            // (violet cavity, 2026-09-25), and `SetColor` would convert it from sRGB first.
+            var cavity=profile.CavityHue;_material.SetVector(PeakShadeId,new Vector4(cavity.r,cavity.g,cavity.b,1));
+            _material.SetColor(PeakLightId,sun!=null?sun.color.linear:Color.white);
+        }
+
+        private void ApplyFade()
+        {
+            float start = _fadeStart;
+            float end = _fadeEnd;
+
+            if (start < 0.0f || end < 0.0f)
+            {
+                if (RenderSettings.fog && RenderSettings.fogMode == FogMode.Linear)
+                {
+                    start = RenderSettings.fogStartDistance;
+                    end = RenderSettings.fogEndDistance;
+                }
+                else
+                {
+                    start = _camera.farClipPlane;
+                    end = _camera.farClipPlane;
+                }
+            }
+
+            _material.SetFloat(FadeStartId, start);
+            _material.SetFloat(FadeEndId, Mathf.Max(end, start + 0.001f));
+        }
+
+        /// <summary>
+        /// The frustum half-extents at unit view depth, so the shader can rebuild the view ray
+        /// per pixel for its grazing-angle compensation.
+        ///
+        /// ⚠️ WRITTEN EVERY FRAME BECAUSE THE FIELD OF VIEW MOVES. `CameraRig.ApplyLens` swaps
+        /// between the first-person and third-person lens every frame based on the mode, and it
+        /// says in its own comment that it does so rather than on the transition. A cached ray
+        /// would be wrong for the whole of every emote.
+        /// </summary>
+        private void ApplyViewRay()
+        {
+            float halfHeight = Mathf.Tan(_camera.fieldOfView * 0.5f * Mathf.Deg2Rad);
+            float halfWidth = halfHeight * _camera.aspect;
+
+            _material.SetVector(ViewRayId, new Vector4(halfWidth, halfHeight, 0.0f, 0.0f));
+        }
+    }
+}

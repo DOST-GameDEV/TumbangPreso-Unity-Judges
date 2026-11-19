@@ -1,0 +1,2340 @@
+using System;
+using System.Collections.Generic;
+using TumbangPreso.Core;
+using TumbangPreso.InputLayer;
+using TumbangPreso.Settings;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI
+{
+    /// <summary>
+    /// Ported from `settings_panel.gd`, driving the converted `SettingsPanel.tscn`.
+    ///
+    /// ⚠️⚠️ THE EDIT IS STAGED AND BACK DISCARDS IT. Every setter in the Godot build writes
+    /// `settings.cfg` on its own, and `begin_edit()` is the only thing that stops it, so the
+    /// APPLY / RESET ALL / BACK row is not decoration: BACK is the only control on the screen
+    /// that can mean "no". A snapshot is taken when the panel opens and restored if the player
+    /// leaves without applying, which also has to put the LIVE state back — a rebind is already
+    /// in the input map and a volume is already on the bus.
+    ///
+    /// ⚠️ AND BACK ASKS FIRST, ONCE, ONLY WHEN THERE IS SOMETHING TO LOSE. The confirm is a
+    /// second press of the same button rather than a dialog, because this panel is instanced
+    /// into the title screen and has no popup layer of its own.
+    /// </summary>
+    public sealed partial class ConvertedSettingsPanel : ConvertedOverlay
+    {
+        private InputActionAsset _actions;
+        private readonly Dictionary<string, Button> _rebindButtons = new Dictionary<string, Button>();
+        private string _listening = "";
+        private RebindSession _rebindOp;
+
+        private string _snapshot;
+        private bool _backArmed;
+
+        private Button _apply;
+        private Button _back;
+
+        /// <summary>Width of a rebind row's action name, so every key button lines up.</summary>
+        private const float ActionLabelWidth = 260.0f;
+
+        /// <summary>⚠️ SHARED BY THE KEYCAPS AND THE NAME FIELD, so the two grids cannot
+        /// drift. It was reported once when they had.</summary>
+        private static readonly Vector2 BindingControlSize = new Vector2(170.0f, 46.0f);
+
+        private TumpSettingsView _nativeSettings;
+        private TumpControllerView _nativeController;
+        private TumpTouchLayoutView _nativeTouch;
+
+        private void Awake()
+        {
+            foreach (Transform child in transform) child.gameObject.SetActive(false);
+            var entrance = GetComponent<PennantEntrance>(); if (entrance != null) entrance.enabled = false;
+        }
+        private void OnEnable() { if (_nativeSettings != null) OpenNativeSettings(); }
+        protected override void Wire()
+        {
+            _nativeSettings = gameObject.AddComponent<TumpSettingsView>();
+            OpenNativeSettings();
+        }
+        private void OpenNativeSettings()
+        {
+            _nativeSettings.Open(transform, Close, () =>
+            {
+                if (_nativeController == null) _nativeController = gameObject.AddComponent<TumpControllerView>();
+                _nativeController.Open(transform, _nativeSettings.Session, _nativeSettings.Resume);
+            }, () =>
+            {
+                if (_nativeTouch == null) _nativeTouch = gameObject.AddComponent<TumpTouchLayoutView>();
+                _nativeTouch.Open(transform, _nativeSettings.Resume);
+            });
+        }
+
+        private void WireLegacyReference()
+        {
+            _actions = Resources.Load<InputActionAsset>("TumbangPreso");
+
+            // ⚠️ LOAD THE OVERRIDES BEFORE DRAWING A SINGLE LABEL, or every row shows the
+            // default and the player believes their rebind was forgotten.
+            Rebinding.Load(_actions);
+
+            _apply = FindButton("ApplyButton");
+            _back = FindButton("BackButton");
+
+            Snapshot();
+
+            BuildRebindRows();
+
+            // ⚠️ BUILT FIRST SO IT SITS FURTHEST FROM THE FULLSCREEN BOX, which is the bottom of
+            // the picker stack. Every row here inserts directly under that box, so build order is
+            // display order reversed (see the note below). This is not a display setting and must
+            // not read as one; it is the last row on the panel, under its own sentence.
+            BuildTelemetryRow();
+            BuildSlipperHighlightRow();
+            BuildReducedMotionRow();
+
+            // ⚠️ THE BUILD ORDER IS THE DISPLAY ORDER, REVERSED. All three picker rows insert
+            // themselves directly under `FullscreenCheck`, so the one built LAST ends up nearest
+            // the box and the first built ends up furthest from it. Top to bottom the screen
+            // therefore reads: fullscreen, render style, anti-aliasing, slipper highlight.
+            //
+            // Render style is nearest the box because it is the largest visual choice on the
+            // panel by a distance: it decides whether the game has ink outlines at all. Then
+            // anti-aliasing, which is also a display setting. The slipper highlight is an
+            // accessibility colour rather than a display mode and reads fine below both.
+            BuildAntiAliasRow();
+            BuildVSyncRow();
+            BuildRenderStyleRow();
+            BuildGraphicsQualityRow();
+            WireSliders();
+            WireChecks();
+            WireNameField();
+            ConfigureScroll();
+
+            // ⚠️ AFTER EVERY ROW EXISTS AND BEFORE THE PAPER DRESS. The strip owns nodes that
+            // the calls above create, so it cannot be built first; and it is four buttons that
+            // have to be skinned like every other control on the screen, so it cannot be built
+            // after `PaperDress.Screen` either. This is the one window.
+            MoveNameRowOutOfBindings();
+            BuildSectionTabs();
+
+            OnClick("ResetAllButton", ResetAll);
+            OnClick("ApplyButton", Apply);
+            OnClick("BackButton", Back);
+
+            SetText("SettingsStatusLabel", "");
+            RefreshApplyState();
+        
+            // ⚠️⚠️ ONE CALL DRESSES THIS WHOLE SCREEN IN PAPER, AND IT IS SCOPED TO THIS SUBTREE
+            // ON PURPOSE. `GodotPanel` and `GodotButton` are the choke points every converted
+            // screen is skinned through, so editing either of them would have repainted the main
+            // menu and the in-match HUD, which 🧑 scoped out twice. `PaperKit.PaperDress.Screen`
+            // walks a given root instead. See `docs/TODO.md` § 119.2 and § 119.5.
+            PaperDress.Screen(transform);
+
+            // ⚠️ AFTER THE DRESS, WHICH FLATTENS EVERY TAB ONTO ONE SURFACE. Same ordering the
+            // character maker records against its own slot tabs: the live-tab relief has to be
+            // written back on once the paper skin has been applied, or the page a player is
+            // looking at is the one tab that does not look selected.
+            RefreshDeviceTabs();
+
+            // ⚠️ AND THE ROWS ARE RE-READ FOR THE PAGE, because `BuildRebindRow` labels each
+            // keycap from `Rebinding.DisplayNameFor(asset, action)` as it builds it, which is
+            // binding 0, which is the keyboard. On a pad the panel would otherwise open on the
+            // GAMEPAD tab showing a list of keys.
+            RefreshBindingLabels();
+
+            // ⚠️ LAST, AND IT IS WHAT PUTS THE SCREEN INTO A KNOWN STATE. Until this runs every
+            // row of all four sections is active at once, which is the screen this pass exists
+            // to replace. It also writes `HintLabel` for the first time, so the sentence under
+            // the strip is the CONTROLS one rather than the authored keyboard-only string.
+            ShowTab(0);
+
+            FitFooterLabels();
+            BuildBrandSettings();
+        }
+
+        /// <summary>
+        /// Shrinks the three footer labels until they fit the plates they are drawn on.
+        ///
+        /// ⚠️⚠️ `APPLY CHANGES` DRAWS PAST BOTH ENDS OF ITS BUTTON, which is visible in
+        /// `Logs/shots-runtime/Settings-v57.png` and is the same silent overflow `CLAUDE.md`
+        /// § 6.2c's fourth question is about: `MenuKit.Label` is set to Overflow, so a label that
+        /// does not fit is not clipped and does not wrap, it simply draws outside its box. These
+        /// three are authored in the `.tscn` at one size for one string, and `RESET ALL` and
+        /// `◀ BACK` fit while the thirteen characters of the third one do not.
+        ///
+        /// ⚠️ THE CANVAS IS UPDATED FIRST, because `MenuKit.Fit` measures against a rect and a
+        /// rect that has not been laid out reports zero, at which point the call returns without
+        /// doing anything. That silent no-op is why fitting from a build method usually fails.
+        /// </summary>
+        private void FitFooterLabels()
+        {
+            Canvas.ForceUpdateCanvases();
+
+            foreach (string name in new[] { "ApplyButton", "ResetAllButton", "BackButton" })
+            {
+                var node = Node(name) as RectTransform;
+                if (node == null) continue;
+
+                var label = node.GetComponentInChildren<Text>(true);
+                if (label == null) continue;
+
+                MenuKit.Fit(label, node.rect.width - 28.0f);
+            }
+        }
+
+        /// <summary>
+        /// Everything that makes this list scrollable, and it is more than one line now.
+        ///
+        /// ⚠️⚠️ THE LIST IS TWICE THE HEIGHT OF ITS WINDOW AND NOTHING ON SCREEN SAID SO.
+        /// 🧑, 2026-08-26, twice: *"make it easier to scroll thru settings bcz its so hard to"*
+        /// and *"here its so weird to scroll in setttings here"*, with a screenshot of a row cut
+        /// in half at the bottom edge. Three separate things were wrong and only the first is
+        /// the one people reach for:
+        ///
+        ///  1. NO SCROLLBAR AT ALL. `ScrollRect.verticalScrollbar` was never assigned, so there
+        ///     was no handle to drag, no indication that there was more below, and no way to tell
+        ///     how much. A cut-off row is the only cue the panel gave, and a cut-off row reads as
+        ///     a layout bug rather than as an invitation.
+        ///  2. THE WHEEL WAS SET TO 45, which is about four rows a notch on a 46 px row. It was
+        ///     commented "fast, smooth, responsive" and it is the first two: one notch skips a
+        ///     whole group heading and its rows, which is exactly what "weird" describes. 24 is
+        ///     two rows.
+        ///  3. NO KEYBOARD. A settings screen with fifteen rebindable rows is one a player is
+        ///     already using the keyboard on.
+        ///
+        /// ⚠️ THE BAR IS BUILT IN CODE BECAUSE THE .tscn HAS NO NODE FOR ONE. `TscnUiImporter`
+        /// converts what Godot authored, and Godot's `ScrollContainer` draws its own bar from the
+        /// theme rather than from a child node, so there was nothing to import. It is drawn in
+        /// wood and amber (`docs/VISION.md` § 6) rather than in Unity's default grey.
+        /// </summary>
+        private void ConfigureScroll()
+        {
+            var scroll = GetComponentInChildren<ScrollRect>(true);
+            if (scroll == null) return;
+
+            _scroll = scroll;
+
+            scroll.scrollSensitivity = WheelStep;
+            scroll.movementType = ScrollRect.MovementType.Clamped;
+            scroll.horizontal = false;
+            scroll.vertical = true;
+
+            // ⚠️ INERTIA OFF. With it, a flick keeps sliding after the wheel stops and the row
+            // under the cursor is not the row that ends up there.
+            scroll.inertia = false;
+
+            scroll.verticalNormalizedPosition = 1.0f; // Reset to top showing MOVEMENT / WASD
+
+            if (scroll.viewport != null)
+            {
+                if (scroll.viewport.GetComponent<RectMask2D>() == null && scroll.viewport.GetComponent<Mask>() == null)
+                    scroll.viewport.gameObject.AddComponent<RectMask2D>();
+            }
+
+            EnsureWheelReachesTheList(scroll);
+            ScrollWheelRelay.Install(gameObject, scroll);
+
+            if (scroll.verticalScrollbar == null) BuildScrollbar(scroll);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE WHEEL, FOR THE FOURTH TIME, AND THIS IS THE CAUSE THE PREVIOUS THREE PASSES
+        /// MISSED. 🧑 2026-08-27: *"u can scroll by holding scroll and yes i want to keep that
+        /// feature but u cant scroll by using mouse scroll or laptop pad scroll ... repeated
+        /// complaint! it feels so clunky/doesnt work at all"*. § 15.8 added a scrollbar and
+        /// changed the wheel step, § 32.3 gave the slider rows a hit rectangle. Both were real
+        /// and neither is this.
+        ///
+        /// ⚠️⚠️ UNITY DELIVERS A WHEEL EVENT TO WHATEVER THE POINTER IS OVER, AND THEN WALKS UP
+        /// FROM IT. `StandaloneInputModule` takes `pointerCurrentRaycast.gameObject` and asks
+        /// `GetEventHandler&lt;IScrollHandler&gt;` for the nearest ancestor that handles a scroll.
+        /// **When the raycast hits nothing, there is no object to walk up from and the wheel is
+        /// simply discarded.** `TscnUiImporter`'s `ScrollContainer` case adds a `ScrollRect` and a
+        /// `RectMask2D` and NO GRAPHIC, and the content is a layout group with no graphic either,
+        /// so the only raycastable pixels in the whole list are the row widgets themselves.
+        ///
+        /// The gaps between rows, the padding down both edges and the strip beside the scrollbar
+        /// are all holes: the wheel works if the cursor happens to be over a key cap and does
+        /// nothing one pixel above it. That is not "broken", which is why it survived three
+        /// passes, and it is exactly what *"clunky"* describes.
+        ///
+        /// ⚠️ AN INVISIBLE FULL-RECT GRAPHIC AT THE BACK OF THE VIEWPORT IS THE FIX, and it is
+        /// the same idiom § 32.3 used on the slider rows for the same reason. Alpha 0 draws
+        /// nothing. `SetAsFirstSibling` keeps it behind the content, so it can never swallow a
+        /// click meant for a row.
+        /// </summary>
+        private static void EnsureWheelReachesTheList(ScrollRect scroll)
+        {
+            var viewport = scroll.viewport;
+            if (viewport == null) return;
+
+            var existing = viewport.GetComponent<Graphic>();
+            if (existing != null)
+            {
+                existing.raycastTarget = true;
+                return;
+            }
+
+            // ⚠️ ON A CHILD RATHER THAN ON THE VIEWPORT ITSELF. `RectMask2D` lives on the
+            // viewport here (the importer puts the mask on the scroll node, which is also the
+            // viewport), and a `Graphic` on the same object as the ScrollRect would also become
+            // the ScrollRect's own `targetGraphic` candidate for other tooling to trip over.
+            var backing = new GameObject("WheelCatcher", typeof(RectTransform), typeof(Image));
+            backing.transform.SetParent(viewport, false);
+            backing.transform.SetAsFirstSibling();
+
+            var rt = backing.GetComponent<RectTransform>();
+            rt.anchorMin = Vector2.zero;
+            rt.anchorMax = Vector2.one;
+            rt.offsetMin = Vector2.zero;
+            rt.offsetMax = Vector2.zero;
+
+            var image = backing.GetComponent<Image>();
+            image.color = new Color(0.0f, 0.0f, 0.0f, 0.0f);
+            image.raycastTarget = true;
+
+            // ⚠️ IT MUST NOT BE LAID OUT. The viewport is also the content's parent here, and a
+            // full-rect child inside a layout group would be given a row of its own.
+            var element = backing.AddComponent<LayoutElement>();
+            element.ignoreLayout = true;
+        }
+
+        /// <summary>Two rows of the list per wheel notch. A row is
+        /// <see cref="BindingControlSize"/>.y = 46 px.</summary>
+        private const float WheelStep = 24.0f;
+
+        /// <summary>How far one key press moves the list, in pixels.</summary>
+        private const float KeyStep = 92.0f;
+
+        private ScrollRect _scroll;
+
+        /// <summary>
+        /// A wood track with an amber handle, down the right-hand edge of the viewport.
+        ///
+        /// ⚠️ IT SHRINKS THE VIEWPORT BY ITS OWN WIDTH rather than floating over the rows. A
+        /// bar drawn on top of the list covers the right end of every key cap, which is the one
+        /// column on this screen a player is reading.
+        /// </summary>
+        private void BuildScrollbar(ScrollRect scroll)
+        {
+            var viewport = scroll.viewport;
+            if (viewport == null) return;
+
+            // ⚠️⚠️ WIDER ON A THUMB, AND IT IS A DRAG TARGET RATHER THAN A PRESS TARGET, WHICH IS
+            // WHY IT IS 44 AND NOT `TouchMetrics.MinTargetUnits`. 14 units is about 14 physical
+            // pixels on a 1080-tall phone, roughly a millimetre: nobody can catch that handle.
+            // 44 is the width `UiRows.ArrowWidth` already uses for a control a thumb has to hit
+            // and is about 3 mm of track. **The 144-unit floor is the smallest a PRESS may be**
+            // (`TouchMetrics.MinTargetUnits`), and a 144-wide bar would eat a fifth of the panel
+            // to say where you are; `InputSurfaceProbe` exempts scrollbars for that reason and
+            // says so where it does it. The list is dragged directly on a phone and the focus
+            // follow scrolls it on a pad, so this bar is the readout, not the mechanism.
+            float Width = TouchHud.ShouldShow ? 44.0f : 14.0f;
+
+            var barGo = new GameObject("VerticalScrollbar", typeof(RectTransform), typeof(Image));
+            barGo.transform.SetParent(scroll.transform, false);
+
+            var barRt = barGo.GetComponent<RectTransform>();
+            barRt.anchorMin = new Vector2(1.0f, 0.0f);
+            barRt.anchorMax = Vector2.one;
+            barRt.pivot = new Vector2(1.0f, 0.5f);
+            barRt.offsetMin = new Vector2(-Width, 0.0f);
+            barRt.offsetMax = Vector2.zero;
+
+            // ⚠️⚠️ THE BAR INVERTS WITH THE FIELD. It was a near-black track with an AMBER handle,
+            // which is correct on a wooden panel and is the pair `docs/TODO.md` § 119.10 records
+            // 🧑 rejecting by eye on three other controls: `UiTheme.Amber` `ffba00` on
+            // `UiTheme.Paper` `f4ecdd` is **1.7:1**, so on a cream panel the moving part of the
+            // scrollbar is the part that disappears. `Logs/shots-runtime/Settings-v57.png` shows
+            // it as a yellow smear down the edge of an otherwise cream sheet.
+            //
+            // **On paper the marker is the one DARK thing**: a `PaperSunk` groove with a `WoodMid`
+            // handle in it, which is about 8:1 and introduces no colour at all. Same move as the
+            // hub's XP bar and the picker's trait pips.
+            var track = barGo.GetComponent<Image>();
+            track.color = new Color(UiTheme.PaperSunk.r, UiTheme.PaperSunk.g,
+                                    UiTheme.PaperSunk.b, 0.85f);
+
+            var handleAreaGo = new GameObject("SlidingArea", typeof(RectTransform));
+            handleAreaGo.transform.SetParent(barGo.transform, false);
+            var areaRt = handleAreaGo.GetComponent<RectTransform>();
+            areaRt.anchorMin = Vector2.zero;
+            areaRt.anchorMax = Vector2.one;
+            areaRt.offsetMin = new Vector2(2.0f, 2.0f);
+            areaRt.offsetMax = new Vector2(-2.0f, -2.0f);
+
+            var handleGo = new GameObject("Handle", typeof(RectTransform), typeof(Image));
+            handleGo.transform.SetParent(handleAreaGo.transform, false);
+            var handleRt = handleGo.GetComponent<RectTransform>();
+            handleRt.offsetMin = Vector2.zero;
+            handleRt.offsetMax = Vector2.zero;
+            handleGo.GetComponent<Image>().color = UiTheme.WoodMid;
+
+            var bar = barGo.AddComponent<Scrollbar>();
+            bar.direction = Scrollbar.Direction.BottomToTop;
+            bar.handleRect = handleRt;
+            bar.targetGraphic = handleGo.GetComponent<Image>();
+
+            scroll.verticalScrollbar = bar;
+
+            // ⚠️⚠️ AUTO-HIDE, AND IT WAS `Permanent` UNTIL THE PANEL GOT TABS. The old note's
+            // reasoning was sound and is now false, which is why this is a correction rather than
+            // a reversal: it read *"the list is always longer than the window (fifteen rebind
+            // rows, four sliders and the name field against about eleven rows of glass), so
+            // auto-hide only ever costs the affordance that was missing in the first place."*
+            // **With one page that was true of every frame.** With four (§ 139), three of them
+            // are three or four rows tall, and `Logs/shots-runtime/Settings-v92-AUDIO.png` is a
+            // full-height wood track down the side of an almost empty page, offering to scroll
+            // something that ends well above it. `CLAUDE.md` § 6.2's INTUITIVE row from the other
+            // side: a control that looks operable and does nothing.
+            //
+            // ⚠️⚠️ AND `Permanent` IS WHY HIDING THE BAR BY HAND DID NOT WORK. `ScrollRect`
+            // re-asserts the bar's active state itself every frame under that setting, so a
+            // `SetActive(false)` from a tab switch was silently undone before the next draw. The
+            // engine owns this decision; the fix is to tell it the right thing rather than to
+            // fight it.
+            //
+            // ⚠️ PLAIN `AutoHide`, NOT `AutoHideAndExpandViewport`. That one asks the ScrollRect
+            // to drive the viewport rect, which fights the sizes `TscnUiImporter` authored; this
+            // one only shows and hides the bar, which is the whole of what is wanted.
+            scroll.verticalScrollbarVisibility = ScrollRect.ScrollbarVisibility.AutoHide;
+            scroll.verticalScrollbarSpacing = 0.0f;
+
+            // ⚠️⚠️ THE ROWS ARE PADDED AWAY FROM THE BAR RATHER THAN THE VIEWPORT BEING SHRUNK,
+            // AND THE FIRST VERSION DID THE OTHER ONE. The content is authored at a fixed width
+            // out of the .tscn rather than stretched to its viewport, so moving the viewport's
+            // right edge moved the window and left the rows where they were: the bar drew over
+            // the right end of every key cap and cut the username field in half.
+            // `Logs/shots-runtime/SettingsPanel.png` showed it in one frame.
+            var group = scroll.content != null
+                ? scroll.content.GetComponent<HorizontalOrVerticalLayoutGroup>()
+                : null;
+
+            if (group != null)
+            {
+                var pad = group.padding;
+                pad.right = Mathf.Max(pad.right, (int)Width + 6);
+                group.padding = pad;
+            }
+        }
+
+        /// <summary>
+        /// Page Up / Page Down / Home / End and the arrow keys move the list.
+        ///
+        /// ⚠️ IT IS REFUSED WHILE A REBIND IS LISTENING, because during one the whole keyboard
+        /// belongs to the key being captured and scrolling on the press that is being recorded
+        /// would move the list out from under the row you just clicked.
+        /// </summary>
+        private void StepScrollFromKeyboard()
+        {
+            if (_scroll == null || _scroll.content == null || _scroll.viewport == null) return;
+            if (!string.IsNullOrEmpty(_listening)) return;
+
+            var keyboard = Keyboard.current;
+            if (keyboard == null) return;
+
+            float window = _scroll.viewport.rect.height;
+            float travel = Mathf.Max(1.0f, _scroll.content.rect.height - window);
+            float page = window * 0.85f;
+            float move = 0.0f;
+
+            if (keyboard.pageDownKey.wasPressedThisFrame) move -= page;
+            if (keyboard.pageUpKey.wasPressedThisFrame) move += page;
+            if (keyboard.downArrowKey.isPressed) move -= KeyStep * Time.unscaledDeltaTime * 12.0f;
+            if (keyboard.upArrowKey.isPressed) move += KeyStep * Time.unscaledDeltaTime * 12.0f;
+
+            if (keyboard.homeKey.wasPressedThisFrame)
+            {
+                _scroll.verticalNormalizedPosition = 1.0f;
+                return;
+            }
+
+            if (keyboard.endKey.wasPressedThisFrame)
+            {
+                _scroll.verticalNormalizedPosition = 0.0f;
+                return;
+            }
+
+            if (Mathf.Approximately(move, 0.0f)) return;
+
+            _scroll.verticalNormalizedPosition =
+                Mathf.Clamp01(_scroll.verticalNormalizedPosition + move / travel);
+        }
+
+        private Button FindButton(string node)
+        {
+            var t = Node(node);
+            return t == null ? null : t.GetComponent<Button>();
+        }
+
+        private void Snapshot() => _snapshot = JsonUtility.ToJson(SettingsStore.Current);
+
+        private bool Dirty() => JsonUtility.ToJson(SettingsStore.Current) != _snapshot;
+
+        // --- Rebind rows -------------------------------------------------------------
+
+        /// <summary>
+        /// ⚠️ THE AUTHORED `PlayerNameRow` IS SKIPPED, NOT CLEARED. It is the first child of
+        /// BindingsList in the scene, and an earlier version of this loop freed every child
+        /// before rebuilding, which destroyed the name field in the same frame the code below
+        /// wired it up. It read as "the username option disappeared" rather than as never built.
+        /// </summary>
+        private void BuildRebindRows()
+        {
+            var list = Node("BindingsList");
+            if (list == null) return;
+
+            for (int i = list.childCount - 1; i >= 0; i--)
+            {
+                var child = list.GetChild(i);
+                if (child.name == "PlayerNameRow") continue;
+
+                Destroy(child.gameObject);
+            }
+
+            BuildDeviceTabs(list);
+
+            foreach (var group in Rebinding.Groups)
+            {
+                BuildGroupHeading(list, group.Title);
+
+                foreach (var action in group.Actions) BuildRebindRow(list, action);
+            }
+
+            BuildControllerRows(list);
+            BuildTouchLayoutRows(list);
+            BuildRumbleRow(list);
+        }
+
+        /// <summary>
+        /// The door into `InputLayer.ControllerMapScreen`, and the switch for the generic pad.
+        ///
+        /// ⚠️⚠️ THIS IS THE VISIBLE DOOR `CLAUDE.md` § 6.3 DEMANDS, AND `BuildTouchLayoutRows`
+        /// TWENTY LINES DOWN IS THE SAME ARGUMENT FOR THE SAME REASON. Without a row here the map
+        /// is `docs/TODO.md` § 96 again: a whole screen reachable only by somebody who already
+        /// knows it exists. **A labelled row in the controls list, in the same place every other
+        /// control lives, is where a player looking for controls will look.**
+        ///
+        /// ⚠️⚠️ AND IT IS ONE DOOR, NOT ONE PER PLACE SOMEBODY MIGHT WANT IT. § 6.3: *"NEVER ADD A
+        /// SECOND DOOR TO FIX A FINDABILITY PROBLEM. That is exactly how § 92's six-button panel
+        /// happened."* The map is not also on the pause menu, not also on the title screen and
+        /// not also on the hub.
+        ///
+        /// ⚠️ THE ROWS ARE HERE ON EVERY PLATFORM AND ARE NOT HIDDEN BEHIND "IS A PAD PLUGGED
+        /// IN". `BuildTouchLayoutRows` records the same decision in its own words: *"a row that
+        /// appears only on Android is a row nobody can test on the machine this game is built
+        /// on."* The reverse is worse here, because the player most likely to go looking for this
+        /// screen is the one whose controller is NOT being detected.
+        /// </summary>
+        private void BuildControllerRows(Transform list)
+        {
+            BuildGroupHeading(list, "CONTROLLER");
+
+            BuildActionRow(list, "ControllerMapRow", "Controller map", "OPEN",
+                           () => InputLayer.ControllerMapScreen.Open());
+
+            // ⚠️⚠️ THE SWITCH IS ONLY DRAWN WHEN THERE IS SOMETHING FOR IT TO DO, AND THAT IS THE
+            // ONE PLACE THIS FILE HIDES A ROW ON PURPOSE. § 6.2's third claim is about what the
+            // player has to hold in their head; "generic controller mapping" is a sentence that
+            // means nothing at all to somebody whose Xbox pad works, and it would sit in the list
+            // for every one of them. `ControllerWatch.HasUnrecognised` is false unless an
+            // unmatched controller-shaped device is actually attached.
+            //
+            // ⚠️ IT IS A SWITCH RATHER THAN ALWAYS-ON BECAUSE A FLIGHT STICK IS ALSO AN UNMATCHED
+            // JOYSTICK. `InputLayer.GenericPadBridge.Enabled` carries the reasoning: bridging a
+            // throttle axis onto the movement stick holds a verb down for a whole match, and
+            // nothing in the descriptor tells the two apart.
+            if (!InputLayer.ControllerWatch.HasUnrecognised) return;
+
+            _genericPadButton = BuildActionRow(
+                list, "GenericPadRow", "Unrecognised controllers",
+                InputLayer.GenericPadBridge.Enabled ? "ON" : "OFF",
+                () =>
+                {
+                    InputLayer.GenericPadBridge.Enabled = !InputLayer.GenericPadBridge.Enabled;
+                    SetLabelOf(_genericPadButton,
+                               InputLayer.GenericPadBridge.Enabled ? "ON" : "OFF");
+                    SetText("SettingsStatusLabel", InputLayer.ControllerWatch.StatusLine());
+                    MenuSfx.Click();
+                });
+        }
+
+        private Button _genericPadButton;
+
+        /// <summary>
+        /// ⚠️ THE LABEL IS A CHILD `Text`, NOT THE BUTTON'S OWN, so a caller cannot just assign a
+        /// string. `MenuKit.WoodButton` builds the lettering as a child for the reason
+        /// `PaperKit.Chip` gives: the pose has to tint the word without touching the surface.
+        /// </summary>
+        private static void SetLabelOf(Button button, string text)
+        {
+            if (button == null) return;
+
+            var label = button.GetComponentInChildren<Text>(true);
+            if (label != null) label.text = text;
+        }
+
+        // -------------------------------------------------------------------
+        // § THE SECTION TABS
+        //
+        // ⚠️⚠️ ONE SCROLL HELD EVERY SETTING IN THE GAME AND THE SCROLLBAR HANDLE WAS A SIXTH OF
+        // ITS TRACK. 🧑 2026-09-04: *"can u overhaul how settings is organized? maybe add tabs or
+        // some shit so that they dont have to scroll that much"*, *"we have too many settings
+        // now"*. `Logs/shots-runtime/Settings-v91.png` is the receipt: the visible page is the
+        // username, the device pair and six MOVEMENT rows, and everything else in this file
+        // (three volume sliders, fullscreen, render style, anti-aliasing, vertical sync, the
+        // slipper highlight, telemetry and its disclosure) is below the fold. **A player looking
+        // for the music volume had no way to know it existed.** `CLAUDE.md` § 6.2's third claim
+        // is exactly this one: *"everything the feature can do is on screen at once, in one flat
+        // list, with nothing saying what matters."*
+        //
+        // ⚠️⚠️ THE TABS ARE A ROUTE, NOT A DECORATION, WHICH IS WHY THE SECTION HEADINGS GO WITH
+        // THEM. `BindingsHeading` reads CONTROLS, `AudioHeading` reads AUDIO and `DisplayHeading`
+        // reads DISPLAY, and a tab strip above a heading that repeats the tab is the same word
+        // twice for one fact. They are dropped from their own tab and `MouseHeading` is kept,
+        // because that one is a SUB-section inside CONTROLS rather than a name for the page.
+        //
+        // ⚠️ FOUR, AND THE FOURTH IS NOT "MISC". Every row lands under a word a player would
+        // guess: a colour for your tsinelas and whether you share counts are both things about
+        // YOU rather than about the game's picture or its sound, and the username was already
+        // sitting inside the rebind list under a heading that said CONTROLS, which it is not.
+        //
+        // ⚠️ THE NAMES ARE THE `Content` CHILDREN'S OWN, so a row that is renamed or deleted
+        // simply stops being owned rather than throwing. `MissingTabNodes` reports any name here
+        // that no longer resolves, and `SettingsTabTests` fails on it: a silently unowned row is
+        // a row that is never shown on any tab, which is worse than a stale name.
+        // -------------------------------------------------------------------
+
+        private sealed class SettingsTab
+        {
+            public readonly string Title;
+            public readonly string[] Nodes;
+
+            public SettingsTab(string title, params string[] nodes)
+            {
+                Title = title;
+                Nodes = nodes;
+            }
+        }
+
+        private static readonly SettingsTab[] Tabs =
+        {
+            new SettingsTab("CONTROLS", "BindingsList", "MouseHeading", "SensitivityRow",
+                            "InvertYCheck"),
+            new SettingsTab("AUDIO", "MasterVolumeRow", "SfxVolumeRow", "MusicVolumeRow"),
+            new SettingsTab("VIDEO", "FullscreenCheck", "RenderStyleRow", "AntiAliasRow",
+                            "VSyncRow", "GraphicsQualityRow"),
+            new SettingsTab("PLAYER", "PlayerNameRow", "TelemetryRow",
+                            "TelemetryNote"),
+            new SettingsTab("ACCESSIBILITY", "ReducedUiMotionRow", "SlipperHighlightRow"),
+        };
+
+        /// <summary>
+        /// Headings the tab strip has made redundant. ⚠️ They are HIDDEN rather than deleted:
+        /// they are authored nodes in a committed prefab, `PaperDress` skins them, and a probe
+        /// that looks one of them up by name should still find it.
+        /// </summary>
+        private static readonly string[] RetiredHeadings =
+        {
+            "BindingsHeading", "AudioHeading", "DisplayHeading",
+        };
+
+        private readonly Dictionary<int, Button> _sectionTabs = new Dictionary<int, Button>();
+        private int _tab;
+
+        private readonly Dictionary<string, Transform> _tabNodes =
+            new Dictionary<string, Transform>();
+
+        /// <summary>
+        /// A row this tab strip owns, looked up among the scroll content's own children.
+        ///
+        /// ⚠️⚠️ NOT `ConvertedScreen.Node`, AND THE DIFFERENCE IS THE WHOLE CORRECTNESS OF THE
+        /// STRIP. `Node` reads `_byName`, an index built by walking the tree ONCE before `Wire`
+        /// runs. Seven of the rows this strip owns do not exist at that moment: `RenderStyleRow`,
+        /// `AntiAliasRow`, `VSyncRow`, `SlipperHighlightRow`, `TelemetryRow` and `TelemetryNote`
+        /// are created by `BuildDropdownRow` and `BuildTelemetryNote` DURING `Wire`, and
+        /// `PlayerNameRow` is reparented during it. Asking `Node` for any of them returns null
+        /// **and logs an error**, and `ShowTab` would then skip them, so those six rows would be
+        /// visible on all four tabs at once while the console filled with lookup failures.
+        ///
+        /// ⚠️ EVERY OWNED ROW IS A DIRECT CHILD OF THE SCROLL CONTENT, which is what makes one
+        /// flat scan correct rather than a recursive search: `BuildDropdownRow` parents to
+        /// `FullscreenCheck.parent` and the authored rows are siblings of it. A row that ever
+        /// moves deeper stops being found, `MissingTabNodes` reports it, and the test fails,
+        /// which is the intended way to find out.
+        ///
+        /// ⚠️ THE CACHE IS CHECKED FOR A DESTROYED OBJECT rather than trusted. `BuildRebindRows`
+        /// destroys and rebuilds the list's children, and a `Transform` whose GameObject has gone
+        /// compares equal to null through Unity's overload while still being a live dictionary
+        /// value.
+        /// </summary>
+        private Transform TabNode(string name)
+        {
+            if (_tabNodes.TryGetValue(name, out var cached) && cached != null) return cached;
+
+            var content = _scroll != null && _scroll.content != null
+                ? _scroll.content
+                : Node("Content");
+
+            if (content == null) return null;
+
+            for (int i = 0; i < content.childCount; i++)
+            {
+                var child = content.GetChild(i);
+                if (child.name != name) continue;
+
+                _tabNodes[name] = child;
+                return child;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The one sentence under the strip, which is per tab because it was per screen and
+        /// therefore wrong on three of the four.
+        ///
+        /// ⚠️⚠️ `HintLabel` READ *"Click a key to rebind it, then press any key on your
+        /// keyboard"* ON A PANEL THAT ALSO CARRIES A GAMEPAD PAGE, three volume sliders and a
+        /// privacy disclosure. It is the header of the whole screen, so it was telling a pad
+        /// player to press a key and a player looking at the music slider to rebind something.
+        /// `docs/VISION.md` § 3: *"a screen that teaches the wrong key is worse than one that
+        /// teaches none."*
+        /// </summary>
+        private string HintFor(int tab)
+        {
+            // ⚠️ EVERY PAGE GETS A SENTENCE AND NONE GETS AN EMPTY ONE. The first version
+            // returned "" for AUDIO and VIDEO, and the render showed what that costs: the label
+            // still occupies its authored row, so the page opened with a band of nothing between
+            // the title and the rule. An empty label is not a hidden label.
+            //
+            // ⚠️ EACH ONE SAYS WHAT IS TRUE OF THAT PAGE'S CONTROLS RATHER THAN NAMING THE PAGE.
+            // The tab above already says AUDIO; a sentence reading "audio settings" would be the
+            // same word twice, which is the duplication the retired headings were removed for.
+            // Both of these are statements a player cannot get from the rows themselves: that
+            // the volume rows preview while you drag, and that the video rows apply on the pick
+            // and are still undone by BACK. Both are documented behaviours of this panel.
+            switch (Tabs[tab].Title)
+            {
+                case "AUDIO":
+                    return "Volume changes as you drag, so you can hear what you are setting.";
+
+                case "VIDEO":
+                    return "Changes preview immediately. Save them or discard them when you leave.";
+
+                case "PLAYER":
+                    return "Your player name and privacy preferences.";
+                case "ACCESSIBILITY":
+                    return "Reduce menu movement and make your slippers easier to spot.";
+            }
+
+            // ⚠️⚠️ AN UNUSABLE CONTROLLER IS SAID OUT LOUD HERE, AND IT OUTRANKS THE REBIND
+            // SENTENCE. `docs/TODO.md` § 138: a pad Unity could not match is a `Joystick` rather
+            // than a `Gamepad`, so every `<Gamepad>` binding in the game resolves to nothing on
+            // it and **the pad is simply dead with no message anywhere**. The GAMEPAD page is
+            // exactly where somebody goes when their controller is not working, so it is the one
+            // screen where this sentence is worth more than the instructions.
+            //
+            // ⚠️ THE CONTROLS TAB ONLY. It is a fact about the controls, and putting it on all
+            // four pages would be a warning following the player around the settings screen.
+            if (ControllerWatch.HasUnrecognised) return ControllerWatch.StatusLine();
+
+            return _bindingDevice == InputDeviceKind.Gamepad
+                ? "Pick a row, then press a button on your pad. B cancels."
+                : "Pick a row, then press a key or a mouse button. Escape cancels.";
+        }
+
+        /// <summary>
+        /// The strip of four, between the rule and the list.
+        ///
+        /// ⚠️ ABOVE THE SCROLL AND OUTSIDE IT, which is the whole point. A tab strip that
+        /// scrolls away with the rows it selects is a control the player loses the moment they
+        /// use the list, and they then have no way back to it except scrolling up. The device
+        /// pair inside `BindingsList` is deliberately NOT this: it belongs to one tab and rides
+        /// with it.
+        /// </summary>
+        private void BuildSectionTabs()
+        {
+            var rule = Node("Rule");
+            if (rule == null || rule.parent == null) return;
+
+            _sectionTabs.Clear();
+
+            var rowGo = new GameObject("SectionTabRow");
+            rowGo.AddComponent<RectTransform>();
+            rowGo.transform.SetParent(rule.parent, false);
+            rowGo.transform.SetSiblingIndex(rule.GetSiblingIndex() + 1);
+
+            var row = rowGo.AddComponent<HorizontalLayoutGroup>();
+            row.childControlHeight = true;
+            row.childControlWidth = true;
+
+            // ⚠️ THE FOUR SHARE THE WIDTH EQUALLY RATHER THAN SITTING AT A FIXED SIZE, so the
+            // strip is one rail across the panel at every aspect. `CLAUDE.md` § 6.2c's first
+            // question: a size is measured against the box the player actually sees, and this
+            // panel is `AspectSafeCanvas`-scaled, so the width is not a number this file knows.
+            row.childForceExpandWidth = true;
+            row.childForceExpandHeight = false;
+            row.childAlignment = TextAnchor.MiddleCenter;
+            row.spacing = 8.0f;
+
+            var element = rowGo.AddComponent<LayoutElement>();
+            element.minHeight = SectionTabHeight;
+            element.preferredHeight = SectionTabHeight;
+
+            for (int i = 0; i < Tabs.Length; i++)
+            {
+                int index = i;
+
+                var button = MenuKit.WoodButton(rowGo.transform, Tabs[i].Title,
+                                                Vector2.zero, Vector2.zero,
+                                                new Vector2(0.0f, SectionTabHeight),
+                                                () => ShowTab(index), "Button");
+
+                var tabElement = button.gameObject.AddComponent<LayoutElement>();
+                tabElement.preferredHeight = SectionTabHeight;
+                tabElement.flexibleWidth = 1.0f;
+
+                _sectionTabs[index] = button;
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ 56, WHICH IS TALLER THAN THE 46 A KEYCAP AND A DROPDOWN USE. A page switch drawn at
+        /// row height reads as one more row, which is exactly what was wrong with the device pair
+        /// before this pass: it sat inside the list at `BindingControlSize` behind a label
+        /// reading "Showing", so two page buttons looked like a setting with a value. The height
+        /// difference is what says "this is not a row".
+        /// </summary>
+        private const float SectionTabHeight = 56.0f;
+
+        /// <summary>How many section tabs the panel has, for a probe that photographs each.</summary>
+        public static int TabCount => Tabs.Length;
+
+        /// <summary>The name of one tab, so a render can be filed under it.</summary>
+        public static string TabTitle(int index)
+            => index >= 0 && index < Tabs.Length ? Tabs[index].Title : "?";
+
+        /// <summary>
+        /// Shows one tab and hides the other three.
+        ///
+        /// ⚠️⚠️ PUBLIC SO EVERY STATE CAN BE PHOTOGRAPHED, WHICH `CLAUDE.md` § 6.2b MAKES A HARD
+        /// RULE: *"EVERY STATE, not the one you built first. A screen with a mode has two layouts
+        /// and you have looked at one."* The receipt there is the sign-in screen, shot only as
+        /// `Open()` and shipped as `OpenAtBoot()`. This screen now has four layouts, so a single
+        /// `Settings-vN.png` would be a picture of a quarter of it.
+        ///
+        /// ⚠️⚠️ IT WALKS EVERY OWNED NODE ON EVERY SWITCH RATHER THAN ONLY THE TWO TABS
+        /// INVOLVED, because rows are BUILT after this first runs and a row created later would
+        /// otherwise keep whatever active state it was born with. `BuildDropdownRow` inserts
+        /// three rows next to `FullscreenCheck` and `Wire` calls them in an order this method
+        /// must not have to know.
+        /// </summary>
+        public void ShowTab(int index)
+        {
+            if (_nativeSettings != null)
+            {
+                if (index >= 0 && index < TumpSettingsView.Sections.Length) _nativeSettings.ShowSection(index);
+                return;
+            }
+            if (index < 0 || index >= Tabs.Length) return;
+
+            bool changed = _tab != index;
+            _tab = index;
+
+            foreach (string name in RetiredHeadings)
+            {
+                var heading = TabNode(name);
+                if (heading != null) heading.gameObject.SetActive(false);
+            }
+
+            for (int i = 0; i < Tabs.Length; i++)
+            {
+                bool live = i == _tab;
+
+                foreach (string name in Tabs[i].Nodes)
+                {
+                    var node = TabNode(name);
+                    if (node != null) node.gameObject.SetActive(live);
+                }
+            }
+
+            RefreshSectionTabs();
+            SetText("HintLabel", HintFor(_tab));
+
+            // ⚠️ BACK TO THE TOP ON EVERY SWITCH. A player who scrolled to the bottom of
+            // CONTROLS and pressed AUDIO would otherwise land on a four-row page scrolled past
+            // its own content, which reads as an empty tab.
+            if (_scroll != null) _scroll.verticalNormalizedPosition = 1.0f;
+
+            RefreshScrollbar();
+
+            // ⚠️⚠️ THE FOCUS PATH IS REBUILT, AND WITHOUT IT A PAD WALKS INTO THE HIDDEN TABS.
+            // `Rebuild` walks `GetComponentsInChildren<Selectable>(includeInactive: false)` and
+            // caches the order, so it is a snapshot of which rows were active when it last ran.
+            // A tab switch changes exactly that, and a navigation that steps onto a deactivated
+            // row simply stops. This is the half that makes the strip usable on a controller.
+            //
+            // ⚠️ THROUGH `OwnerOf` RATHER THAN A LOCAL `GetComponent`, because that is the one
+            // answer to "which screen owns this control" that both this file and
+            // `InputSurfaceProbe` ask; its own note records a probe inventing 44 unreachable
+            // controls when the two disagreed.
+            InputLayer.ScreenFocus.OwnerOf(this)?.Rebuild();
+
+            if (changed) MenuSfx.Click();
+        }
+
+        /// <summary>
+        /// Re-measures the content so the scrollbar's own auto-hide is right on the first frame
+        /// of a new page.
+        ///
+        /// ⚠️⚠️ THE VISIBILITY ITSELF IS `ScrollRect`'s JOB AND TAKING IT AWAY FROM IT DID NOT
+        /// WORK. The first version of this measured the content against the viewport and called
+        /// `SetActive` on the bar, and the bar stayed visible anyway: `ScrollbarVisibility
+        /// .Permanent` makes `ScrollRect` re-assert the active state every frame, so the switch
+        /// was undone before the next draw. `ConfigureScroll` sets `AutoHide` now and this method
+        /// only makes sure the sizes it reads are this page's.
+        ///
+        /// ⚠️ THE REBUILD IS THE PART THAT MATTERS. `SetActive` does not resize the content until
+        /// the next layout pass, so the height `ScrollRect` would otherwise read on the frame of
+        /// a tab switch is whatever the tab we just left happened to be, and the bar would be
+        /// right one frame late on every switch. `MenuKit.Fit`'s own note records the same trap
+        /// from the other end: a rect that has not been laid out reports zero.
+        /// </summary>
+        private void RefreshScrollbar()
+        {
+            if (_scroll == null || _scroll.content == null) return;
+
+            LayoutRebuilder.ForceRebuildLayoutImmediate(_scroll.content);
+        }
+
+        private void RefreshSectionTabs()
+        {
+            foreach (var pair in _sectionTabs)
+            {
+                var button = pair.Value;
+                if (button == null) continue;
+
+                bool live = pair.Key == _tab;
+
+                if (BrandTab(button, live)) continue;
+
+                // The same relief-not-hue inversion the device pair uses; see
+                // `RefreshDeviceTabs` for why a live tab is a raised surface rather than a
+                // second colour, and why the paper skin is tried before the wood one.
+                if (PaperKit.MarkLive(button, live)) continue;
+
+                var skin = button.GetComponent<GodotButton>();
+                if (skin == null) continue;
+
+                skin.Variation = live ? "WoodTabLiveButton" : "WoodTabIdleButton";
+                skin.Apply();
+                skin.Refresh();
+            }
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE USERNAME WAS A CHILD OF `BindingsList`, UNDER A HEADING THAT SAYS CONTROLS.
+        /// It is not a control and it is not rebindable, and `BuildRebindRows` had to carry a
+        /// `if (child.name == "PlayerNameRow") continue;` to avoid destroying it while clearing
+        /// the list, which is the shape of a row living in the wrong parent. It moves to
+        /// `Content` so the PLAYER tab can own it, and that skip in `BuildRebindRows` becomes
+        /// dead rather than load-bearing.
+        /// </summary>
+        private void MoveNameRowOutOfBindings()
+        {
+            var nameRow = Node("PlayerNameRow");
+            var anchor = Node("FullscreenCheck");
+
+            if (nameRow == null || anchor == null || anchor.parent == null) return;
+            if (nameRow.parent == anchor.parent) return;
+
+            nameRow.SetParent(anchor.parent, false);
+            nameRow.SetSiblingIndex(anchor.GetSiblingIndex() + 1);
+        }
+
+        /// <summary>
+        /// Every tab node name that no longer resolves to a child of this panel.
+        ///
+        /// ⚠️ A STALE NAME IS SILENT WITHOUT THIS. `ShowTab` skips a null, so a row that has been
+        /// renamed simply stops being owned by any tab and is therefore never shown, on any page,
+        /// with no error. `SettingsTabTests` asserts this comes back empty.
+        /// </summary>
+        public List<string> MissingTabNodes()
+        {
+            var missing = new List<string>();
+
+            foreach (var tab in Tabs)
+                foreach (string name in tab.Nodes)
+                    if (TabNode(name) == null) missing.Add($"{tab.Title}/{name}");
+
+            return missing;
+        }
+
+        /// <summary>
+        /// Which device's bindings the rebind list is showing and editing.
+        ///
+        /// ⚠️⚠️ THE PANEL LISTED THE KEYBOARD BINDING AND ONLY THE KEYBOARD BINDING, SO A PAD
+        /// PLAYER COULD NOT SEE THEIR OWN CONTROLS. `docs/TODO.md` § 125.13's first open item:
+        /// *"`Rebinding` can now answer per device and rebind per device without disturbing the
+        /// other, so the data is all there; what is missing is a device toggle on the panel."*
+        /// `RefreshBindingLabels`, `BeginRebind` and every row's own label all went through
+        /// `DisplayNameFor(asset, action)`, which resolves binding 0, which is always the key.
+        ///
+        /// ⚠️⚠️ IT OPENS ON THE DEVICE THE PLAYER IS ACTUALLY HOLDING, which is
+        /// `LastInputDevice`'s own argument reused rather than a second one: *"a player who picks
+        /// up a pad mid-match has told you which glyph they want by picking it up."* A pad player
+        /// opening CONTROLS to check their bindings should not have to find a toggle first.
+        ///
+        /// ⚠️ TOUCH FALLS BACK TO KEYBOARD AND MOUSE RATHER THAN GETTING A THIRD PAGE. The thumb
+        /// layer is not rebound by path at all: it has its own screen, reached from a row further
+        /// down this very list, where a control is dragged and resized instead. A third tab
+        /// reading GAMEPAD / KEYBOARD / TOUCH where one of the three leads somewhere else
+        /// entirely is what `CLAUDE.md` § 6.2 calls overwhelming.
+        /// </summary>
+        private InputDeviceKind _bindingDevice =
+            LastInputDevice.Current == InputDeviceKind.Gamepad
+                ? InputDeviceKind.Gamepad
+                : InputDeviceKind.KeyboardMouse;
+
+        private readonly Dictionary<InputDeviceKind, Button> _deviceTabs =
+            new Dictionary<InputDeviceKind, Button>();
+
+        /// <summary>
+        /// The two-page header at the top of the controls list.
+        ///
+        /// ⚠️ ONE CONTROL, AT THE TOP, WHICH IS THE SHAPE § 125.13 ASKED FOR: *"one control at the
+        /// top of the rebind list switching every row between keyboard and pad."* It is at the top
+        /// because it changes the meaning of every row under it, and a control that reinterprets a
+        /// list belongs above the list rather than beside one of its rows.
+        /// </summary>
+        private void BuildDeviceTabs(Transform list)
+        {
+            // ⚠️ THE DEVICE IS READ HERE RATHER THAN LEFT TO THE FIELD INITIALISER, AND THE
+            // DIFFERENCE IS REAL. A field initialiser runs when the COMPONENT is constructed,
+            // which for a panel parked inactive in a converted scene is at scene load, possibly
+            // minutes before anybody opens it. Reading it as the rows are built is what makes the
+            // sentence on `_bindingDevice` true: the page opens on the device the player is
+            // holding, not on the one they were holding when the scene came up.
+            _bindingDevice = LastInputDevice.Current == InputDeviceKind.Gamepad
+                ? InputDeviceKind.Gamepad
+                : InputDeviceKind.KeyboardMouse;
+
+            _deviceTabs.Clear();
+
+            var rowGo = new GameObject("BindingDeviceRow");
+            rowGo.AddComponent<RectTransform>();
+            rowGo.transform.SetParent(list, false);
+
+            var row = rowGo.AddComponent<HorizontalLayoutGroup>();
+            row.childControlHeight = true;
+            row.childControlWidth = true;
+            row.childForceExpandHeight = false;
+
+            // ⚠️⚠️ A FULL-WIDTH RAIL OF TWO, AND IT USED TO BE A SETTINGS ROW. 🧑 2026-09-04:
+            // *"make controller settings in settings look prettier too"*.
+            // `Logs/shots-runtime/Settings-v91.png` shows what it was: a `MenuBody` label reading
+            // **"Showing"** in the 260-unit action column, then two 170-unit buttons the exact
+            // size and shape of the keycaps below them. So the one control that reinterprets
+            // every row on the page was drawn as a row with a value, in a column that means "the
+            // name of a control you can rebind", and the word naming it was not a noun anybody
+            // was looking for.
+            //
+            // ⚠️ THE LABEL IS GONE RATHER THAN REWORDED. Two buttons reading KEYBOARD and GAMEPAD
+            // side by side, one of them visibly pressed in, do not need a word telling the player
+            // they are a pair; `CLAUDE.md` § 6.2's third claim is that a screen earns its calm by
+            // removing what the player does not need, and this row is directly under a tab that
+            // already says CONTROLS.
+            row.childForceExpandWidth = true;
+            row.childAlignment = TextAnchor.MiddleCenter;
+            row.spacing = 8.0f;
+
+            var element = rowGo.AddComponent<LayoutElement>();
+            element.minHeight = DeviceTabHeight;
+            element.preferredHeight = DeviceTabHeight;
+
+            AddDeviceTab(rowGo.transform, InputDeviceKind.KeyboardMouse, "KEYBOARD");
+            AddDeviceTab(rowGo.transform, InputDeviceKind.Gamepad, "GAMEPAD");
+        }
+
+        /// <summary>
+        /// ⚠️ 52: BETWEEN THE 46 OF A ROW AND THE 56 OF A SECTION TAB, WHICH IS THE HIERARCHY
+        /// SAID IN HEIGHT. This pair switches every row in one section; the strip above it
+        /// switches the section. Drawing them the same size would say they do the same kind of
+        /// thing, and drawing this one at row height said it was a row, which is what it looked
+        /// like for its whole life.
+        /// </summary>
+        private const float DeviceTabHeight = 52.0f;
+
+        private void AddDeviceTab(Transform parent, InputDeviceKind device, string text)
+        {
+            var button = MenuKit.WoodButton(parent, text, Vector2.zero, Vector2.zero,
+                                            new Vector2(0.0f, DeviceTabHeight),
+                                            () => ShowDevice(device), "Button");
+
+            var element = button.gameObject.AddComponent<LayoutElement>();
+            element.preferredHeight = DeviceTabHeight;
+            element.flexibleWidth = 1.0f;
+
+            _deviceTabs[device] = button;
+        }
+
+        private void ShowDevice(InputDeviceKind device)
+        {
+            if (_bindingDevice == device) return;
+
+            // ⚠️ A REBIND IN FLIGHT IS ABANDONED, because it was started against the OTHER page's
+            // binding index and completing it would write that device's path onto this page's row.
+            if (_rebindOp != null) CancelRebind();
+
+            _bindingDevice = device;
+            MenuSfx.Click();
+
+            RefreshDeviceTabs();
+            RefreshBindingLabels();
+
+            // ⚠️ THE HINT UNDER THE STRIP FOLLOWS THE PAGE, which is the half `HintFor` exists
+            // for: the sentence telling a player how to rebind has to name the device they are
+            // actually looking at, and the authored one named the keyboard on both pages.
+            SetText("HintLabel", HintFor(_tab));
+
+            SetText("SettingsStatusLabel",
+                    device == InputDeviceKind.Gamepad
+                        ? "Showing gamepad controls. Pick a row, then press a button on your pad."
+                        : "Showing keyboard and mouse controls. Pick a row, then press a key.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ RELIEF RATHER THAN HUE, WHICH IS WHAT EVERY OTHER TAB STRIP IN THIS FRONT END
+        /// DOES. `CustomCharacterScreen`'s slot tabs carry the argument and `GodotTheme` carries
+        /// the reason: a live tab is a statement about where you already are rather than a second
+        /// "press me", so it is a raised surface and not a different colour. It also survives a
+        /// colourblind player and a bad projector, which `FUTURE.md` § 16.1 is about.
+        ///
+        /// ⚠️ THE PAPER SKIN IS WRITTEN FIRST AND THE WOOD ONE ONLY IF THERE IS NO PAPER, for the
+        /// reason `PaperKit.MarkLive` records: by the time anybody presses one of these the
+        /// `GodotButton` is disabled, because `PaperDress` turns it off on the way past. Three
+        /// screens had that same fault at once. `Build` calls this AFTER `PaperDress.Screen`.
+        /// </summary>
+        private void RefreshDeviceTabs()
+        {
+            foreach (var pair in _deviceTabs)
+            {
+                var button = pair.Value;
+                if (button == null) continue;
+
+                bool live = pair.Key == _bindingDevice;
+
+                if (BrandTab(button, live)) continue;
+
+                if (PaperKit.MarkLive(button, live)) continue;
+
+                var skin = button.GetComponent<GodotButton>();
+                if (skin == null) continue;
+
+                skin.Variation = live ? "WoodTabLiveButton" : "WoodTabIdleButton";
+                skin.Apply();
+                skin.Refresh();
+            }
+        }
+
+        /// <summary>
+        /// The door into the touch customiser, and the escape from a layout somebody has broken.
+        ///
+        /// ⚠️⚠️ THIS IS THE VISIBLE DOOR `CLAUDE.md` § 6.3 DEMANDS, AND WITHOUT IT THE CUSTOMISER
+        /// IS `docs/TODO.md` § 96 ALL OVER AGAIN: a whole screen reachable only by somebody who
+        /// already knows it exists. The hub's one door was *"a corner chip stating a name and a
+        /// level"* and the person who commissioned it never found it. A labelled row in the
+        /// controls list, in the same place every other control lives, is where a player looking
+        /// for controls will look.
+        ///
+        /// ⚠️⚠️ AND `RESET TOUCH LAYOUT` IS ON THIS SCREEN RATHER THAN ONLY ON THE CUSTOMISER,
+        /// BECAUSE THE CUSTOMISER IS WHERE YOU BREAK IT. A player who drags THROW half off the
+        /// screen and closes the screen has no control to press and no obvious way back;
+        /// `TouchHud.ClampIntoCanvas` stops the worst of it, but the recovery has to exist
+        /// somewhere that does not depend on the layer being usable. § 6.3: a dead end is a bug.
+        ///
+        /// ⚠️ THE ROWS ARE HERE ON EVERY PLATFORM, not hidden behind a touch check. A desktop
+        /// player on a 2-in-1 has a touchscreen, and `TouchLayoutScreen.Open` forces the layer on
+        /// so the screen is usable with a mouse. A row that appears only on Android is a row
+        /// nobody can test on the machine this game is built on.
+        /// </summary>
+        private void BuildTouchLayoutRows(Transform list)
+        {
+            BuildGroupHeading(list, "TOUCH CONTROLS");
+
+            BuildActionRow(list, "TouchLayoutRow", "On-screen controls", "CUSTOMISE",
+                           () => InputLayer.TouchLayoutScreen.Open());
+
+            BuildActionRow(list, "TouchResetRow", "Reset on-screen layout", "RESET",
+                           () =>
+                           {
+                               InputLayer.TouchLayoutStore.ResetAll();
+                               SetText("SettingsStatusLabel",
+                                       "On-screen controls are back to the default layout.");
+                           });
+        }
+
+        /// <summary>A label and one button, in the same shape as a rebind row.</summary>
+        private Button BuildActionRow(Transform list, string name, string label, string button,
+                                      System.Action onClick)
+        {
+            var rowGo = new GameObject(name);
+            rowGo.AddComponent<RectTransform>();
+            rowGo.transform.SetParent(list, false);
+
+            var row = rowGo.AddComponent<HorizontalLayoutGroup>();
+            row.childControlHeight = true;
+            row.childControlWidth = true;
+            row.childForceExpandHeight = false;
+            row.childForceExpandWidth = false;
+            row.childAlignment = TextAnchor.MiddleLeft;
+            row.spacing = 0.0f;
+
+            var text = MenuKit.Styled(rowGo.transform, "MenuBody", label, TextAnchor.MiddleLeft);
+            text.raycastTarget = false;
+
+            var labelElement = text.gameObject.AddComponent<LayoutElement>();
+            labelElement.preferredWidth = ActionLabelWidth;
+            labelElement.minHeight = BindingControlSize.y;
+
+            var control = MenuKit.WoodButton(rowGo.transform, button, Vector2.zero, Vector2.zero,
+                                             BindingControlSize, onClick, "Button");
+
+            var buttonElement = control.gameObject.AddComponent<LayoutElement>();
+            buttonElement.preferredWidth = BindingControlSize.x;
+            buttonElement.preferredHeight = BindingControlSize.y;
+            buttonElement.flexibleWidth = 1.0f;
+
+            return control;
+        }
+
+        private Button _rumbleButton;
+
+        /// <summary>
+        /// The rumble switch, in the controls list rather than in the display group.
+        ///
+        /// ⚠️⚠️ IT LIVES BESIDE THE BINDINGS BECAUSE THAT IS WHERE A PLAYER LOOKING FOR IT WILL
+        /// LOOK. `CLAUDE.md` § 6.3: *"every destination has a visible door"*, and the door to a
+        /// controller setting is the CONTROLS list, not the display pickers at the bottom of the
+        /// panel. The two touch-layout rows are already here for the same reason.
+        ///
+        /// ⚠️ A BUTTON THAT READS ITS OWN STATE, NOT A DROPDOWN, WHICH IS THE OPPOSITE OF THE
+        /// CALL `BuildSlipperHighlightRow` MAKES AND FOR ITS OWN STATED REASON. That one is a
+        /// list with swatches because *"the player is picking a COLOUR, and a button reading
+        /// 'Purple' in ink on wood shows them everything except the purple."* There is nothing to
+        /// show here: ON and OFF are the whole range, the row is one press either way, and it
+        /// matches the shape of every other row in this list.
+        ///
+        /// ⚠️ AND IT GOES THROUGH THE PANEL'S APPLY/BACK TRANSACTION like every other row.
+        /// `Snapshot` captures the settings object as JSON and BACK restores it, so a row that
+        /// wrote to disk on the press would be the one row BACK cannot undo. `RefreshApplyState`
+        /// is what arms APPLY.
+        /// </summary>
+        private void BuildRumbleRow(Transform list)
+        {
+            _rumbleButton = BuildActionRow(list, "RumbleRow", "Rumble", RumbleLabel(), () =>
+            {
+                SettingsStore.Current.Rumble = !SettingsStore.Current.Rumble;
+
+                // ⚠️ APPLIED IMMEDIATELY AS WELL AS STORED, because the point of this switch is
+                // that the next cue is different, and BACK re-applies the snapshot through
+                // `GameSettings.Apply` so a discarded change puts the old value back on the way
+                // out. Same shape as the fullscreen box, which was saved and displayed and never
+                // actually set for the whole port.
+                InputLayer.Rumble.Enabled = SettingsStore.Current.Rumble;
+
+                if (_rumbleButton != null)
+                {
+                    var text = _rumbleButton.GetComponentInChildren<Text>();
+                    if (text != null) text.text = RumbleLabel();
+                }
+
+                // A press on this row should be felt, when the answer to the press is "on".
+                InputLayer.Rumble.Tagged();
+
+                MenuSfx.Click();
+                RefreshApplyState();
+            });
+        }
+
+        private static string RumbleLabel() => SettingsStore.Current.Rumble ? "ON" : "OFF";
+
+        /// <summary>
+        /// A group heading, and the one line of explanation under it where there is one.
+        ///
+        /// ⚠️ THE HEADING IS AMBER AND THE ROWS ARE NOT, which is the whole reason the grouping
+        /// reads at a glance. A heading in the same weight as its rows is another row.
+        /// </summary>
+        private void BuildGroupHeading(Transform list, string title)
+        {
+            var headingGo = new GameObject($"{title}Heading");
+            headingGo.AddComponent<RectTransform>();
+            headingGo.transform.SetParent(list, false);
+
+            var column = headingGo.AddComponent<VerticalLayoutGroup>();
+            column.childControlHeight = true;
+            column.childControlWidth = true;
+            column.childForceExpandHeight = false;
+            column.childForceExpandWidth = true;
+            column.spacing = 0.0f;
+            column.padding = new RectOffset(0, 0, 14, 4);
+
+            var heading = MenuKit.Styled(headingGo.transform, "MenuBody", title,
+                                         TextAnchor.MiddleLeft);
+            heading.raycastTarget = false;
+            heading.color = UiTheme.Amber;
+            MenuKit.Apply(heading, PaperKit.FaceFor(heading.fontSize), bold: true);
+            heading.gameObject.AddComponent<LayoutElement>().preferredHeight = 26.0f;
+
+            string blurb = Rebinding.BlurbFor(title);
+            if (string.IsNullOrEmpty(blurb)) return;
+
+            var note = MenuKit.Styled(headingGo.transform, "MenuBody", blurb,
+                                      TextAnchor.MiddleLeft);
+            note.raycastTarget = false;
+            note.color = UiTheme.CreamMuted;
+            note.fontSize = MenuKit.MinReadableUnits;
+            note.gameObject.AddComponent<LayoutElement>().preferredHeight = 20.0f;
+        }
+
+        private void BuildRebindRow(Transform list, string action)
+        {
+            {
+                var rowGo = new GameObject($"{action}Row");
+                rowGo.AddComponent<RectTransform>();
+                rowGo.transform.SetParent(list, false);
+
+                var row = rowGo.AddComponent<HorizontalLayoutGroup>();
+                row.childControlHeight = true;
+                row.childControlWidth = true;
+                row.childForceExpandHeight = false;
+                row.childForceExpandWidth = false;
+                row.childAlignment = TextAnchor.MiddleLeft;
+                row.spacing = 0.0f;
+
+                var label = MenuKit.Styled(rowGo.transform, "MenuBody",
+                                           Rebinding.LabelFor(action), TextAnchor.MiddleLeft);
+                label.raycastTarget = false;
+
+                var labelElement = label.gameObject.AddComponent<LayoutElement>();
+                labelElement.preferredWidth = ActionLabelWidth;
+                labelElement.minHeight = BindingControlSize.y;
+
+                // ⚠️ DELIBERATELY THE THEME'S DEFAULT BUTTON, light fill with INK lettering. It
+                // is the one control on this screen that should read as a physical keycap, and
+                // inverting it to wood loses that.
+                string capture = action;
+                var button = MenuKit.WoodButton(rowGo.transform,
+                    Rebinding.DisplayNameFor(_actions, action), Vector2.zero, Vector2.zero,
+                    BindingControlSize, () => BeginRebind(capture), "Button");
+
+                var buttonElement = button.gameObject.AddComponent<LayoutElement>();
+                buttonElement.preferredWidth = BindingControlSize.x;
+                buttonElement.preferredHeight = BindingControlSize.y;
+                buttonElement.flexibleWidth = 1.0f;
+
+                _rebindButtons[action] = button;
+            }
+        }
+
+        // --- The landed-highlight colour ---------------------------------------------
+
+        private Dropdown _highlight;
+        private Dropdown _antiAlias;
+        private Dropdown _vsync;
+        private Dropdown _renderStyle;
+
+        /// <summary>
+        /// § THE LANDED HIGHLIGHT's colour picker, from `settings_panel.gd`.
+        ///
+        /// ⚠️ BUILT IN CODE AND PLACED NEXT TO THE FULLSCREEN BOX, rather than authored into
+        /// `SettingsPanel.unity`. The scene is a conversion of the .tscn and gets rebaked by
+        /// `TscnImporter`, so a row added to the asset by hand is a row that disappears the
+        /// next time somebody reimports the maps. Everything on this screen that the importer
+        /// does not own is built here, which is the same reason the rebind rows are.
+        ///
+        /// ⚠️⚠️ IT IS A LIST WITH SWATCHES, NOT A CYCLING BUTTON, AND THAT WAS A CORRECTION.
+        /// The first version advanced through the palette on click and printed the colour's
+        /// NAME. It worked and it was the wrong control: the player is picking a COLOUR, and a
+        /// button reading "Purple" in ink on wood shows them everything except the purple. The
+        /// Godot panel puts every option on screen at once with the colour beside it, so the
+        /// choice is made by eye. See `SwatchDropdown`.
+        /// </summary>
+        private void BuildSlipperHighlightRow()
+        {
+            var options = new List<SwatchDropdown.Option>();
+
+            foreach (var entry in SlipperHighlights.All)
+            {
+                // ⚠️ "Off" PASSES A NULL SWATCH rather than its stored colour. Row 0 holds black
+                // as a placeholder because the palette is an array and every row needs a value;
+                // drawing it would put a black chip beside "Off" that reads like a sixth colour.
+                bool hasColour = entry.Label != "Off";
+                options.Add(new SwatchDropdown.Option(
+                    entry.Label, hasColour ? entry.Colour : (Color?)null));
+            }
+
+            _highlight = BuildDropdownRow("SlipperHighlightRow", "Slipper Highlight", options,
+                                          SettingsStore.Current.SlipperHighlight,
+                                          PickSlipperHighlight);
+        }
+
+        /// <summary>
+        /// The anti-aliasing picker.
+        ///
+        /// ⚠️⚠️ IT IS ON THIS SCREEN AT ALL BECAUSE THE GAME HAD NO WAY TO ASK FOR IT. The
+        /// sample count a player rendered at came from whichever of the six quality levels the
+        /// platform default happened to select, four of the six carried none, and nothing in the
+        /// game ever showed a quality level or let anybody change one. See
+        /// <see cref="AntiAliasModes"/> for what was measured.
+        ///
+        /// ⚠️ AND IT IS A DROPDOWN WITH NO SWATCHES rather than the cycling button the first
+        /// version of the highlight row used. Same reasoning inverted: the highlight is a colour
+        /// and has to be shown, this is a list of five named modes and the only thing a player
+        /// needs to see is which one is on and what else there is. A null swatch on every row
+        /// hides the chip, which is the same path "Off" already takes.
+        /// </summary>
+        /// <summary>
+        /// The telemetry opt-out, and the sentence that says what it is opting out of.
+        ///
+        /// ⚠️⚠️ THE SENTENCE IS NOT DECORATION, IT IS HALF THE FEATURE. `FUTURE.md` § 19.3 asks
+        /// for *"a visible opt-out in Settings that is honoured completely, and a plain statement
+        /// of what is collected"*. A switch with no explanation asks a player to make a decision
+        /// with no information, and the honest answer here is short enough to fit on one line:
+        /// counts, no names, nothing typed.
+        ///
+        /// ⚠️ AND "HONOURED COMPLETELY" MEANS `TelemetrySink` STOPS COUNTING, not just stops
+        /// sending. An opt-out that only gates the upload leaves a buffer somebody could later
+        /// decide to flush, which is the same thing as no opt-out.
+        ///
+        /// ⚠️ A DROPDOWN RATHER THAN A TICK BOX, and that is a reuse decision rather than a
+        /// design one: every tick box on this panel is a node the importer owns, and a row added
+        /// to `SettingsPanel.unity` by hand disappears the next time `TscnImporter` rebakes it.
+        /// `BuildDropdownRow` is the built-in-code path three rows already use.
+        /// </summary>
+        private void BuildTelemetryRow()
+        {
+            var options = new List<SwatchDropdown.Option>
+            {
+                new SwatchDropdown.Option("OFF", null),
+                new SwatchDropdown.Option("ON", null),
+            };
+
+            // ⚠️ FIRST, SO IT ENDS UP UNDER THE ROW. See `BuildTelemetryNote`'s own note: these
+            // all insert at the same index, so insertion order is display order reversed and the
+            // explanation has to go in before the thing it explains.
+            BuildTelemetryNote();
+
+            BuildDropdownRow("TelemetryRow", "Anonymous stats", options,
+                             SettingsStore.Current.TelemetryEnabled ? 1 : 0,
+                             index =>
+                             {
+                                 // ⚠️ IT GOES THROUGH THE PANEL'S APPLY/BACK TRANSACTION LIKE
+                                 // EVERY OTHER ROW, RATHER THAN SAVING ON THE PICK. `Snapshot`
+                                 // captures the whole settings object as JSON and Back restores
+                                 // it, so a row that wrote to disk immediately would be a row
+                                 // Back cannot undo, on the one screen where every other control
+                                 // can be.
+                                 SettingsStore.Current.TelemetryEnabled = index == 1;
+                                 RefreshApplyState();
+                             });
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE NOTE GOES IN **BEFORE** THE ROW, AND THIS COMMENT USED TO SAY THE OPPOSITE
+        /// AND BE WRONG. It read: *"THE NOTE GOES IN AFTER THE ROW, SO IT LANDS ABOVE IT ON
+        /// SCREEN ... which puts this line directly under the picker it explains once the whole
+        /// stack is reversed."* Those two halves contradict each other, and the second one is the
+        /// false one. Every row inserts at `FullscreenCheck`'s sibling index **+ 1**, so the last
+        /// thing inserted sits nearest the box, and the box is ABOVE: last in means highest on
+        /// screen. Inserting the note after the row therefore put the explanation above the
+        /// control it explains, which is what shipped.
+        ///
+        /// ⚠️ IT WAS INVISIBLE UNTIL THE PANEL GOT TABS, for the same reason the blue slider
+        /// fills and the magenta tick were: the telemetry rows were the very bottom of a single
+        /// scroll and no render of this screen had ever reached them. `CLAUDE.md` § 6.2b, once
+        /// more: the probe asks whether the screen is a screen, the picture asks whether it can
+        /// be read.
+        ///
+        /// Sizing it as its own row rather than as a second label inside the picker keeps the
+        /// label column aligned with every other row on the panel, which is the alignment fault
+        /// this file's `BuildDropdownRow` header already records being reported once.
+        /// </summary>
+        private void BuildTelemetryNote()
+        {
+            var anchor = Node("FullscreenCheck");
+            if (anchor == null || anchor.parent == null) return;
+
+            var noteGo = new GameObject("TelemetryNote");
+            noteGo.AddComponent<RectTransform>();
+            noteGo.transform.SetParent(anchor.parent, false);
+            noteGo.transform.SetSiblingIndex(anchor.GetSiblingIndex() + 1);
+
+            // ⚠️ THE ROW NEEDS ITS OWN LAYOUT GROUP, exactly as `BuildDropdownRow` gives its row
+            // one. `MenuKit.Styled` parents the label to this object, and a child of a plain
+            // RectTransform inside a vertical list is laid out by nothing at all: it collapses to
+            // its default rect and the sentence is invisible while the row still takes its height,
+            // which reads as a gap somebody left rather than as text that failed to draw.
+            var layout = noteGo.AddComponent<HorizontalLayoutGroup>();
+            layout.childControlHeight = true;
+            layout.childControlWidth = true;
+            layout.childForceExpandHeight = true;
+            layout.childForceExpandWidth = true;
+            layout.childAlignment = TextAnchor.MiddleLeft;
+
+            var text = MenuKit.Styled(noteGo.transform, "MenuBody",
+                "Counts only: matches played, modes, maps, picks and frame rate. " +
+                "No names, no chat, nothing you type.", TextAnchor.MiddleLeft);
+            text.raycastTarget = false;
+            text.fontSize = 18;
+
+            // ⚠️⚠️ BOTH AXES, AND SETTING ONLY THE VERTICAL ONE DID NOTHING AT ALL. This block
+            // used to set `verticalOverflow = Overflow` and stop, with a note saying the sentence
+            // is *"two lines wide by design"*. **It was never two lines.** `MenuKit.Styled`
+            // leaves `horizontalOverflow = Overflow`, so the text does not wrap, so it never
+            // needs a second line, so allowing a second line changes nothing: the sentence simply
+            // ran off the side of the panel. Measured 2026-08-30 by
+            // `PhaseSurfaceLayoutProbe.TheTelemetryRowFitsItsBoxAtEveryShippedResolution` at
+            // 1280x720: **795 px of text in a 688 px box, 107 px past the edge**, and nothing
+            // errors, because Overflow is silent by construction.
+            //
+            // ⚠️⚠️ AND THE HALF THAT WENT IS THE HALF THAT MATTERS. The sentence is
+            // *"Counts only: ... No names, no chat, nothing you type."* The clause that survives
+            // at 720p is the list of what IS collected; the promise about what is not is the part
+            // off the edge. `FUTURE.md` § 19.3 asks for *"a plain statement of what is
+            // collected"*, and **a privacy disclosure that is silently truncated is worse than
+            // one that is absent**, because the reader has no way to know they are seeing half.
+            //
+            // ⚠️ `Wrap` PLUS `Overflow` IS THE PAIR. Wrap alone would clip the second line to the
+            // 48 px box, which is the wrap-and-clip trap `GameVersion.ApplyTo` and
+            // `ConvertedScreen.SetHeadline` both record. Wrapping makes the lines; vertical
+            // overflow lets them be drawn.
+            text.horizontalOverflow = HorizontalWrapMode.Wrap;
+            text.verticalOverflow = VerticalWrapMode.Overflow;
+
+            // ⚠️ 56 RATHER THAN 48, because two 18-unit lines plus their leading do not fit in
+            // 48 and the row below would be drawn through. The label may still overflow this box
+            // downward by design; the height is what the LIST reserves for it.
+            var element = noteGo.AddComponent<LayoutElement>();
+            element.minHeight = 56.0f;
+            element.preferredHeight = 56.0f;
+        }
+
+        private void BuildAntiAliasRow()
+        {
+            var options = new List<SwatchDropdown.Option>();
+
+            foreach (var entry in AntiAliasModes.All)
+                options.Add(new SwatchDropdown.Option(entry.Label, null));
+
+            _antiAlias = BuildDropdownRow("AntiAliasRow", "Anti-Aliasing", options,
+                                          SettingsStore.Current.AntiAliasMode, PickAntiAlias);
+        }
+
+        private Dropdown _graphicsQuality;
+
+        private void BuildGraphicsQualityRow()
+        {
+            var options = new List<SwatchDropdown.Option>();
+            foreach (var profile in GraphicsProfiles.All)
+                options.Add(new SwatchDropdown.Option(profile.Label, null));
+
+            _graphicsQuality = BuildDropdownRow("GraphicsQualityRow", "Graphics quality",
+                options, SettingsStore.Current.GraphicsQuality, index =>
+                {
+                    SettingsStore.Current.GraphicsQuality = Mathf.Clamp(index, 0, GraphicsProfiles.All.Length - 1);
+                    GraphicsProfiles.Apply(SettingsStore.Current.GraphicsQuality);
+                    RefreshApplyState();
+                });
+        }
+
+        /// <summary>
+        /// The vertical sync picker.
+        ///
+        /// ⚠️ IT APPLIES ON THE PICK, like anti-aliasing and the render style. Tearing and judder
+        /// are the entire content of this setting and neither can be judged from a label, so a
+        /// value that only took effect on APPLY would make the choice guesswork. `SettingsStore`'s
+        /// snapshot still restores it on Back, because `GameSettings.Apply` pushes the stored index
+        /// back through `VSyncModes.Apply`.
+        /// </summary>
+        private void BuildVSyncRow()
+        {
+            var options = new List<SwatchDropdown.Option>();
+
+            foreach (var entry in VSyncModes.All)
+                options.Add(new SwatchDropdown.Option(entry.Label, null));
+
+            _vsync = BuildDropdownRow("VSyncRow", "Vertical Sync", options,
+                                      SettingsStore.Current.VSyncMode, PickVSync);
+        }
+
+        private void PickVSync(int index)
+        {
+            SettingsStore.Current.VSyncMode =
+                Mathf.Clamp(index, 0, VSyncModes.All.Length - 1);
+
+            VSyncModes.Apply(SettingsStore.Current.VSyncMode);
+            RefreshApplyState();
+        }
+
+        /// <summary>
+        /// The render style picker.
+        ///
+        /// ⚠️⚠️ IT IS ON THIS SCREEN SO THE TWO LOOKS CAN BE COMPARED WITHOUT A REBUILD. 🧑 wants
+        /// to judge a softer post-processed look with visible colour fringing against the ink
+        /// outlines the game ships with, and judging two looks means flipping between them on the
+        /// same frame rather than describing them. See <see cref="RenderStyles"/> for what each
+        /// row switches and why Toon is row 0 and the default.
+        ///
+        /// ⚠️ NO SWATCHES, for the same reason the anti-aliasing row has none: these are two
+        /// named looks, not colours, and the only thing a player needs to see is which one is on
+        /// and what else there is. The picture behind the panel is the swatch.
+        /// </summary>
+        private void BuildRenderStyleRow()
+        {
+            var options = new List<SwatchDropdown.Option>();
+
+            foreach (var entry in RenderStyles.All)
+                options.Add(new SwatchDropdown.Option(entry.Label, null));
+
+            _renderStyle = BuildDropdownRow("RenderStyleRow", "Render Style", options,
+                                            SettingsStore.Current.RenderStyle, PickRenderStyle);
+        }
+
+        /// <summary>
+        /// The scaffolding both picker rows sit in.
+        ///
+        /// ⚠️ SHARED RATHER THAN COPIED, AND THE REASON IS THE COLUMN. `ActionLabelWidth` is what
+        /// lines a row's label up with the fifteen rebind rows above it, and
+        /// <see cref="HighlightControlSize"/> is what keeps the control the same width as the
+        /// one below. Two copies of this method are two places for one of those to be edited,
+        /// and a settings list where one row's control starts forty pixels further right than
+        /// its neighbour's has already been reported once on this panel.
+        ///
+        /// ⚠️ BUILT IN CODE AND PLACED NEXT TO THE FULLSCREEN BOX, rather than authored into
+        /// `SettingsPanel.unity`. The scene is a conversion of the .tscn and gets rebaked by
+        /// `TscnImporter`, so a row added to the asset by hand is a row that disappears the next
+        /// time somebody reimports the maps. Everything on this screen that the importer does
+        /// not own is built here, which is the same reason the rebind rows are.
+        /// </summary>
+        private Dropdown BuildDropdownRow(string rowName, string label,
+                                          IList<SwatchDropdown.Option> options,
+                                          int initial, Action<int> onChanged)
+        {
+            var anchor = Node("FullscreenCheck");
+            if (anchor == null || anchor.parent == null) return null;
+
+            var rowGo = new GameObject(rowName);
+            rowGo.AddComponent<RectTransform>();
+            rowGo.transform.SetParent(anchor.parent, false);
+
+            // Directly under the fullscreen box, so it reads as part of DISPLAY rather than as
+            // the first row of whatever section follows.
+            rowGo.transform.SetSiblingIndex(anchor.GetSiblingIndex() + 1);
+
+            var row = rowGo.AddComponent<HorizontalLayoutGroup>();
+            row.childControlHeight = true;
+            row.childControlWidth = true;
+            row.childForceExpandHeight = false;
+            row.childForceExpandWidth = false;
+            row.childAlignment = TextAnchor.MiddleLeft;
+            row.spacing = 0.0f;
+
+            var text = MenuKit.Styled(rowGo.transform, "MenuBody", label, TextAnchor.MiddleLeft);
+            text.raycastTarget = false;
+
+            var labelElement = text.gameObject.AddComponent<LayoutElement>();
+            labelElement.preferredWidth = ActionLabelWidth;
+            labelElement.minHeight = HighlightControlSize.y;
+
+            var dropdown = SwatchDropdown.Build(rowGo.transform, options, initial,
+                                                HighlightControlSize, onChanged);
+
+            var element = dropdown.gameObject.AddComponent<LayoutElement>();
+            element.preferredWidth = HighlightControlSize.x;
+            element.preferredHeight = HighlightControlSize.y;
+            element.flexibleWidth = 1.0f;
+
+            return dropdown;
+        }
+
+        /// <summary>⚠️ WIDER THAN A KEYCAP. This row carries a swatch, a label and a chevron
+        /// rather than one short key name, and at the rebind rows' 170 the colour names
+        /// collided with the arrow.</summary>
+        private static readonly Vector2 HighlightControlSize = new Vector2(300.0f, 46.0f);
+
+        /// <summary>
+        /// ⚠️ IT ANNOUNCES THE CHANGE, and that is the half that makes the control feel real.
+        /// This panel is reachable from the in-match pause menu, so every tsinelas already
+        /// lying on the arena repaints on this pick rather than at its next landing.
+        /// </summary>
+        private void PickSlipperHighlight(int index)
+        {
+            SettingsStore.Current.SlipperHighlight =
+                Mathf.Clamp(index, 0, SlipperHighlights.All.Length - 1);
+
+            SettingsStore.RaiseSlipperHighlightChanged();
+            RefreshApplyState();
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ IT APPLIES ON THE PICK RATHER THAN ON APPLY, AND THAT IS DELIBERATE ON A PANEL
+        /// WHERE MOST THINGS DO NOT. This is the same rule the volume sliders and the highlight
+        /// colour already follow: a setting whose whole content is how the screen looks has to
+        /// change the screen while the player is looking at it, or the control is a claim they
+        /// cannot check. This panel is reachable from the in-match pause menu, so on the pick
+        /// there is a real frame behind it to judge.
+        ///
+        /// ⚠️ AND BACK STILL UNDOES IT, which is the half that makes applying early safe.
+        /// `SettingsStore.Restore` calls `GameSettings.Apply`, and `Apply` pushes the mode back
+        /// through `AntiAliasModes.Apply`, so a discarded pick is off the screen as well as out
+        /// of the file. Nothing here writes the disk.
+        /// </summary>
+        private void PickAntiAlias(int index)
+        {
+            SettingsStore.Current.AntiAliasMode =
+                Mathf.Clamp(index, 0, AntiAliasModes.All.Length - 1);
+
+            AntiAliasModes.Apply(SettingsStore.Current.AntiAliasMode);
+            RefreshApplyState();
+        }
+
+        /// <summary>
+        /// ⚠️ IT APPLIES ON THE PICK, for the reason <see cref="PickAntiAlias"/> gives at length
+        /// and with more force than anything else on this panel: the whole content of this
+        /// setting is what the screen looks like, and it exists so two looks can be COMPARED.
+        /// A style that only took effect on APPLY, or on the next match, would make the one
+        /// question it was added to answer impossible to ask.
+        ///
+        /// ⚠️ AND BACK STILL UNDOES IT. `SettingsStore.Restore` calls `GameSettings.Apply`, which
+        /// pushes the snapshot's index back through `RenderStyles.Apply`, and that re-writes the
+        /// `_OutlineSuppress` global as well as the two statics. Nothing here writes the disk.
+        /// </summary>
+        private void PickRenderStyle(int index)
+        {
+            SettingsStore.Current.RenderStyle =
+                Mathf.Clamp(index, 0, RenderStyles.All.Length - 1);
+
+            RenderStyles.Apply(SettingsStore.Current.RenderStyle);
+            RefreshApplyState();
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE OPERATION ITSELF MOVED TO `Settings.RebindSession` ON 2026-09-04 AND THIS IS
+        /// NOW ONLY THE PANEL'S HALF OF IT. Every ⚠️ note that used to live here lives there, in
+        /// full: the target index, the candidate restriction, the disabled action, the undone
+        /// override before the conflict check. **It moved because there are two rebinding screens
+        /// now** — this one and `InputLayer.ControllerMapScreen` — and a copy of eight
+        /// hard-earned notes is a copy that has seven of them the next time somebody finds the
+        /// ninth. `docs/TODO.md` § 38.5 is what a second path costs in this repository.
+        /// </summary>
+        private void BeginRebind(string action)
+        {
+            if (_rebindOp != null) return;   // one at a time
+
+            bool pad = _bindingDevice == InputDeviceKind.Gamepad;
+
+            string refusal = RebindSession.RefusalFor(_actions, action, _bindingDevice);
+
+            if (refusal != null)
+            {
+                SetText("SettingsStatusLabel", refusal);
+                MenuSfx.Error();
+                return;
+            }
+
+            _listening = action;
+
+            SetText("SettingsStatusLabel",
+                    pad
+                        ? $"Press a button for \"{Rebinding.LabelFor(action)}\"…  (B or Esc to cancel)"
+                        : $"Press any key for \"{Rebinding.LabelFor(action)}\"…  (Esc to cancel)");
+
+            SetButtonText(action, "…");
+
+            _rebindOp = RebindSession.Begin(_actions, action, _bindingDevice, (outcome, conflict) =>
+            {
+                _rebindOp = null;
+
+                switch (outcome)
+                {
+                    case RebindOutcome.Bound:
+                        SetText("SettingsStatusLabel", $"\"{Rebinding.LabelFor(action)}\" rebound.");
+                        MenuSfx.Click();
+                        break;
+
+                    case RebindOutcome.Conflict:
+                        SetText("SettingsStatusLabel",
+                                $"That key is already \"{conflict}\". Choose a different key.");
+                        MenuSfx.Error();
+                        break;
+
+                    default:
+                        MenuSfx.Back();
+                        SetText("SettingsStatusLabel", "Rebind cancelled.");
+                        break;
+                }
+
+                RefreshBindingLabels();
+                _listening = "";
+                RefreshApplyState();
+            });
+
+            if (_rebindOp == null) CancelRebind();
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ `Dispose` RATHER THAN `Cancel`, AND THE DIFFERENCE IS ONE SOUND PLAYED TWICE.
+        /// `RebindSession.Cancel` reports `Cancelled` through the callback, which plays
+        /// `MenuSfx.Back()` and writes the status line; **this method's two callers already do
+        /// both** (`Update`'s Escape branch plays Back and then calls here). `Dispose` still
+        /// re-enables the disabled action, which is the half that matters: a session abandoned
+        /// without it leaves a verb switched off for the rest of the run, and the symptom is one
+        /// control that has quietly stopped working in a match nobody connects to a closed menu.
+        /// </summary>
+        private void CancelRebind()
+        {
+            var session = _rebindOp;
+            _rebindOp = null;
+
+            session?.Dispose();
+
+            _listening = "";
+            SetText("SettingsStatusLabel", "Rebind cancelled.");
+            RefreshBindingLabels();
+        }
+
+        private void SetButtonText(string action, string value)
+        {
+            if (!_rebindButtons.TryGetValue(action, out var button) || button == null) return;
+
+            var text = button.GetComponentInChildren<Text>();
+            if (text != null) text.text = value;
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ EVERY ROW READS THE BINDING FOR THE PAGE THE PLAYER IS ON, NOT BINDING 0. The
+        /// old line called `DisplayNameFor(asset, action)`, which resolves the first binding,
+        /// which is always the keyboard one: on a pad this panel showed a list of keys.
+        ///
+        /// ⚠️ A ROW WITH NOTHING BOUND ON THIS DEVICE READS "-" AND SAYS SO RATHER THAN LOOKING
+        /// BROKEN. `ScreenInputCatalogue` records a `null` pad path as a written-down answer
+        /// (`ToggleFullscreen`: a phone has no window, and a pad player is not the player who
+        /// alt-tabs), so "-" here is the truth about that control on that device.
+        /// `Rebinding.DisplayNameFor`'s own note is the same argument from the prompt side:
+        /// falling back to the keyboard would print SPACE on a pad row and **teach a control that
+        /// does not exist**, which `docs/VISION.md` § 3 calls worse than teaching none.
+        /// </summary>
+        private void RefreshBindingLabels()
+        {
+            foreach (var pair in _rebindButtons)
+            {
+                string label = Rebinding.DisplayNameFor(_actions, pair.Key, _bindingDevice);
+
+                // ⚠️⚠️ A ROW WITH NOTHING OF ITS OWN ON THIS DEVICE IS NOT AUTOMATICALLY A DEAD
+                // ROW, AND THE FOUR MOVEMENT ROWS ARE WHY. On a pad they have no binding of their
+                // own (the stick is one control that does all four jobs and belongs to none of
+                // them), so a plain read would print "-" four times at the top of the list and
+                // the page would look broken on the most important rows in it.
+                // `Rebinding.SharedDisplayNameFor` answers what actually moves you, and the
+                // button is greyed rather than removed: `CLAUDE.md` § 6.3 wants a control that
+                // does nothing to not look pressable, and a row that VANISHES on one page is a
+                // list that jumps under the reader's eye every time they switch.
+                bool ownBinding = Rebinding.HasBindingFor(_actions, pair.Key, _bindingDevice);
+
+                if (!ownBinding)
+                {
+                    string shared = Rebinding.SharedDisplayNameFor(_actions, pair.Key,
+                                                                   _bindingDevice);
+                    if (shared.Length > 0) label = shared;
+                }
+
+                SetButtonText(pair.Key, label);
+
+                // ⚠️ `interactable` RATHER THAN HIDING IT, and it also takes the row off the
+                // controller focus path for free: `ScreenFocus.Rebuild` skips a `Selectable` that
+                // is not interactable, so a pad walking this list steps over the rows it cannot
+                // change instead of stopping on each of them to be told no.
+                if (pair.Value != null) pair.Value.interactable = ownBinding;
+            }
+        }
+
+        // --- Sliders and checks ------------------------------------------------------
+
+        /// <summary>
+        /// ⚠️⚠️ THE VALUE IS SEEDED BEFORE THE CALLBACK IS CONNECTED, NOT AFTER. Assigning to a
+        /// slider fires its changed event synchronously in both engines, so connecting first
+        /// means opening this panel writes the settings file three times before the player has
+        /// touched anything.
+        /// </summary>
+        private void WireSliders()
+        {
+            Slider("SensitivitySlider", "SensitivityValueLabel",
+                   SettingsStore.Current.MouseSensitivity,
+                   v => SettingsStore.Current.MouseSensitivity = v,
+                   v => $"{v:0.0}x", preview: false);
+
+            Slider("MasterVolumeSlider", "MasterVolumeValueLabel",
+                   SettingsStore.Current.MasterVolume,
+                   v => SettingsStore.Current.MasterVolume = v,
+                   Percent, preview: true);
+
+            Slider("SfxVolumeSlider", "SfxVolumeValueLabel",
+                   SettingsStore.Current.SfxVolume,
+                   v => SettingsStore.Current.SfxVolume = v,
+                   Percent, preview: true);
+
+            // ⚠️ NO PREVIEW CLICK ON THE MUSIC ROW. The preview is the ordinary UI click, which
+            // is on the SFX bus: it demonstrates Master and SFX honestly and would say nothing
+            // truthful about the music level.
+            Slider("MusicVolumeSlider", "MusicVolumeValueLabel",
+                   SettingsStore.Current.MusicVolume,
+                   v => SettingsStore.Current.MusicVolume = v,
+                   Percent, preview: false);
+        }
+
+        private static string Percent(float v) => $"{Mathf.RoundToInt(v * 100.0f)}%";
+
+        /// <summary>
+        /// ⚠️⚠️ THE THREE VOLUME SLIDERS WERE FILLED IN BRIGHT BLUE AND HAD BEEN FOR THE WHOLE
+        /// PORT. `CLAUDE.md` § 6.4, stated as wide as it can be stated: *"no blue, no navy, no
+        /// cold grey, in any UI colour, in any layer. Outlines, fills, panel backgrounds,
+        /// scrims, rings, gradients, glyph tints, disabled states."* 🧑 has said it six times.
+        ///
+        /// ⚠️⚠️ AND NOBODY HAD SEEN IT, WHICH IS THE WHOLE OF WHY `CLAUDE.md` § 6.2b EXISTS. The
+        /// audio rows were below the fold of a single scroll that opened on MOVEMENT, so every
+        /// render of this screen ever taken (`Settings-v57` through `v91`) stopped above them.
+        /// Splitting the panel into tabs made AUDIO a page you land on, and the fills were the
+        /// first thing on it. **The tabs did not cause this; they photographed it.**
+        ///
+        /// ⚠️ PERSIMMON, WHICH IS THE ROLE AND NOT A PICK. § 6.4's table gives `#FD8041` exactly
+        /// one job: *"the MARKER: the one value or selection that matters"*. A slider fill is the
+        /// current value of the one thing the row is about, so it is that role by definition.
+        /// The track stays `PaperSunk`, which is the paper ramp's own recessed tint, so the
+        /// filled and unfilled halves are the same two surfaces every other paper control uses.
+        /// </summary>
+        /// <summary>
+        /// ⚠️⚠️ THE SPRITE GOES FIRST, AND SETTING ONLY THE COLOUR PRODUCED A THIRD WRONG COLOUR.
+        /// `Image.color` MULTIPLIES the sprite rather than replacing it, and the authored fill
+        /// sprite is blue: persimmon `fd8041` times `0080e8` is about `004033`, a dark teal, which
+        /// is what `Logs/shots-runtime/Settings-v92-AUDIO.png` shows. It is not blue any more and
+        /// it is not the colour anybody asked for either, which is a worse failure than the
+        /// original because it looks deliberate.
+        ///
+        /// ⚠️ `null` DRAWS A FLAT RECT, which is what these bars already are: the authored groove
+        /// is a straight band with square ends, so nothing is lost with the sprite and the colour
+        /// then means what it says.
+        /// </summary>
+        private static void Flatten(Image image, Color colour)
+        {
+            if (image == null) return;
+
+            image.sprite = null;
+            image.color = colour;
+        }
+
+        private static void PaintSlider(Slider slider)
+        {
+            if (slider.fillRect != null)
+                Flatten(slider.fillRect.GetComponent<Image>(), UiTheme.BrandPersimmon);
+
+            // ⚠️ THE TRACK IS THE SLIDER'S OWN BACKGROUND CHILD, and it is found by name because
+            // `Slider` exposes the fill and the handle but not the groove. The importer names it
+            // `Background`, which is also what a dozen other converted nodes are called, so this
+            // is scoped to this slider's children rather than looked up on the panel.
+            var background = slider.transform.Find("Background");
+            if (background != null) Flatten(background.GetComponent<Image>(), UiTheme.PaperSunk);
+
+            // ⚠️ THE HANDLE KEEPS ITS SPRITE. It is the one part of the row with a shape worth
+            // having, and `Paper` over it is a tint of a light sprite rather than a fight with a
+            // coloured one.
+            if (slider.handleRect != null)
+            {
+                var handle = slider.handleRect.GetComponent<Image>();
+                if (handle != null) handle.color = UiTheme.Paper;
+            }
+        }
+
+        private void Slider(string sliderNode, string labelNode, float seed, Action<float> setter,
+                            Func<float, string> format, bool preview)
+        {
+            var t = Node(sliderNode);
+            if (t == null) return;
+
+            var slider = t.GetComponent<Slider>();
+            if (slider == null) return;
+
+            // ⚠⚠ WITHOUT THIS THE ROW IS DECORATION. The converted slider reaches us with every
+            // graphic under it muted, so it takes no pointer event at all. See
+            // MenuKit.EnsureHitArea for the whole story; it is repaired here rather than only in
+            // the importer because the converted prefabs are committed assets and a player
+            // running the shipped build never re-runs the converter.
+            MenuKit.EnsureHitArea(slider);
+            PaintSlider(slider);
+
+            slider.SetValueWithoutNotify(seed);
+            SetText(labelNode, format(seed));
+
+            // ⚠️⚠️ THE CLICK PLAYS ON RELEASE, NOT ON EVERY VALUE CHANGE. `onValueChanged`
+            // fires once per frame of a drag, so playing MenuSfx.Click() straight from the
+            // listener turned one drag into dozens of overlapping clicks a second. The
+            // gate below tracks whether the pointer is currently down on the slider; while it
+            // is, a change only marks the sfx pending, and SliderCommitGate.Released fires it
+            // once when the drag ends. A keyboard nudge (no pointer ever down) still plays
+            // immediately, because it is already one discrete completed movement.
+            var gate = slider.GetComponent<SliderCommitGate>();
+            if (gate == null) gate = slider.gameObject.AddComponent<SliderCommitGate>();
+
+            bool pendingSfx = false;
+            gate.Released += () =>
+            {
+                if (!pendingSfx) return;
+                pendingSfx = false;
+                if (preview) MenuSfx.Click();
+            };
+
+            slider.onValueChanged.AddListener(v =>
+            {
+                setter(v);
+                SetText(labelNode, format(v));
+
+                // ⚠⚠ NO `Apply()` HERE, AND IT USED TO BE CALLED ON EVERY VALUE CHANGE.
+                // `GameSettings.Apply` is ApplyDisplay plus the AI difficulty, and ApplyDisplay
+                // is a `Screen.SetResolution`: dragging one volume slider across its groove fired
+                // a window resize on every frame of the drag, which stalls the drag it is
+                // reacting to. No slider on this panel feeds either system. The volumes are read
+                // live off the store by the music bed, the announcer and the SFX bus, and the
+                // sensitivity is read live by the camera, which is what makes a drag audible and
+                // visible immediately without pushing anything anywhere.
+                if (preview)
+                {
+                    if (gate.IsPressed) pendingSfx = true;
+                    else MenuSfx.Click();
+                }
+
+                RefreshApplyState();
+            });
+        }
+
+        /// <summary>
+        /// Tracks whether the pointer is currently held down on a slider, so its owner can defer
+        /// a "movement finished" action until <see cref="Released"/> fires instead of running it
+        /// on every intermediate value change of a drag.
+        /// </summary>
+        private sealed class SliderCommitGate : MonoBehaviour, IPointerDownHandler, IPointerUpHandler, IEndDragHandler
+        {
+            public bool IsPressed { get; private set; }
+            public event Action Released;
+
+            public void OnPointerDown(PointerEventData e) => IsPressed = true;
+
+            public void OnPointerUp(PointerEventData e)
+            {
+                IsPressed = false;
+                Released?.Invoke();
+            }
+
+            public void OnEndDrag(PointerEventData e)
+            {
+                IsPressed = false;
+                Released?.Invoke();
+            }
+        }
+
+        private void WireChecks()
+        {
+            Check("InvertYCheck", SettingsStore.Current.InvertY,
+                  v => SettingsStore.Current.InvertY = v);
+
+            Check("FullscreenCheck", SettingsStore.Current.Fullscreen, v =>
+            {
+                SettingsStore.Current.Fullscreen = v;
+
+                // ⚠️ APPLIED, NOT ONLY STORED. Fullscreen was saved and displayed and never
+                // actually set for the whole port, so the box claimed the opposite of the window.
+                SettingsStore.Current.ApplyDisplay();
+            });
+        }
+
+        private void Check(string node, bool seed, Action<bool> setter)
+        {
+            var t = Node(node);
+            if (t == null) return;
+
+            var toggle = t.GetComponent<Toggle>();
+            if (toggle == null) return;
+
+            // ⚠️⚠️ THE HIT AREA, FOR THE SAME REASON THE SLIDERS GET ONE HERE AND NOT IN THE
+            // IMPORTER. Both boxes on this panel converted, skinned, seeded and wired their
+            // listener, and neither could be pressed: a Toggle's tick box is on a child node, so
+            // the shipped scene has no raycast target under the row at all. See
+            // `MenuKit.EnsureHitArea(Toggle)`. Runtime, because the player never re-runs the bake.
+            MenuKit.EnsureHitArea(toggle);
+
+            // ⚠️⚠️ THE TICK WAS MAGENTA (`UiTheme.Impact`, `f468a8`) AND THAT COLOUR IS NOT IN
+            // THE FRONT END'S PALETTE AT ALL. `Impact` is a HUD colour for a gameplay event;
+            // § 6.4's table is the eight measured logo colours and magenta is none of them.
+            // Found the same way as the blue slider fills: FULLSCREEN was below the fold of the
+            // old single scroll, so no render of this screen had ever included it.
+            //
+            // ⚠️ PERSIMMON, THE SAME MARKER ROLE THE SLIDER FILLS TAKE, because a ticked box and
+            // a filled bar are the same statement: this is the value that is set. Through
+            // `Flatten` for `PaintSlider`'s reason: the authored tick is a magenta sprite and a
+            // colour set over it multiplies rather than replaces.
+            Flatten(toggle.graphic as Image, UiTheme.BrandPersimmon);
+
+            // ⚠️ SEEDED WITHOUT NOTIFYING, like the sliders: assigning `isOn` emits the change,
+            // and a fullscreen toggle that fires on every open flips the window mode for free.
+            toggle.SetIsOnWithoutNotify(seed);
+
+            toggle.onValueChanged.AddListener(v =>
+            {
+                setter(v);
+                MenuSfx.Click();
+                RefreshApplyState();
+            });
+        }
+
+        private void WireNameField()
+        {
+            var t = Node("PlayerNameField");
+            if (t == null) return;
+
+            var field = t.GetComponent<InputField>();
+            if (field == null) return;
+
+            // ⚠️⚠️ A PAPER TRAY, BECAUSE THE AUTHORED FIELD IS A BARE `Image` WITH A BAKED WOOD
+            // SPRITE AND `PaperDress` CANNOT SEE IT. `Logs/shots-runtime/Settings-v57.png`: the
+            // one text box on this panel is a near-black well with a grey placeholder in it,
+            // sitting in a cream sheet, and every keycap beside it is cream. It is the same fault
+            // as the hub's backdrop and the lobby drawer's address box, which is now three
+            // separate nodes in three files: **a surface set outside `GodotPanel`, `GodotButton`
+            // and `WoodSkin` is a surface the conversion is blind to.**
+            //
+            // ⚠️ AND THE LETTERING GOES WITH IT. `PaperDress.Type` had already remapped the text
+            // and the placeholder to ink, which is what made this unreadable rather than merely
+            // old: dark ink on `WoodDark` is about 1.3:1. Setting them here keeps the two halves
+            // in one place.
+            PaperKit.Paperise(t.gameObject, PaperCraft.Surface.Tray);
+
+            if (field.textComponent != null) field.textComponent.color = UiTheme.PaperInk;
+            if (field.placeholder is Text ghost) ghost.color = UiTheme.PaperInkSoft;
+
+            // ⚠️⚠️ AND THE SELECTION HIGHLIGHT, WHICH IS THE ONE PIECE OF THIS FIELD THAT WAS
+            // STILL UNITY'S `a8ceff`. `MenuKit.Dress`'s own header says a fifth field added
+            // later inherits the fix by calling it; this field is AUTHORED rather than built,
+            // so it inherited nothing and was the last blue left in the front end.
+            // `PaperPurityProbe.NoFieldHighlightsInBlue` found it and named it: blue 1.00 over
+            // red 0.66, against `CLAUDE.md` § 6.4's *"more blue in it than red"*.
+            MenuKit.Dress(field);
+
+            field.characterLimit = Balance.PlayerNameMax;
+            field.text = SettingsStore.Current.PlayerName;
+
+            // ⚠️⚠️ ON EVERY KEYSTROKE, AND WITHOUT IT APPLY COULD NOT BE REACHED AT ALL. The
+            // obvious way to leave the field is to click APPLY, but APPLY is disabled until
+            // something is dirty, a disabled button takes no focus and emits nothing, so the
+            // click did nothing and the name was never staged. Typing is the change, so typing
+            // is what reports it. Safe per keystroke: nothing here touches the disk.
+            field.onValueChanged.AddListener(v =>
+            {
+                SettingsStore.Current.PlayerName = GameSettings.SanitiseName(v);
+                RefreshApplyState();
+            });
+        }
+
+        // --- The apply / discard pair -------------------------------------------------
+
+        private void Apply()
+        {
+            SettingsStore.Current.Validate();
+            SettingsStore.Save();
+            SettingsStore.Current.Apply();
+
+            if (_actions != null) Rebinding.Save(_actions);
+
+            AIController.ApplyDifficulty(SettingsStore.Current.AiDifficulty);
+
+            // Straight into a new transaction: the panel is still open, so the next change the
+            // player makes has to be revertible too.
+            Snapshot();
+            _backArmed = false;
+
+            SetText("SettingsStatusLabel", "Settings saved.");
+            RefreshApplyState();
+        }
+
+        private void ResetAll()
+        {
+            if (_actions != null) Rebinding.ResetAll(_actions);
+            RefreshBindingLabels();
+
+            // ⚠️ RESET IS A STAGED EDIT LIKE ANY OTHER and the wording has to say so, or the
+            // button promises something that has not happened until APPLY is pressed.
+            SetText("SettingsStatusLabel", "Controls reset. Save changes to keep them.");
+            RefreshApplyState();
+        }
+
+        private void Back()
+        {
+            if (_brandSettings != null && Dirty()) { OpenSettingsDiscard(); return; }
+            if (Dirty() && !_backArmed)
+            {
+                _backArmed = true;
+                MenuSfx.Error();
+
+                SetButtonLabel(_back, "◀  DISCARD & GO BACK");
+                SetText("SettingsStatusLabel",
+                        "You have unsaved changes. Press BACK again to discard them.");
+
+                RefreshApplyState();
+                return;
+            }
+
+            Revert();
+            Close();
+        }
+
+        /// <summary>
+        /// ⚠️ REVERT, NOT JUST CLOSE. Nothing has been written since the snapshot, so the FILE
+        /// is already right, but the running process is not: a rebind is live in the input map
+        /// and a volume is live on the bus. Leaving without this hands a player who pressed BACK
+        /// the settings they just rejected, until a restart quietly puts the saved ones back.
+        /// </summary>
+        private void Revert()
+        {
+            if (!string.IsNullOrEmpty(_snapshot))
+                SettingsStore.Restore(JsonUtility.FromJson<GameSettings>(_snapshot));
+
+            if (_actions != null) Rebinding.Load(_actions);
+
+            // ⚠️ THE PICKER'S FACE IS PART OF THE STATE BEING REVERTED. `Restore` puts the value
+            // back and repaints the arena, but the control still shows whatever the player
+            // chose, and a swatch reading Red beside slippers lit Blue is the setting looking
+            // broken.
+            //
+            // ⚠️ SetValueWithoutNotify, NOT `value`. Assigning `value` fires onValueChanged,
+            // which would write the reverted index straight back into the settings as a fresh
+            // edit and re-dirty the panel we are in the middle of cleaning up.
+            if (_highlight != null)
+                _highlight.SetValueWithoutNotify(SettingsStore.Current.SlipperHighlight);
+            if (_reducedMotion != null)
+                _reducedMotion.SetIsOnWithoutNotify(SettingsStore.Current.ReducedUiMotion);
+
+            // ⚠️ THE SAME FOR THE ANTI-ALIASING FACE, and it has the stronger claim of the two:
+            // `Restore` re-applies the mode to the engine, so the frame behind this panel is
+            // already back to what it was. A picker still reading "Off" over a filtered frame is
+            // the reverted state showing through the one place that has not been told.
+            if (_vsync != null)
+                _vsync.SetValueWithoutNotify(SettingsStore.Current.VSyncMode);
+
+            if (_antiAlias != null)
+                _antiAlias.SetValueWithoutNotify(SettingsStore.Current.AntiAliasMode);
+
+            if (_graphicsQuality != null)
+                _graphicsQuality.SetValueWithoutNotify(SettingsStore.Current.GraphicsQuality);
+
+            // ⚠️ AND THE SAME FOR THE STYLE, which has the strongest claim of the three: a picker
+            // reading "Chromatic" over a frame that has just been given its ink outlines back is
+            // the discard looking like it failed.
+            if (_renderStyle != null)
+                _renderStyle.SetValueWithoutNotify(SettingsStore.Current.RenderStyle);
+
+            _backArmed = false;
+            SetButtonLabel(_back, "◀  BACK");
+            SetText("SettingsStatusLabel", "");
+        }
+
+        private static void SetButtonLabel(Button button, string value)
+        {
+            if (button == null) return;
+
+            var text = button.GetComponentInChildren<Text>();
+            if (text != null) text.text = value;
+        }
+
+        /// <summary>APPLY is live only when there is something to apply, and BACK goes back to
+        /// saying BACK the moment the player undoes whatever armed it.</summary>
+        private void RefreshApplyState()
+        {
+            bool dirty = Dirty();
+
+            if (_apply != null) _apply.interactable = dirty;
+
+            if (dirty || !_backArmed) return;
+
+            _backArmed = false;
+            SetButtonLabel(_back, "◀  BACK");
+        }
+
+        protected override void Update()
+        {
+            if (_nativeSettings != null) return;
+            if (_discardDialog != null && _discardDialog.activeSelf)
+            {
+                if (InputLayer.MenuNav.CancelPressed)
+                {
+                    _discardDialog.SetActive(false);
+                    ScreenTakeover.ConsumeEscape();
+                    InputLayer.ScreenFocus.OwnerOf(this)?.Rebuild();
+                }
+                return;
+            }
+            // ⚠️ BEFORE THE ESC GUARD BELOW, because that guard RETURNS on a listening rebind and
+            // the keyboard scroll has its own refusal for exactly that case. Putting it after
+            // would have made this work only when nothing else was going on.
+            StepScrollFromKeyboard();
+
+            // ⚠️ ESC IS THE REBIND'S CANCEL WHILE ONE IS LISTENING, not the panel's exit. The
+            // rebinding operation already owns that key; letting the base class also act on it
+            // closes the whole panel on a cancelled rebind.
+            //
+            // ⚠️⚠️ EXCEPT ON THE GAMEPAD PAGE, WHERE THE OPERATION CANCELS THROUGH THE PAD'S B
+            // BUTTON AND NOBODY OWNS ESCAPE. Leaving the plain `return` there would have made
+            // Escape do NOTHING during a pad rebind, which is a dead end on the one screen
+            // `CLAUDE.md` § 6.3 names twice: *"Escape backs out on every screen, always, innermost
+            // layer first"*, and *"a player who learns Escape is reliable and then meets one
+            // screen where it is not has learned that it is unreliable."* So the panel cancels the
+            // rebind itself here and consumes the key, which is the innermost layer, and the next
+            // press closes the panel.
+            if (_rebindOp != null || _listening != "")
+            {
+                if (_bindingDevice != InputDeviceKind.Gamepad) return;
+
+                // ⚠️⚠️ ESCAPE ONLY, AND THIS IS THE ONE PLACE IN THE FRONT END THAT MUST NOT GO
+                // THROUGH `InputLayer.MenuNav`. `MenuNav.CancelPressed` is Escape OR the pad's
+                // B, and the rebind operation four hundred lines up already cancels through
+                // `<Gamepad>/buttonEast` itself. Routing this line through it would make one
+                // press of B run `CancelRebind` twice: once from the operation's `OnCancel` and
+                // once from here, with a second `MenuSfx.Back()` on top of it. The pad's own
+                // cancel is not missing here, it is handled one layer down.
+                if (!Input.GetKeyDown(KeyCode.Escape)) return;
+
+                MenuSfx.Back();
+                CancelRebind();
+                return;
+            }
+
+            if (!InputLayer.MenuNav.CancelPressed) return;
+
+            // ⚠️⚠️ A TAKEOVER OVER THIS PANEL GETS THE PRESS, NOT THIS PANEL, AND THIS OVERRIDE
+            // NEVER ASKED. `ConvertedScreen.Update` carries the check and its receipt in full
+            // (*"one press closed the character maker AND backed the screen underneath it out to
+            // the main menu"*), and this method overrides it without calling base. That cost
+            // nothing while no takeover ever opened over settings — and `ControllerMapScreen`
+            // opens from a row in this very list. Without this line, one Escape on the map closes
+            // the map AND the panel behind it. `CLAUDE.md` § 6.3: innermost layer first.
+            if (ScreenTakeover.EscapeIsSpoken) return;
+
+            MenuSfx.Back();
+            Back();
+        }
+
+        private void OnDestroy() => _rebindOp?.Dispose();
+    }
+}

@@ -1,0 +1,162 @@
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI
+{
+    public sealed partial class TumpMatchReadout
+    {
+        public void Build(Transform owner)
+        {
+            Canvas = OwnerUiLayout.Canvas(owner, "OwnerMatchCanvas", 100);
+            Canvas.GetComponent<InputLayer.ScreenFocus>().enabled = false; _root = UiSafeArea.Content(Canvas, "HudSafeArea");
+            _openingUi = Canvas.gameObject.AddComponent<CanvasGroup>();
+            RefreshOpeningVisibility();
+            _effects = gameObject.AddComponent<TumpHudEffects>(); _effects.Build((RectTransform)Canvas.transform);
+            // VISUAL-1.4: the match bar replaces the corner score slabs and the clock box.
+            // `BuildCourtScores` and `BuildCourtClock` below are the previous layout, kept for
+            // the record and no longer called.
+            BuildMatchBar(); BuildCourtCan(); BuildCourtPersonal(); BuildStaminaArc(); BuildCourtPrompts();
+            // The signal icon rides with the timer: the four-chip row it used to follow is off in play.
+            var connection = OwnerUiLayout.Rect(_clockRoot, "ConnectionQuality").gameObject.AddComponent<ConnectionQualityIcon>();
+            connection.rectTransform.anchorMin = connection.rectTransform.anchorMax = new Vector2(1, .5f);
+            connection.rectTransform.pivot = new Vector2(.5f, .5f);
+            connection.rectTransform.anchoredPosition = new Vector2(26, 0); connection.rectTransform.sizeDelta = new Vector2(22, 22);
+            BuildStatusChips(); BuildBoard(); BuildWarnings();
+            var eventFeed = MatchEventFeed.Create(_root);
+            _momentBanner = MatchMomentBanner.Create(_root);
+            _powers = gameObject.AddComponent<TumpPowerReadout>(); _powers.Build(_root);
+            // ⚠️ 2026-10-20 OVERHAUL: an announcement is big italic ivory words on a strip of smoked
+            // glass, Overwatch's "OVERTIME" and "ROUND 2", landing with the same short pop. It was a
+            // cream toy tile with brown words (UI revamp 2026-10-06); the earned moment is still red.
+            _toastPlate = OwnerUiLayout.Rect(_root, "MatchToastPlate").gameObject.AddComponent<HudCard>();
+            _toastPlate.Glass(HudDraw.Glass).raycastTarget = false; _toastPlate.enabled = false;
+            Pin(_toastPlate.rectTransform, new Vector2(.5f, 1), new Vector2(0, -196), new Vector2(400, ToastHeight));
+            _toastPlate.rectTransform.localRotation = Quaternion.Euler(0, 0, ToastTilt);
+            // Painted lettering with no plate (`boot_match.toast`).
+            _toast = LiveHud.Lettering(_root, "MatchToast", "", 44, LiveHud.Yellow, LiveHud.YellowInk, LiveHud.YellowInk, 6, 4, 3);
+            Pin(_toast.rectTransform, new Vector2(.5f, 1), new Vector2(0, -196), new Vector2(1080, ToastHeight)); _toast.enabled = false;
+            BuildScorePops();
+            _countdown = Ink(_root, "Countdown", "", 108, true);
+            Pin(_countdown.rectTransform, new Vector2(.5f, .58f), Vector2.zero, new Vector2(740, 180)); _countdown.enabled = false;
+            // VISUAL-1.6: a drawn reticle that carries charge, pektus, cooldown, refusal and
+            // (for the taya) reach, instead of a "+" in the display face.
+            _reticle = OwnerUiLayout.Rect(Canvas.transform, "Reticle").gameObject.AddComponent<HudReticle>();
+            _reticle.color = CourtPresentationPalette.Paper; _reticle.raycastTarget = false; _crosshair = _reticle;
+            Pin(_reticle.rectTransform, new Vector2(.5f, .5f), Vector2.zero, new Vector2(96, 96));
+            // VISUAL-1.4: a drawn hit mark (four ticks on black keels) instead of a "x" in the
+            // display face. Same name, so the reading layout still scales it.
+            _hitMark = OwnerUiLayout.Rect(Canvas.transform, "HitConfirmation").gameObject.AddComponent<HudBadge>();
+            Pin(_hitMark.rectTransform, new Vector2(.5f, .5f), Vector2.zero, new Vector2(64, 64));
+            _hitMark.Kind = HudBadge.Glyph.Hit; _hitMark.RimWidth = 2; _hitMark.raycastTarget = false; _hitMark.enabled = false;
+            _spectator = Ink(_root, "SpectatorReadout", "", 28, false);
+            Pin(_spectator.rectTransform, new Vector2(.5f, 0), new Vector2(0, 42), new Vector2(1300, 40));
+            _sandbox = Ink(_root, "SandboxState", "", 28, false);
+            Pin(_sandbox.rectTransform, new Vector2(1, 0), new Vector2(-286, 71), new Vector2(550, 54));
+            var version = Ink(_root, "GameVersion", "", 28, false);
+            Pin(version.rectTransform, new Vector2(1, 0), new Vector2(-230, 22), new Vector2(420, 40)); GameVersion.ApplyTo(version);
+            CalloutCaption.Create(_root);
+            PeerConnectionNotice.Create(_root).ShareRailWith(eventFeed);
+            HudReadingLayout.Install(_root);
+            HudContrast.Install(_root);
+        }
+        private void BuildCourtScores()
+        {
+            _scoreRoot = OwnerUiLayout.Rect(_root, "MatchScores");
+            Pin(_scoreRoot, new Vector2(0, 1), new Vector2(288, -186), new Vector2(530, 320));
+            for (int i = 0; i < 4; i++)
+            {
+                var row = OwnerUiLayout.Rect(_scoreRoot, "ScoreRow" + i); OwnerUiLayout.Place(row, 0, i * 80, 530, 78); _scoreRows[i] = row;
+                _scoreAccents[i] = row.gameObject.AddComponent<OwnerScoreStrip>();
+                _scoreAccents[i].raycastTarget = false;
+                _portraits[i] = OwnerPortraitArt.Create(row, "PlayerPortrait", ""); OwnerUiLayout.Place(_portraits[i].rectTransform, 8, 5, 65, 65);
+                _names[i] = Ink(row, "PlayerName", "", 28, true); _names[i].alignment = TextAnchor.MiddleLeft;
+                OwnerUiLayout.Place(_names[i].rectTransform, 83, 1, 318, 43);
+                _scores[i] = Ink(row, "Score", "", 31, true); _scores[i].alignment = TextAnchor.MiddleRight;
+                OwnerUiLayout.Place(_scores[i].rectTransform, 418, 7, 96, 54);
+                _roles[i] = Ink(row, "RoleState", "", 28, false); _roles[i].alignment = TextAnchor.MiddleLeft;
+                OwnerUiLayout.Place(_roles[i].rectTransform, 84, 41, 430, 36);
+            }
+        }
+        private void BuildCourtClock()
+        {
+            _clockRoot = OwnerUiLayout.Rect(_root, "RoundClock");
+            Pin(_clockRoot, new Vector2(.5f, 1), new Vector2(0, -82), new Vector2(620, 140));
+            var face = OwnerUiLayout.Rect(_clockRoot, "ClockFace").gameObject.AddComponent<Image>();
+            OwnerUiLayout.Place(face.rectTransform, 157, 0, 306, 92); face.color = new Color32(35, 29, 33, 218); face.raycastTarget = false;
+            _clock = Ink(_clockRoot, "TimeLeft", "", 60, true); OwnerUiLayout.Place(_clock.rectTransform, 170, 0, 280, 89);
+            _round = Ink(_clockRoot, "RoundLabel", "", 28, true); OwnerUiLayout.Place(_round.rectTransform, 70, 96, 480, 44);
+        }
+        private void BuildCourtCan()
+        {
+            _canRoot = OwnerUiLayout.Rect(_root, "CanReadout");
+            Pin(_canRoot, new Vector2(1, 1), new Vector2(-253, -109), new Vector2(464, 170));
+            var can = OwnerUiLayout.Rect(_canRoot, "CanStateIcon").gameObject.AddComponent<TumpSymbol>();
+            can.Kind = TumpSymbol.Icon.Can; can.color = OwnerUiTheme.Current.Pale; can.raycastTarget = false;
+            var edge = can.gameObject.AddComponent<Outline>(); edge.effectColor = UiTheme.InGameOutline; edge.effectDistance = new Vector2(2, -2);
+            OwnerUiLayout.Place(can.rectTransform, 12, 5, 68, 84);
+            _canState = Ink(_canRoot, "CanState", "", 32, true); _canState.alignment = TextAnchor.MiddleLeft;
+            OwnerUiLayout.Place(_canState.rectTransform, 101, 7, 352, 75);
+            _canHint = Ink(_canRoot, "CanHint", "", 28, false); _canHint.alignment = TextAnchor.UpperRight;
+            OwnerUiLayout.Place(_canHint.rectTransform, 0, 103, 452, 67);
+        }
+        private void BuildCourtPersonal()
+        {
+            // ⚠️ 2026-10-20 OVERHAUL: THE BOTTOM-LEFT IS YOUR VITALS PLATE, Overwatch's portrait and
+            // health corner (see `HudVitalsBar` for why stamina takes the health bar's shape). The
+            // group keeps its name, its words and its show/hide rule; it now sits in the corner
+            // proper, 36 units from each edge, and its two sentences ride above the plate on the
+            // rare occasions they speak (piloting Kuro, a limited slipper stock).
+            // ⚠️ PIVOTED ON ITS OWN CORNER so its base scale and the reading scale both grow it away
+            // from the screen edges instead of off them.
+            _personalRoot = OwnerUiLayout.Rect(_root, "LocalState");
+            Pin(_personalRoot, new Vector2(0, 0), new Vector2(0, 0), new Vector2(500, 120));
+            _personalRoot.pivot = Vector2.zero; _personalRoot.localScale = Vector3.one * VitalsScale;
+            BuildVitals();
+            _role = Ink(_personalRoot, "LocalRole", "", 34, true); _role.alignment = TextAnchor.MiddleLeft;
+            OwnerUiLayout.Place(_role.rectTransform, 250, -86, 392, 46);
+            _stock = Ink(_personalRoot, "SlipperState", "", 28, false); _stock.alignment = TextAnchor.MiddleLeft;
+            OwnerUiLayout.Place(_stock.rectTransform, 250, -42, 392, 40);
+            // The labelled bar is the piloting readout (whose stamina it is IS the information), so
+            // it rides above the plate with the two lines rather than under the portrait.
+            var track = OwnerUiLayout.Rect(_personalRoot, "StaminaTrack").gameObject.AddComponent<Image>();
+            OwnerUiLayout.Place(track.rectTransform, 250, -116, 230, 12); track.color = new Color32(35, 29, 33, 230); track.raycastTarget = false;
+            _stamina = OwnerUiLayout.Rect(track.transform, "StaminaFill").gameObject.AddComponent<Image>();
+            OwnerUiLayout.Fill(_stamina.rectTransform); _stamina.color = CourtPresentationPalette.Gold; _stamina.raycastTarget = false;
+            var label = Ink(_personalRoot, "StaminaLabel", "Stamina", 28, false); OwnerUiLayout.Place(label.rectTransform, 488, -131, 154, 42);
+            // VISUAL-1.4: a stun the player cannot time is a stun they cannot play around
+            // (`Design.md` § 11), so these stay; they sit under the reticle, where the eye
+            // already is, instead of floating in the left margin under a scoreboard that moved.
+            for (int i = 0; i < 4; i++)
+            {
+                _status[i] = Ink(_root, "TimedStatus" + i, "", 28, false); _status[i].alignment = TextAnchor.MiddleCenter;
+                Pin(_status[i].rectTransform, new Vector2(.5f, .5f), new Vector2(0, -104 - i * 38), new Vector2(560, 38));
+            }
+        }
+        private void BuildCourtPrompts()
+        {
+            _promptRoot = OwnerUiLayout.Rect(_root, "ContextualAction");
+            Pin(_promptRoot, new Vector2(.5f, .28f), Vector2.zero, new Vector2(1100, 174));
+            // ⚠️ 2026-10-20 OVERHAUL: Overwatch's interaction prompt, the key glyph then the verb in
+            // ivory, on one strip of smoked glass sized to its words (`SizePromptPlate`). The strip
+            // is kept rather than letting the words float because the hold progress has to sit
+            // INSIDE something (`RevisedHudSeparatesStatusesWarningActionAndFitsFourRounds`), and
+            // because the street behind the centre of the screen is bright chalk and sky.
+            _promptPlate = OwnerUiLayout.Rect(_promptRoot, "PromptPlate").gameObject.AddComponent<HudCard>();
+            _promptPlate.Glass(HudDraw.GlassDeep).raycastTarget = false;
+            _promptPlate.enabled = false;
+            _prompt = OwnerUiLayout.Text(_promptRoot, "ActionPrompt", "", 38, OwnerUiLayout.TypeRole.Reading);
+            OwnerUiLayout.Place(_prompt.rectTransform, 0, 0, 1100, 74);
+            _prompt.alignment = TextAnchor.MiddleLeft; _prompt.verticalOverflow = VerticalWrapMode.Overflow; _prompt.color = PromptInk;
+            if (InGameTypography.Clock != null) { _prompt.font = InGameTypography.Clock; _prompt.fontSize = 36; }
+            var promptEdge = _prompt.gameObject.AddComponent<Outline>(); promptEdge.effectColor = UiTheme.InGameOutline; promptEdge.effectDistance = new Vector2(1.5f, -1.5f);
+            _bindingGlyph = OwnerUiLayout.Rect(_promptRoot, "ActionBindingGlyph").gameObject.AddComponent<Image>();
+            _bindingGlyph.preserveAspect = true; _bindingGlyph.raycastTarget = false; _bindingGlyph.enabled = false;
+            _context = Ink(_promptRoot, "ActionDetail", "", 28, false); OwnerUiLayout.Place(_context.rectTransform, 0, 77, 1100, 66);
+            var track = OwnerUiLayout.Rect(_promptRoot, "RecoveryProgress").gameObject.AddComponent<Image>();
+            OwnerUiLayout.Place(track.rectTransform, 320, 154, 460, 10); track.color = new Color(0, 0, 0, .5f); track.raycastTarget = false;
+            _progress = OwnerUiLayout.Rect(track.transform, "ProgressFill").gameObject.AddComponent<Image>();
+            OwnerUiLayout.Fill(_progress.rectTransform); _progress.color = HudDraw.Honey; _progress.raycastTarget = false;
+            track.gameObject.SetActive(false);
+        }
+    }
+}

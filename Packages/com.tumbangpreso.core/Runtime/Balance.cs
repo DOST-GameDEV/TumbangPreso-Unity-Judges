@@ -1,0 +1,970 @@
+namespace TumbangPreso.Core
+{
+    /// <summary>
+    /// Every tuned number in the game, in one place.
+    ///
+    /// ⚠️ TRANSCRIBED FROM THE GDScript, NOT FROM Design.md. The two have drifted in
+    /// at least two places and the code is the newer half (see docs/Port_Plan.md §7.1).
+    /// Each block below names the .gd file it came from so the pairing can be re-checked
+    /// rather than re-derived.
+    ///
+    /// ⚠️ A NUMBER HERE THAT DISAGREES WITH THE GODOT BUILD IS A PORT BUG, and it is the
+    /// kind no compiler catches and no casual playtest surfaces. Core.Tests asserts the
+    /// derived quantities that Design.md recorded as MEASURED, which is what makes a
+    /// drift fail a build instead of quietly changing how the game plays.
+    /// </summary>
+    public static class Balance
+    {
+        // -------------------------------------------------------------------
+        // MATCH STRUCTURE — match_manager.gd, round_manager.gd
+        // -------------------------------------------------------------------
+
+        /// <summary>Both default modes play one complete defender rotation.</summary>
+        public const int Rounds = 4;
+        public const int HeroStrikeRounds = 4;
+        public const int PlayerCount = 4;
+        public const float RoundTime = 90.0f;
+        public const float IntermissionDuration = 3.0f;
+
+        /// <summary>
+        /// The pause between rounds, in which the role swap is read and the next taya finds their
+        /// mark.
+        ///
+        /// ⚠️⚠️ 5.0, DOWN FROM 15.0. 🧑 2026-08-29, off a played eight-round match: *"make round
+        /// buffer 5 seconds for all, 15 seconds reportedly too long"* — "reportedly" because it
+        /// came from the people testing rather than from him.
+        ///
+        /// **The arithmetic is why 15 was indefensible once the mode count doubled.** Hero Strike
+        /// is eight rounds, so seven buffers at 15 s is **1 m 45 s of a match with nobody
+        /// playing**, against 12 m of actual play. At 5 s it is 35 s. The historical Classic
+        /// four-round format went from45s to15s; the owner changed Classic to8rounds on2026-09-15.
+        ///
+        /// ⚠️ `BufferSkipVote` STAYS AND IS NOT MADE REDUNDANT BY THIS. It was added on the same
+        /// day for the same complaint, and a unanimous vote is what lets a room that is ready end
+        /// even five seconds early; this is what the room that says nothing gets. The clock was
+        /// always the backstop and it is a shorter backstop now.
+        ///
+        /// ⚠️ IT IS THE ROLE SWAP CARD'S BUDGET TOO. `RoleSwapCard.ShowForShot` runs its timeline
+        /// inside this window; anything longer than 5 s of animation there is now cut off by the
+        /// round starting rather than by the card finishing.
+        /// </summary>
+        public const float WarmupBufferDuration = 5.0f;
+
+        // -------------------------------------------------------------------
+        // SCORING — round_manager.gd
+        //
+        // ⚠️ Every point in the game is awarded in ONE function, host-side. The
+        // predecessor spread its win conditions across four files and the recurring
+        // bug class was a rule firing on the wrong peer.
+        // -------------------------------------------------------------------
+
+        public const int ScoreLataKnocked = 100;
+        public const int ScoreTag = 100;
+        public const int ScoreSabotage = 50;
+        public const int ScoreDefensePerTick = 10;
+        public const float DefenseTickInterval = 1.0f;
+        public const float TagStunTime = 5.0f;
+        public const float SabotageWindow = 2.5f;
+        public const float ThrowRestoreCooldown = 3.5f;
+        public const float ThrowChargeResetTime = .5f;
+
+        // Tournament Anti-Camping & Anti-Stall Penalties
+        public const float TayaCampRadius = 1.5f;
+        public const float TayaCampClearRadius = 2.0f;
+        public const float TayaCampWarningTime = 2.5f;
+        public const float TayaCampGracePeriod = 5.0f;
+        public const int ScoreTayaCampPenalty = -5;
+
+        public const float SlipperUnretrievedWarningTime = 7.5f;
+        public const float SlipperUnretrievedGracePeriod = 15.0f;
+        public const int ScoreUnretrievedPenalty = -5;
+        public const float TournamentPenaltyInterval = 1.0f;
+
+        // Owner, October 22 tournament feedback: a taya who was ahead left the can lying down,
+        // which stops every throw and every tag, and ran the round out. After this many seconds
+        // of the can down while the taya is free to act and not standing it up, the taya pays
+        // ScoreCanDownPenalty every TournamentPenaltyInterval.
+        public const float CanDownWarningTime = 2.5f;
+        public const float CanDownGracePeriod = 7.0f;
+        public const int ScoreCanDownPenalty = -5;
+
+        // ------------------------------------------------------------------
+        // Hero Strike objective economy, owner revision October 3, 2026.
+        // Knockdowns and successful tags each pay one point. The defender also
+        // receives one point once at the beginning of their round. No timed
+        // trickle, throw income or retrieval income. Ultimate costs are unchanged.
+        public const float UltimateExtraObjectivePoints = 3.0f;
+        public const float UltimateChargeLataKnock = 1.0f;
+        public const float UltimateChargeTag = 1.0f;
+        public const float UltimateChargeDefenderRound = 1.0f;
+        // Retained names keep existing callers and numeric contracts explicit.
+        public const float UltimateChargeOwnSlipperRetrieved = 0.0f;
+        public const float UltimateChargeLegalThrow = 0.0f;
+
+        /// <summary>
+        /// Owner, October 22 tournament feedback: *"ults were rarely cast in 4 round games"*. The
+        /// ultimate costs are priced for an eight-round match, so a shorter match pays every
+        /// objective point proportionally more (four rounds: double) and each player can still
+        /// reach an ultimate. Eight rounds or more are unchanged.
+        /// </summary>
+        public static float UltimateChargeScale(int totalRounds)
+        {
+            if (totalRounds <= 0 || totalRounds >= 8) return 1.0f;
+            return System.Math.Min(3.0f, 8 / (float)totalRounds);
+        }
+
+        // Pektus (Curve Spin) Throwing
+        public const float PektusCurveStrength = 14.0f;
+        public const float MaxPektusSpin = 1.0f;
+        /// <summary>
+        /// How far above a body's feet a resting tsinelas may sit and still be picked up.
+        ///
+        /// ⚠️ IT IS UNDER PickupRadius ON PURPOSE. `Slipper.CanBeGrabbedBy` measures a 3D
+        /// distance from the grabber's transform, which is at their feet, so a slipper this
+        /// high has already spent almost the whole 1.4 m budget on height alone and can only
+        /// be reached by standing exactly underneath it. Anything higher is out of play, and
+        /// a piece of ammunition that is out of play has to be given back rather than lost.
+        /// </summary>
+        public const float SlipperMaxRestReach = 1.2f;
+
+        public const float PektusBankSpinThreshold = 0.55f;
+        public const float PektusBankRestitution = 0.62f;
+        public const int MaxScoringBanks = 1;
+
+        // -------------------------------------------------------------------
+        // MOVEMENT AND THE ARENA — character_base.gd
+        // -------------------------------------------------------------------
+
+        // Legacy non-locomotion reference for companion flight and throw presentation.
+        // Player walking/running uses the explicit role speeds below.
+        public const float Speed = 4.6f;
+
+        // Veil has a sustained speed gain alongside tag immunity.
+        // The previous 3*dt impulse was erased by ordinary movement friction.
+        public const float NemuPhaseSpeedScale = 1.20f;
+
+        // October 3 playtest revision: explicit role speeds, identical across character
+        // picks and both modes. Active statuses, abilities and terrain remain separate.
+        public const float AttackerWalkSpeed = 2.5f;
+        public const float DefenderWalkSpeed = 3.75f;
+        public const float AttackerRunSpeed = 3.75f;
+        public const float DefenderRunSpeed = 5.625f;
+
+        public const float SprintScale = 1.50f;
+        public const float Friction = 30.0f;
+        public const float Gravity = 20.0f; // Slipper/projectile gravity is unchanged.
+        public const float CharacterGravity = 20.0f;
+        public const float MaxFallSpeed = 25.0f;
+        public const float JumpVelocity = 5.75f;
+
+        /// <summary>
+        /// ⚠️ A SQUARE, NOT A CIRCLE. Both the chalk the map builders draw and the clamp
+        /// in _move_and_confine() are max(|x|,|z|) against this number. A square and a
+        /// circle of the same "radius" agree only at the four edge midpoints and differ
+        /// by 2.07 units on the diagonals, which is exactly where a taya moves to cover
+        /// a corner. Making either one radial cost a session on 2026-07-29.
+        ///
+        /// ⚠️ 7.0 IS A CEILING THIS MAP IMPOSES, not a preference:
+        /// CONFINEMENT_RADIUS + THROW_STANDOFF (1.2) + a capsule must stay inside
+        /// Eskinita's wall faces at x = ±8.6, or the attackers' standoff ring lands
+        /// inside a wall and the bots jam against it trying to reach it.
+        /// </summary>
+        public const float ConfinementRadius = 7.0f;
+
+        public const float SafeZoneMargin = 2.0f;
+        public const float DefenderStartOffset = 2.5f;
+
+        /// <summary>
+        /// How far apart the three attackers stand on their shared line. Two body widths:
+        /// close enough to read as one group, far enough that nobody spawns inside anybody
+        /// and the spawn settle has nothing to untangle.
+        /// </summary>
+        public const float AttackerSpawnSpacing = 1.8f;
+
+        /// <summary>
+        /// ⚠️ DO NOT REMOVE ON THE ASSUMPTION UNITY DOES NOT NEED IT. This is the real
+        /// fix for B-100 in Godot: writing position on a physics body updates the scene
+        /// tree at once and the broadphase only at the next step, so on a role rotation
+        /// two players trade marks and each stands on the other's stale collider for one
+        /// frame. Measured there: three contacts with normal (0,1,0), a 1.60 shove up,
+        /// then 9.89 units into a wall on the next frame. Unity resolves transforms
+        /// against its own broadphase with the same lag; port it deliberately and let a
+        /// probe say whether it can go.
+        /// </summary>
+        public const int SpawnSettleFrames = 3;
+
+        // -------------------------------------------------------------------
+        // STAMINA — character_base.gd
+        //
+        // ⚠️⚠️ STAMINA_MAX IS THE KNOWN DOC DRIFT. The code says 60.0, which is 1.5 s of
+        // sprint at 40/s. Design.md's §3 note, its §2.5 "MEASURED" block and its §5.3
+        // shove arithmetic all still describe a 50-point pool and 1.25 s. This file
+        // follows the CODE, because the code is what every recent match was played
+        // against. Port_Plan.md §7.1 carries the reconciliation as a Phase 1 blocker.
+        // -------------------------------------------------------------------
+
+        public const float StaminaMax = 250.0f;
+        /// <summary>
+        /// Stamina spent per second of sprinting.
+        ///
+        /// ⚠️⚠️ 24, DOWN FROM 40, AND IT MOVED BECAUSE THE ATTACKER'S SPEED DID. `Stamina`'s
+        /// header states the invariant this belongs to and states it as a DISTANCE, not a time:
+        /// *"the bar is dimensioned to roughly one crossing of the danger zone, which is the
+        /// retrieval the whole game is about"*, and *"a change to any one of the four has to be
+        /// re-measured against the other three rather than reasoned about"*. § 83.1 changed one
+        /// of the four. This is that re-measurement, and it is arithmetic rather than taste:
+        ///
+        /// | | sprint | on a full bar | buys |
+        /// |---|---|---|---|
+        /// | before § 83.1 | 4.6 x 0.75 x 1.5 = **5.175 m/s** | 60/40 = 1.50 s | **7.76 m** |
+        /// | at 0.45, drain 40 | 4.6 x 0.45 x 1.5 = **3.105 m/s** | 60/40 = 1.50 s | **4.66 m** |
+        /// | at 0.55, drain 40 | 4.6 x 0.55 x 1.5 = **3.795 m/s** | 60/40 = 1.50 s | **5.69 m** |
+        /// | **at 0.55, drain 29** | **3.795 m/s** | 60/29 = 2.07 s | **7.85 m** |
+        ///
+        /// **About 7.8 m is `ConfinementRadius` plus a margin**, which is what "one crossing"
+        /// means: in from the chalk to the can and back out. At the untouched drain of 40 the
+        /// speed cut left an attacker with **60 to 73% of a crossing on a full bar** depending on
+        /// the scale — they could sprint in and not out, every time, on every map. That is not
+        /// the taya being stronger, it is retrieval being impossible, and § 83.1b flagged it as
+        /// the thing to measure.
+        ///
+        /// ⚠️⚠️ THE DRAIN MOVED AND `StaminaMax` DID NOT, WHICH IS THE HALF THAT MATTERS. Buying
+        /// the same distance by raising the bar to 100 would have worked and would have silently
+        /// retuned everything else priced against it: `ShoveStaminaCost` is 25, which is 42% of a
+        /// 60 bar and 25% of a 100 one, and `StaminaSprintFloor` is 7.5. Slowing the drain keeps
+        /// every fraction on the bar exactly where it was and changes only the thing that had to
+        /// change.
+        ///
+        /// ⚠️ AND THE REGEN IS UNTOUCHED, so a full refill is still `StaminaMax / StaminaRegenRate`
+        /// = 3 s. What a sprint COSTS in time to earn back is unchanged; what it BUYS in ground
+        /// is back to what it was.
+        ///
+        /// ⚠️ `BalanceTests.ASprintBuysOneCrossingOfTheDangerZone` holds this. It asserts the
+        /// DISTANCE against `ConfinementRadius`, so the next person to move the speed, the bar,
+        /// the drain or the box gets told rather than finding out from a playtest.
+        /// </summary>
+        public const float StaminaDrainRate = 100.0f;
+        public const float StaminaRegenRate = 100.0f;
+        public const float StaminaRegenDelay = 1.0f;
+
+        /// <summary>You cannot START a sprint below this, so the bar cannot be feathered.</summary>
+        public const float StaminaSprintFloor = 50.0f;
+
+        // November 4 owner revision: empty stamina adds no exhaustion lockout.
+        public const float FatigueTime = 0.0f;
+        public const float FatigueSpeedScale = 1.0f;
+
+        // -------------------------------------------------------------------
+        // THE SHOVE — character_base.gd. Attackers shove Attackers.
+        //
+        // ⚠️ THE REAL PRICE IS THE SPRINT, NOT THE 25 POINTS. That half-bar is the same
+        // bar that gets you back out of the box, so a shove is paid for in escape
+        // distance. That is why it stays rare without needing a bigger number on it.
+        // -------------------------------------------------------------------
+
+        public const float ShoveChargeTime = 0.0f;
+        public const float ShoveSpeed = 12.247f;
+        public const float ShoveLift = 2.2f;
+        public const float ShoveStun = 1.25f;
+        public const float ShoveStaminaCost = 0.0f;
+        public const float ShoveCooldown = 7.5f;
+        public const float ShoveMissCooldown = 0.5f;
+        public const float ShoveRange = 1.6f;
+        public const float ShoveArcDeg = 70.0f;
+
+        // -------------------------------------------------------------------
+        // THE TAYA'S TWO TAG VERBS — character_base.gd
+        //
+        // They answer different problems. The lunge is a charge, a dash and a cooldown:
+        // the right answer to somebody running PAST you and the wrong one to somebody
+        // standing next to you, because the charge is exactly long enough for them to
+        // leave. The punch has no charge, more reach, and does not move the taya at all.
+        // -------------------------------------------------------------------
+
+        public const float LungeChargeTime = 0.5f;
+        // Owner feedback, 2026-09-30: a faster, farther defender commitment.
+        // Solve the impulse from travel so friction and all derived reach stay coherent.
+        public const float LungeDistance = 3.5f;
+        public static readonly float LungeSpeed =
+            (float)System.Math.Sqrt(2.0 * Friction * LungeDistance);
+        public const float LungeTagRadius = 1.3f;
+        public static readonly float LungeActiveTime = LungeSpeed / Friction;
+        public const float LungeCooldown = 2.5f;
+        public const float LungeTapCooldown = 0.5f;
+        public const float LungeMinPower = 0.35f;
+
+        // -------------------------------------------------------------------
+        // THE ATTACKER'S RETRIEVAL SLIDE, `docs/TODO.md` § 146
+        //
+        // ⚠️⚠️ IT IS THE SAME PRESS AS THE TAYA'S LUNGE AND THAT IS THE WHOLE DESIGN. `Verb.Lunge`
+        // already has a key, a pad binding and a thumb target (`InputLayer.InputCatalogue`), and
+        // on an ATTACKER it did nothing at all: `CombatVerbs.Update` only reaches `StepLunge`
+        // behind `if (_motor.IsDefender)`, so three of the four players in every round had a dead
+        // control under their right hand and a dead button on the touch layer. `docs/VISION.md`
+        // § 1.1 asks for Classic's depth to come from somewhere other than powers, and
+        // `CLAUDE.md` § 6.2 asks what the player has to hold in their head: reusing a press they
+        // already have costs them nothing to learn.
+        //
+        // ⚠️⚠️ EVERY NUMBER BELOW IS SOLVED FROM ONE ALREADY IN THIS FILE. `CLAUDE.md` § 4:
+        // *"Write the distance you want and solve for the speed; never hard-code a distance
+        // beside a speed."* The distance wanted is `PickupRadius`, because the thing the slide
+        // buys is the LAST APPROACH: an attacker who is already inside the pickup radius can
+        // simply press grab, so the ground worth converting into a commitment is exactly the
+        // ground between "in reach" and "not in reach".
+        //
+        //   walking that 1.75 m at `Speed * AttackerSpeedScale` (2.53 m/s)  =  0.69 s
+        //   sliding it, decelerating against `Friction` from `SlideSpeed`   =  0.34 s
+        //
+        // **So the slide buys about 0.35 s.** That is what makes it worth pressing and what
+        // bounds it: `PunchCooldown` is 0.9 s and `LungeChargeTime` is 0.5 s, so a third of a
+        // second is less than one taya decision. The attacker cannot outrun a read; they can beat
+        // a taya who committed late.
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// How far a committed retrieval slide carries an attacker.
+        ///
+        /// ⚠️ IT IS `PickupRadius` AND NOT A NUMBER OF ITS OWN. The slide converts the last
+        /// approach into a commitment, and the last approach is by definition the distance at
+        /// which a pickup starts working. Tying them means a retune of the pickup radius cannot
+        /// leave the slide reaching further than a pickup can.
+        /// </summary>
+        public const float SlideDistance = PickupRadius;
+
+        /// <summary>
+        /// The impulse a slide leaves with, solved from <see cref="SlideDistance"/>.
+        ///
+        /// Like the defender lunge, this derives velocity from the intended travel
+        /// and friction instead of storing two independently tuned values.
+        /// </summary>
+        public static readonly float SlideSpeed =
+            (float)System.Math.Sqrt(2.0 * Friction * SlideDistance);
+
+        /// <summary>
+        /// How long the slide is live, in seconds: `SlideSpeed / Friction`, which is exactly how
+        /// long the impulse takes to decay to nothing.
+        ///
+        /// ⚠️ THE SWEEP RUNS FOR THE WHOLE OF IT, for `CombatVerbs.SweepLungeTag`'s reason: a
+        /// dash sampled only at its end tunnels straight past whatever it passed through, and
+        /// the tsinelas this exists to collect is usually somewhere in the middle.
+        /// </summary>
+        public static readonly float SlideActiveTime = SlideSpeed / Friction;
+
+        /// <summary>
+        /// How long after the slide the attacker steers at reduced authority.
+        ///
+        /// ⚠️⚠️ IT IS SIZED AGAINST THE TAYA'S WHOLE PUNISH CYCLE AND NOT AGAINST FEEL. A taya
+        /// who reads the commitment has to charge (`LungeChargeTime`, 0.5 s) and then dash
+        /// (`LungeActiveTime`, 0.45 s), which is 0.95 s of their own. If the attacker's
+        /// commitment were shorter than that, a perfect read could not be cashed in and the
+        /// slide would be a free mobility buff, which is the failure the brief names by name.
+        /// So the committed window is that number: the slide's own 0.34 s plus this.
+        /// </summary>
+        public static readonly float SlideRecoveryTime =
+            0.95f - SlideActiveTime;
+
+        /// <summary>
+        /// How much of their steering an attacker keeps while committed.
+        ///
+        /// ⚠️ 0.35 IS `LungeMinPower`, WHICH IS THE GAME'S EXISTING ANSWER TO "HOW MUCH OF A
+        /// COMMITTED MOVE IS STILL YOURS". It is not a coincidence worth pretending is one: both
+        /// numbers say the same thing about the same feeling, and a second constant here would be
+        /// a number that can disagree with it.
+        ///
+        /// ⚠️ IT IS NOT ZERO ON PURPOSE. A slide with no steering at all is a dead body flying in
+        /// a straight line, and `docs/VISION.md` § 0 is that the tension is the retrieval: the
+        /// player has to be able to adjust into the shoe or the verb is a coin flip rather than a
+        /// read.
+        /// </summary>
+        public const float SlideSteerScale = LungeMinPower;
+
+        /// <summary>
+        /// How long before an attacker may slide again.
+        ///
+        /// ⚠️⚠️ IT IS THE TAYA'S ENTIRE PUNISH CYCLE PLUS THEIR COOLDOWN, so an attacker who
+        /// slides into a lunge cannot simply slide back out of the consequence: by the time the
+        /// second slide is available the taya who spent a lunge on the first one has theirs back.
+        /// `LungeChargeTime + LungeActiveTime + LungeCooldown` = 2.45 s. A number picked for feel
+        /// would have no such property, and "cannot instantly chain another lunge" is exactly what
+        /// the brief asks the commitment to cost.
+        /// </summary>
+        public const float SlideCooldown = 2.45f;
+
+        /// <summary>
+        /// Retrieval slide keeps its explicit 25-point price. It no longer aliases
+        /// ShoveStaminaCost, because the owner removed shove/lunge costs after playtesting.
+        /// </summary>
+        public const float SlideStaminaCost = 25.0f;
+
+        public const float PunchRange = 1.7f;
+        public const float PunchArcDeg = 75.0f;
+        public const float PunchCooldown = 0.5f;
+        public const float PunchHitCooldown = 0.25f;
+
+        public const float MaxKnockbackSpeed = 16.0f;
+        public const float MaxKnockbackLift = 7.0f;
+        public const float BaseStaggerTime = 0.25f;
+
+        // -------------------------------------------------------------------
+        // THE THROW — carrier.gd and slipper.gd
+        // -------------------------------------------------------------------
+
+        // Faster ordinary wind-up requested in Feedback. Power range, launch
+        // speed and retrieval recovery remain unchanged in both modes.
+        public const float ChargeFullTime = 1.5f;
+        public const float ChargeMinPower = 0.35f;
+        public const float ThrowLockTime = 1.25f;
+        /// <summary>How close a body's FEET have to be to a resting tsinelas to pick it up.
+        ///
+        /// ⚠️⚠️ 1.75, UP FROM 1.40 ON 2026-08-26. 🧑, off the 4.69 player: *"cant pick up any
+        /// slipper"*, in every mode. The mechanism was not broken — `SoloPracticeTests` puts a
+        /// loose tsinelas at a seat's own feet and the grab connects — so what he was reporting
+        /// is REACH, and the geometry says he is right. This is a 3D distance measured from the
+        /// motor's transform, which sits at the SOLE OF THE FOOT, while the camera is at about
+        /// 1.6 m and pitched down. At 1.40 m a tsinelas that is legally grabbable sits near the
+        /// BOTTOM EDGE of the frame; anything the player can see at the crosshair is three or
+        /// four metres out and refuses silently.
+        ///
+        /// ⚠️ 1.75 IS BOUNDED BY THE HAZARD ARITHMETIC AND NOT BY FEEL. `docs/TODO.md` § 12.2
+        /// turns on this radius being SMALLER than the widest trip-hazard footprint of 2.60 m,
+        /// which is what makes a swallowed tsinelas unreachable and the ejector necessary. 1.75
+        /// keeps that true with 0.85 m to spare, so nothing in that entry changes.
+        ///
+        /// ⚠️ AND THE REAL FIX IS THE PROMPT, NOT THE NUMBER. `Hud.UpdatePickupPrompt` now says
+        /// when a tsinelas is in reach, because a silent refusal is indistinguishable from a
+        /// broken key and that is exactly how this was reported.</summary>
+        public const float PickupRadius = 1.75f;
+
+        /// <summary>Taya distance, flat, under which retrieving your own tsinelas is called a clutch pickup.
+        /// Presentation only: it pays nothing.</summary>
+        public const float ClutchPickupMetres = 2.5f;
+
+        /// <summary>Taya distance, flat, under which a pickup that makes you taggable is presented as a hot one:
+        /// a held beat and a heartbeat. Presentation only.</summary>
+        public const float HotPickupMetres = 6.0f;
+        public const float MuzzleForward = 0.15f;
+
+        public const float LaunchSpeed = 18.5f;
+        public const float SlipperHitRadius = 0.23f;
+
+        /// <summary>
+        /// Extra HORIZONTAL reach on the taya's body when a tsinelas is tested against it, and
+        /// on nobody else's.
+        ///
+        /// ⚠️⚠️ 🧑 2026-08-29, twice: *"make hit box for defender bigger but make sure it reverts
+        /// to nroaml when theyre attacker ... this is bcz defender kinda feels weak right now"*,
+        /// and then the shape of it: *"make hitbox bigger horizontally but not fatter so taht
+        /// tehy can defend perktus bettert"*.
+        ///
+        /// **A block is the taya's only way to stop a throw that is already in the air**, and
+        /// `Slipper.HitsBody` tested it against `SlipperHitRadius + CharacterController.radius`
+        /// — about 0.60 m of flat reach for a projectile crossing that window at up to 18.5 m/s,
+        /// which at a 50 Hz physics step is 0.37 m of travel per test. A Pektus throw curves
+        /// ACROSS that window rather than into it, so the taya was being asked to stand within a
+        /// third of a metre of a path they cannot predict.
+        ///
+        /// ⚠️⚠️ IT IS ADDED IN `HitsBody` AND NOT TO THE `CharacterController`, WHICH IS THE
+        /// WHOLE OF "NOT FATTER". Growing the capsule would widen the physical body: the taya
+        /// would push attackers around, snag on the map, spawn-settle differently, and read as a
+        /// wider character on screen. This number is only ever consulted when deciding whether a
+        /// slipper CONNECTS, so the body stays exactly the size it looks.
+        ///
+        /// ⚠️ AND HORIZONTAL ONLY, ON PURPOSE. `HitsBody`'s vertical test is unchanged, so a
+        /// throw sailing over the taya's head still sails over it. Widening both would have made
+        /// the taya a column rather than a person.
+        ///
+        /// ⚠️ THE REVERT IS FREE BECAUSE THERE IS NO STATE. `HitsBody` reads `who.IsDefender` on
+        /// the frame of the test, so the bonus arrives and leaves with the role and there is
+        /// nothing to unwind when the taya rotates — which is precisely what he asked to be sure
+        /// of. `docs/TODO.md` § 83.2.
+        /// </summary>
+        public const float DefenderBlockRadiusBonus = 0.35f;
+
+        public const float MaxFlightTime = 6.0f;
+
+        /// <summary>
+        /// The total time a tsinelas may spend off the ground, deflections included.
+        ///
+        /// ⚠️⚠️ `MaxFlightTime` CANNOT DO THIS JOB, BECAUSE A DEFLECT RESETS IT. Bouncing off a
+        /// body or off the can restarts the per-arc clock on purpose: the new arc genuinely is
+        /// a new flight and deserves its own budget. The consequence nobody wrote down is that a
+        /// slipper which deflects again before that budget runs out never runs it out at all. A
+        /// tsinelas falling onto somebody standing still gets lifted by `DeflectLift`, comes
+        /// straight back down onto them, and hovers there for the rest of the round. Its owner
+        /// is then fined -5 a second under the anti-stall rule for failing to fetch a slipper
+        /// that is not on the ground to be fetched.
+        ///
+        /// ⚠️ IT IS THE SAME 6 SECONDS AS THE PER-ARC CAP RATHER THAN A MULTIPLE. Real throws
+        /// resolve in about a second and a half, so six seconds of accumulated air is already
+        /// far beyond anything the game asks for; a larger number would only mean a longer
+        /// stall before the same recovery.
+        /// </summary>
+        public const float MaxAirborneTime = 6.0f;
+        public const float ThrowerIgnoreTime = 0.25f;
+
+        /// <summary>
+        /// ⚠️ A BLOCKED SLIPPER STAYS IN THE BOX, AND THAT IS THE TAYA'S WHOLE SCORING
+        /// VERB. At the old 0.62 a block threw the slipper 5.7 m, to the chalk or past
+        /// it. An attacker is taggable exactly while holding a slipper INSIDE the box,
+        /// so a block that put the slipper OUTSIDE meant the retrieval never entered the
+        /// box and the tag could never happen: measured at 22.5% of all points before,
+        /// 1.8% after. At 0.27 it travels 2.5 m and they have to come in for it.
+        /// </summary>
+        public const float DeflectSpeedScale = 0.27f;
+
+        public const float DeflectLift = 5.0f;
+
+        /// <summary>
+        /// The slipper coming off the CAN, about 1.3 m. ⚠️ This and DeflectSpeedScale
+        /// were ONE constant until 2026-08-01 and had to move in opposite directions:
+        /// cutting the block scale for the tag fix silently collapsed the can knock to
+        /// 0.3 m for a reason that had nothing to do with it.
+        /// </summary>
+        public const float LataRecoilScale = 0.25f;
+
+        public const float LataRecoilLiftScale = 0.55f;
+        // Owner, October 31: a slipper hit should knock you back a bit. 0.6 m, up from 0.35 m, which barely read as a push.
+        public const float BlockKnockbackSpeed = 6.0f;
+
+        // -------------------------------------------------------------------
+        // THE LATA — lata.gd
+        // -------------------------------------------------------------------
+
+        public const float InteractionRadius = 1.6f;
+        public const float ResetChannelTime = 1.5f;
+        public const float DownedTiltDeg = 88.0f;
+        public const float ToppleTime = 0.22f;
+
+        /// <summary>
+        /// ⚠️ THE NUMBER THAT DECIDES EVERY KNOCKDOWN IN THE GAME. A thrown slipper
+        /// connects when its flat distance to the can is inside
+        /// SlipperHitRadius + HitMargin = 0.53 m at neutral, tested per physics frame,
+        /// host-side. Until 2026-08-01 this was an unnamed literal in slipper.gd while
+        /// Design.md documented a hurtbox shape and Lata.tscn carried an Area3D authored
+        /// to it, and grep found no reader for either. Three numbers that were meant to
+        /// be one.
+        ///
+        /// ⚠️ THE WINDOW IS SKIN-INDEPENDENT EXCEPT THROUGH A DECLARED STAT. The four
+        /// cans span 0.108 to 0.143 in radius, a 32% spread; deriving the window from
+        /// that geometry would make the prettiest can quietly the hardest to hit with
+        /// nothing on screen saying so. STANCE is how the difference is declared.
+        /// </summary>
+        public const float LataHitMargin = 0.30f;
+
+        // -------------------------------------------------------------------
+        // TRAITS — character_base.gd
+        //
+        // ⚠️ THE SPREAD IS DELIBERATELY NARROW. This is a party game about hitting a can
+        // with a slipper; a pick 40% faster than another is not a personality, it is the
+        // correct answer.
+        // -------------------------------------------------------------------
+
+        public const float TraitSpeedPerPoint = 0.05f;
+        public const float TraitPowerPerPoint = 0.07f;
+        public const float TraitGritPerPoint = 0.07f;
+
+        // Equipment cadence/recoil need a visible difference without retuning people's
+        // speed, grit or power. Recovery ranges from 0.92 to 1.95 seconds after pickup;
+        // can recoil retains 14..36% of incoming speed and never adds flight energy.
+        public const float SlipperRecoveryPerPoint = 0.18f;
+        public const float CanReboundPerPoint = 0.22f;
+
+        // -------------------------------------------------------------------
+        // MISC
+        // -------------------------------------------------------------------
+
+        /// <summary>Also SettingsManager.PLAYER_NAME_MAX. One cap, not two on one row.</summary>
+        public const int PlayerNameMax = 14;
+
+        // -------------------------------------------------------------------
+        // SLIPPER FLIGHT — transcribed from slipper.gd. The systems that read these
+        // are still PARTIAL; the numbers land first so the port cannot re-derive them.
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// ⚠️ ENERGY IS LOST ON THE BOUNCE. A perfectly elastic wall would return a slipper
+        /// at throw speed, which is a projectile nobody threw and which can still knock the
+        /// lata down — a point scored by the wall. 0.45 is enough to carry it clear of the
+        /// boundary and not enough to be a shot.
+        /// </summary>
+        public const float BounceRestitution = 0.45f;
+
+        /// <summary>A tap still throws, at this fraction of full speed, so an accidental
+        /// click is a weak throw and not a dropped input. Mirrors Carrier.ChargeMinPower.
+        /// Read as `LaunchSpeed * lerp(MinPowerScale, 1, power)` — the aim line and the
+        /// flight line share the one expression on purpose.</summary>
+        public const float MinPowerScale = 0.35f;
+
+        /// <summary>Where a slipper lies when it is at rest. The three-flat-slipper average,
+        /// so it cannot look wrong on the default skin.</summary>
+        public const float SlipperRestHeight = 0.045f;
+
+        /// <summary>Visual spin about the long axis while airborne, degrees/second.</summary>
+        public const float SlipperSpinSpeedDeg = 900.0f;
+
+        /// <summary>End-over-end tumble, degrees/second. A real thrown slipper does both at
+        /// once; doing only the spin is what made the predecessor read as "flying perfectly
+        /// flat".</summary>
+        public const float SlipperTumbleSpeedDeg = 520.0f;
+
+        /// <summary>
+        /// ⚠️ A GAMEPLAY CONSTANT WEARING A COSMETIC HAT. 0.691 is what the generated meshes
+        /// already measured (0.432 mesh × the 1.6 visual scale in `TsinelasVisual.tscn`),
+        /// kept exactly so the constants that depend on it did not have to move again when
+        /// downloaded models arrived.
+        /// </summary>
+        public const float SlipperModelLength = 0.691f;
+
+        /// <summary>How far below the arena a slipper has to fall before it is considered
+        /// lost and returned to its spawn rather than falling forever.</summary>
+        public const float VoidY = -12.0f;
+
+        /// <summary>
+        /// The rim glow strength on the slipper that belongs to the local player.
+        ///
+        /// ⚠️ PER-PEER, DELIBERATELY NOT REPLICATED. "Yours" is a different slipper on every
+        /// machine, so this is computed locally each time it changes and never sent — a
+        /// networked glow would light one slipper for everybody.
+        /// </summary>
+        /// <summary>
+        /// How hard the local player's OWN tsinelas is rimmed, so they can pick it out of four.
+        ///
+        /// ⚠️⚠️ 0.0, AND IT IS OFF BECAUSE HE ASKED FOR IT OFF BY NAME. 🧑 2026-08-29: *"pls js
+        /// remove shader for slippers, especially the color. idk what does it but the slippers
+        /// are a completley diff color ingame and character select"*.
+        ///
+        /// **That is exactly what this constant did, and it is the whole of the difference he
+        /// was looking at.** The two surfaces build the tsinelas identically — `MatchInstaller`
+        /// and `ModelPreview` both call `ToonSkin.ApplySlipper(model, PropOutlineWidth)` — so the
+        /// material, the flat shading and the ink are the same in both places. What the MATCH
+        /// adds is `Slipper.RefreshHighlight`, which writes a `MaterialPropertyBlock` rimming
+        /// YOUR shoe in `OwnerRimColour`, a gold chosen precisely so it *cannot* be mistaken for
+        /// any skin. There is no `Slipper` component on the picker, so the picker showed the
+        /// skin he chose and the match showed that skin under gold.
+        ///
+        /// ⚠️ IT IS A ZERO RATHER THAN A DELETION, so the affordance is one number away if the
+        /// team misses it. The rest of the machinery — `SetOwnerGlow`, the per-peer note about
+        /// why it is never replicated, the property block — is untouched and still correct.
+        ///
+        /// ⚠️⚠️ AND "WHICH ONE IS MINE" IS STILL ANSWERED TWICE OVER, which is why this is a
+        /// safe thing to turn off rather than a feature being dropped. `LandedRimStrength` is a
+        /// separate, settings-driven highlight on a tsinelas that has come to REST — the moment
+        /// you have actually lost track of it — and every player picks their own skin, so four
+        /// shoes on the road are four different shoes. The glow was the answer to a question the
+        /// skin picker already answers.
+        /// </summary>
+        public const float OwnerRimStrength = 0.0f;
+
+        /// <summary>
+        /// The rim strength on a tsinelas that has just been thrown and come to rest.
+        ///
+        /// ⚠️⚠️ § THE LANDED HIGHLIGHT ANSWERS A DIFFERENT QUESTION FROM THE OWNER GLOW, which
+        /// is why it is tracked separately despite sharing a lever and a strength. The owner
+        /// glow is "which slipper is MINE": per-peer, a different slipper on every machine,
+        /// never sent. This is "where did the one that was just thrown END UP": the same answer
+        /// on all four machines, because it falls out of the slipper's state plus the one bit
+        /// that says the arrival at rest ended a flight rather than a teleport.
+        ///
+        /// ⚠️ IT STAYS ON FOR THE WHOLE LOOSE REST, NOT FOR A TIMED FLASH. A throw that missed
+        /// is exactly the moment its owner has lost track of the thing, and a cue that expired
+        /// after two seconds would be gone by the time they finished looking for it. It goes
+        /// out when the slipper leaves Loose, which is to say when somebody has it: when the
+        /// question is answered, rather than when a timer says it should be.
+        ///
+        /// ⚠️ AND IT LIGHTS EVERY LANDED SLIPPER, NOT ONLY YOUR OWN. Anybody may pick up
+        /// anybody's tsinelas, so "one is lying loose over there" is information for all three
+        /// attackers and for the taya. The owner glow is still what says which one is yours.
+        /// </summary>
+        public const float LandedRimStrength = 0.85f;
+
+        /// <summary>Metres per second below which a downed can stops rolling. A can lying
+        /// still must lie still rather than creep.</summary>
+        public const float DownedRollSettle = 0.35f;
+
+        // -------------------------------------------------------------------
+        // IMPACT FEEL
+        // -------------------------------------------------------------------
+
+        /// <summary>Global time scale and duration for the freeze on a landed hit.
+        ///
+        /// ⚠️ HITSTOP WRITES A GLOBAL TIME SCALE, which is why CameraRig's shake is
+        /// deliberately NOT built on it — see that file's note. Whatever drives this must
+        /// restore the previous scale even if the round ends mid-freeze.</summary>
+        public const float HitstopDuration = 0.06f;
+        public const float HitstopTimeScale = 0.05f;
+
+        /// <summary>Below this fall speed a landing is silent. Stops a unit that stepped off
+        /// a kerb from thumping like one that fell off a roof.</summary>
+        public const float LandSfxMinSpeed = 2.0f;
+
+        /// <summary>How often a networked slipper's transform is sent.</summary>
+        public const float SlipperSyncInterval = 0.25f;
+
+        // -------------------------------------------------------------------
+        // GETTING BACK UP
+        //
+        // 🧑, 2026-08-25, on the street trip hazards: *"like maybe places u can trip on?
+        // then fall down animation plays and u have to spam a button to get back up"*.
+        //
+        // ⚠⚠ A TRIP WAS THE ONLY DEAD TIME IN THE GAME A PLAYER COULD NOT ANSWER. The knockdown
+        // and the get-up already shipped: `StreetTripHazard` calls `CharacterMotor.ApplyTrip`,
+        // `CharacterAnimator` plays the knockdown while `TripLeft > 0.7` and the get-up under it,
+        // and the stagger runs for the same span. Then the timer ran down on its own and no
+        // input touched it, so 2.5 s on the floor was 2.5 s of watching. Every other status in
+        // this game is either short, self-inflicted or answered by a decision.
+        //
+        // ⚠⚠ IT IS A FLOOR, NOT A RACE, AND THAT IS THE WHOLE BALANCE OF IT. Rewarding raw
+        // press rate would hand the round to whoever owns a mouse with a turbo switch, and
+        // `docs/VISION.md` § 4 aims Hero Strike at a bracket. So: presses are RATE-CAPPED, each
+        // one buys a fixed slice, and no amount of mashing takes the fall below `MinTripDown`.
+        // The gap a mash can close is therefore bounded and knowable: from 2.50 s down to 0.90 s.
+        // -------------------------------------------------------------------
+
+        /// <summary>Seconds a single accepted press removes from a trip.
+        ///
+        /// ⚠ SOLVED, NOT PICKED. `StreetTripHazard` sets `TripDuration` to 2.50 s and
+        /// `MinTripDown` is 0.35 s, so a mash has **2.15 s** to remove, which is 6.1 presses at
+        /// this value: 0.61 s of mashing at the 10 Hz cap, for a fall of 0.96 s answered
+        /// perfectly. Raised from 0.20 with `MinTripDown` on 2026-08-26; at 0.20 the same slack
+        /// wanted 10.75 presses, which is 1.08 s of mashing and a 1.43 s fall, and it left the
+        /// per-press value doing the work the floor should have been doing.
+        ///
+        /// ⚠⚠ RAISED FROM 0.13 TO 0.20 ON 2026-08-25, AND THE OLD VALUE WAS SOLVED AGAINST THE
+        /// WRONG QUANTITY. 0.13 was chosen so the saving "lands comfortably inside the fall",
+        /// which it did: 1.60 / 0.13 = 12.3 presses at 0.10 s is 1.23 s of mashing. But what the
+        /// player experiences is not the mashing window, it is the WHOLE TIME ON THE FLOOR, and
+        /// that is the mash plus the floor: 1.23 + 0.90 = **2.13 s**. 🧑 asked for a fall you can
+        /// answer "in 1-2 seconds", and 2.13 is outside that.
+        ///
+        /// 0.20 s takes the same 1.60 s off in 8 presses, which is 0.80 s of mashing, for a total
+        /// of 0.80 + 0.90 = **1.70 s** on the floor. Still eight real presses, so it remains a
+        /// burst rather than two taps, and the anti-turbo bound in `MashCooldown` is untouched.
+        ///
+        /// ⚠ THE FLOOR IS NOT THE LEVER AND MUST NOT BECOME ONE. `MinTripDown` is pinned at
+        /// 0.90 by the knockdown clip, as its own note explains, so the only honest way to
+        /// shorten a fall is to buy the slack faster.</summary>
+        /// ⚠️⚠️ 0.22, DOWN FROM 0.35 ON 2026-08-26, BECAUSE 0.35 MADE THE MASH A TAP. 🧑, off
+        /// the 4.69 player: *"mash is weird now, I js have to click it twice to get up im not fr
+        /// mashing"*. He was measuring correctly and the arithmetic agrees: at 0.35 the 2.15 s
+        /// slack was 6.1 presses, and two of them plus a second and a half of passive bleed had
+        /// him up. A six-press burst is short enough that the passive rate is doing most of the
+        /// work in any real fall, which is the same complaint as *"it automatically resolves"*
+        /// wearing different clothes.
+        ///
+        /// At 0.22 the slack is **9.8 presses**, which is 0.98 s of hammering at the 10 Hz cap
+        /// and 1.33 s on the floor in total. That is a burst you have to commit to, it is inside
+        /// the 1 to 2 s he asked a fall to last, and two taps now buy 20 per cent of the meter
+        /// rather than a third of it.
+        public const float MashRecoverPerPress = 0.22f;
+
+        /// <summary>Shortest gap between two presses that both count.
+        ///
+        /// ⚠ THIS IS THE ANTI-TURBO BOUND AND IT IS THE REASON THE MASH IS FAIR. 10 Hz is
+        /// comfortably above what a human sustains on a burst and comfortably below what a macro
+        /// or a turbo-fire mouse does, so the ceiling is reachable by hand and cannot be beaten
+        /// by hardware.</summary>
+        public const float MashCooldown = 0.10f;
+
+        /// <summary>How long a trip lasts however hard it is answered.
+        ///
+        /// ⚠ IT IS THE GET-UP ANIMATION'S LENGTH AND NOTHING ELSE, AND IT WAS 0.90 FOR A
+        /// REASON THAT STOPPED BEING TRUE. `CharacterAnimator` switches from the knockdown to
+        /// the get-up at this value and TIME-SCALES the get-up clip to fill it exactly, so the
+        /// get-up lands as control returns. The old note said 0.90 was "pinned by the knockdown
+        /// clip"; the knockdown is now a separate held phase that ENDS here, so the only thing
+        /// this has to be long enough for is the get-up itself. Every clip on every rig measures
+        /// **0.333 s**, so 0.35 plays it at 0.95x, which is its own speed.
+        ///
+        /// ⚠⚠ AND 0.90 WAS THE "PROGRESS PAUSES" BUG. 🧑, 2026-08-26, off the built player:
+        /// *"if i mash it, the progress pauses"*. It was not a rendering fault. `MashRecover`
+        /// clamps at this floor, so with 0.90 a fall of 2.50 s had only 1.60 s a press could buy
+        /// and **0.90 s, over a third of the whole event, in which every further press was
+        /// refused**. A fast masher spent that 0.90 s hammering a button that did nothing, with
+        /// the bar crawling at the passive rate. At 0.35 the un-mashable tail is the get-up
+        /// animation and nothing else: presses count for **86 per cent** of the fall.
+        ///
+        /// ⚠ THE SWITCH USED TO BE A SEPARATE 0.70 TYPED INTO `CharacterAnimator.Choose`, which
+        /// meant part of every fall was a state with no name: the mash refused, the HUD saying
+        /// GETTING UP, and the body still face down. One number, one meaning.</summary>
+        public const float MinTripDown = 0.35f;
+
+        /// <summary>How long a fall may last with NOBODY pressing anything, after which the
+        /// body is released whatever the mash meter says.
+        ///
+        /// ⚠️⚠️ IT REPLACES `TripPassiveDecayRate`, WHICH WAS DELETED ON 2026-08-26, AND THE
+        /// DELETION IS THE FIX. That constant bled the fall away on its own at 0.60x, so a
+        /// player who pressed nothing still stood up in 3.93 s and the get-up meter was not the
+        /// thing that ended the fall. 🧑, off the 4.70 player: *"u randomly get up after set amt
+        /// of time, i dont have to actually mash it"* and *"i want it so that i can only get up
+        /// when ive reached the end of the mashing shit bcz sometimes i get up with it still at
+        /// middle or when i only clicked once"*. Both sentences describe a clock, and no value
+        /// of a decay RATE can answer them: while a rate above zero exists, time alone ends the
+        /// fall and the meter is decoration on a countdown. The three previous passes at this
+        /// (§ 12.1, § 13.1, § 14.1 in `docs/TODO.md`) each retuned the rate and each left that
+        /// property standing.
+        ///
+        /// ⚠️⚠️ SO THE RULE IS NOW ONE SENTENCE: **above `MinTripDown` only an accepted press
+        /// moves the fall.** The meter is the gate rather than a readout, and
+        /// `CharacterMotor.MashRemoved` reaching the mashable slack is the ONLY thing that puts
+        /// a player on their feet inside this window.
+        ///
+        /// ⚠️ THIS IS A STRANDING GUARD, NOT A SECOND WAY UP, and it is set far enough out that
+        /// it can never be the better option. A perfectly answered fall is 1.33 s; this is 5.0,
+        /// which is **3.8x** that and **5.1x** the 0.98 s mash window. Nobody waits five seconds
+        /// on the road to save ten presses. What it does buy is the property the old note on
+        /// `TripPassiveDecayRate` was right about: a trip that ONLY a press can clear strands a
+        /// player whose hands left the keyboard, and hands a griefing tool to anything that can
+        /// re-apply one.
+        ///
+        /// ⚠️⚠️ AND WHEN IT FIRES IT FILLS THE METER. `CharacterMotor` credits the whole slack
+        /// to `MashRemoved` on the way out, so the invariant a player can see holds without
+        /// exception: **you never stand up with the bar part-full.** Without that line this
+        /// constant would reintroduce, once every five seconds, the exact frame he photographed.
+        /// </summary>
+        public const float TripAutoRecoverSeconds = 5.0f;
+
+        /// <summary>Seconds after a trip ends during which no hazard may start another one.
+        ///
+        /// ⚠⚠ WITHOUT IT THE MASH IS A TRAP AND THE HAZARD FIELD IS A LOOP. The mash is bound
+        /// to Jump (`CharacterMotor`), so the instant `_tripLeft` reaches 0 the same hammering
+        /// becomes real jumps. A jump gives the body well over `StreetTripHazard`'s
+        /// `MinSpeedToTrip` of 1.0 m/s while it is still standing on or beside the hazard, and
+        /// the hazard trips it again. `StreetTripHazard`'s own `Cooldown` cannot answer this
+        /// because it is PER HAZARD: a neighbouring one re-trips with no wait at all, which on
+        /// Ilalim ng Tulay meant two hazards 2.6 m apart could pass a player back and forth.
+        ///
+        /// ⚠ SOLVED AGAINST THE FOOTPRINT, NOT PICKED. An attacker moves at
+        /// `Speed` * `AttackerSpeedScale` = 2.53 m/s, so 1.60 s carries them 4.05 m. The largest
+        /// hazard footprint on the map is 2.60 m, so the grace covers walking clear of the thing
+        /// that felled you from its centre, with margin.
+        ///
+        /// ⚠️⚠️ 1.60, RE-SOLVED WHEN `AttackerSpeedScale` FELL ON 2026-08-29, AND THE OLD 1.20
+        /// WOULD HAVE REINTRODUCED THE LOOP RATHER THAN MERELY BEEN STALE. It was solved against
+        /// 3.45 m/s and covered 4.14 m; at the 2.07 m/s of the first pass the same 1.20 s covers
+        /// only **2.48 m**, which is UNDER the 2.60 m footprint it exists to clear. A slower
+        /// attacker would have stood up still inside the hazard that felled them, with the grace
+        /// already expired — the exact ping-pong this constant was added to stop.
+        ///
+        /// ⚠️ AT THE SHIPPED 0.55 IT IS MARGIN RATHER THAN NECESSITY — 1.20 s would cover 3.04 m
+        /// and clear the footprint — AND IT STAYS AT 1.60 ANYWAY. The cost of the longer window
+        /// is that a hazard cannot re-trip you for four tenths of a second more; the cost of the
+        /// short one is a player passed back and forth between two hazards, which is a bug and
+        /// not a balance number. **This is what "re-measure the interlocked set" means in
+        /// practice**, and it is the one member of it that can be re-solved by arithmetic rather
+        /// than by playing.
+        ///
+        /// ⚠ IT LIVES ON THE MOTOR, NOT ON THE HAZARD, so every hazard present and future
+        /// respects one window rather than each keeping its own.</summary>
+        public const float TripGraceAfterGetUp = 1.60f;
+
+        // -------------------------------------------------------------------
+        // § MASHING OUT OF AN ABILITY STUN
+        //
+        // ⚠️⚠️ THIS APPLIES TO ABILITY STUNS ONLY AND DELIBERATELY NOT TO THE TAYA'S TAG.
+        // 🧑 2026-08-26: *"for abilities that freeze or stun enmies ... i want them to go to TPP
+        // and to have a button mashing thing to get unstunned or unfrozen (same as when u trip)
+        // but maybe diff UI and effect"*. The sentence names abilities, and the distinction is
+        // load-bearing rather than a narrow reading: `TagStunTime` is 5.0 s and the tag is the
+        // ONE scoring verb a defender has (`docs/VISION.md` § 4). Letting an attacker hammer out
+        // of it would take the single thing the taya can do and halve it, in the mode aimed at a
+        // bracket. A tag is answered by not being caught.
+        //
+        // ⚠️ SO THE TWO STATUSES NOW READ DIFFERENTLY ON PURPOSE, WHICH IS THE WHOLE POINT OF
+        // SPLITTING THEM. A tag drains the body's colour and cannot be fought (§ THE CAUGHT MARK
+        // in `Toon.shader`). An ability stun coats the body in the caster's ELEMENT and can be.
+        // One of them is a rule, the other is a fight.
+        //
+        // ⚠️ IT REUSES `MashCooldown`, NOT A SECOND RATE CAP. The 10 Hz anti-turbo bound is the
+        // reason the trip mash is fair against a macro, and there is no argument for a different
+        // ceiling here: it is the same hand on the same key.
+        // -------------------------------------------------------------------
+
+        /// <summary>
+        /// How many accepted presses break a stun, when the ability does not say otherwise.
+        ///
+        /// ⚠️⚠️ THE COST IS PER ABILITY, NOT ONE GLOBAL SLICE, AND THAT WAS ASKED FOR DIRECTLY.
+        /// 🧑 2026-08-26: *"maybe chaneg the amt needed to be button mash for each skill? make it
+        /// dependent on how hard the skill is supposed to hit"*. So the tuning knob is a PRESS
+        /// COUNT that each ability declares, and the seconds a press buys are DERIVED from it:
+        ///
+        ///     perPress = (stunTotal - MinStunDown) / breakPresses
+        ///
+        /// ⚠️ IT IS EXPRESSED AS PRESSES RATHER THAN AS SECONDS-PER-PRESS BECAUSE PRESSES ARE
+        /// THE THING BEING BALANCED. "Nemu's phase grab takes four presses, Cheska's nova takes
+        /// nine" is a sentence somebody can hold in their head and tune against. A table of
+        /// per-press durations says the same thing in units nobody experiences, and it silently
+        /// changes meaning whenever a stun's DURATION is retuned: the same 0.30 buys half as
+        /// much of a 6 s stun as of a 3 s one. Deriving from the total keeps a press count
+        /// meaning the same thing whatever the duration is.
+        ///
+        /// ⚠️ 6 IS THE MIDDLE OF THE RANGE, NOT A CEILING. `Hero_Strike_Balance.md` carries the
+        /// per-ability numbers; light staggers should sit at 3 or 4 and an ultimate's hold at 9
+        /// or more. This constant is only what an ability that never said gets.
+        /// </summary>
+        public const int StunBreakPressesDefault = 6;
+
+        /// <summary>
+        /// The bounds a per-ability press count is clamped into.
+        ///
+        /// ⚠️⚠️ THE FLOOR EXISTS SO A STUN CANNOT BE TAPPED OFF AND THE CEILING SO IT CANNOT
+        /// BECOME UNANSWERABLE. At the 10 Hz `MashCooldown`, 2 presses is 0.2 s of input, which
+        /// is inside the reaction time of noticing you were stunned at all: that is not a fight,
+        /// it is a formality. 14 presses is 1.4 s of sustained hammering, which is already longer
+        /// than the perfectly answered trip and is as far as this should ever go before the
+        /// honest answer is a longer `MinStunDown` instead.
+        ///
+        /// ⚠️ CLAMPED RATHER THAN ASSERTED, deliberately. A kit author typing 0 should get a
+        /// playable stun and a balance review, not a division by zero in the middle of a match.
+        /// </summary>
+        public const int StunBreakPressesMin = 3;
+
+        public const int StunBreakPressesMax = 14;
+
+        /// <summary>The shortest an ability stun can be made by mashing perfectly.
+        ///
+        /// ⚠⚠ IT IS A FLOOR AND IT IS WHAT KEEPS A COOLDOWN WORTH SPENDING. Without one, a
+        /// player with fast hands would clear a stun in three presses and every control ability
+        /// in Hero Strike would stop being a control ability. It is the same argument
+        /// `MinTripDown` makes, at a higher number because the thing being escaped cost somebody
+        /// a cooldown.
+        ///
+        /// ⚠⚠ **0.60, DOWN FROM 1.20, BECAUSE AT 1.20 THE MASH STOPPED PAYING AFTER TWO OR THREE
+        /// PRESSES AND THE PLAYER WAS STILL HOLDING THE KEY DOWN.** 🧑 2026-08-29: *"some button
+        /// mash dont work ... only up to 2-3 button mash and nothing registers anymore"*.
+        ///
+        /// **The floor was measured against nothing, and the stuns that shipped are short.**
+        /// `Combat.StunMashPerPress` sells `stunTotal - MinStunDown` across the ability's press
+        /// count, and `MashOutOfStun` refuses everything once `stunLeft` reaches the floor. So at
+        /// 1.20 the whole mash was worth this much:
+        ///
+        /// | ability | hold | presses | slack at 1.20 | per press | dead time after |
+        /// |---|---|---|---|---|---|
+        /// | Sean, `StunElement.Fire` | 1.50 s | 4 | **0.30 s** | 0.075 s | 1.10 s |
+        /// | possession, `Void` | 1.80 s | 6 | 0.60 s | 0.100 s | 1.20 s |
+        /// | shock | 2.00 s | 7 | 0.80 s | 0.114 s | 1.20 s |
+        /// | Dante, `Stone` | 2.20 s | 8 | 1.00 s | 0.125 s | 1.20 s |
+        /// | Cheska, `Ice` | 2.50 s | 9 | 1.30 s | 0.144 s | 1.20 s |
+        ///
+        /// Four presses at the 10 Hz `MashCooldown` is 0.4 s of input; the shortest of them then
+        /// spent **1.1 s refusing every further press**, with the meter frozen. That is the
+        /// report exactly, and it is worst on the ability a player meets most.
+        ///
+        /// At 0.60 the same five sell 0.90, 1.20, 1.40, 1.60 and 1.90 s, so **every declared
+        /// press pays and the last one lands on the floor rather than a third of the way to it.**
+        ///
+        /// ⚠ THE PRESS COUNTS ARE UNTOUCHED AND THAT IS THE POINT. They are the per-ability
+        /// tunable — see `StunBreakPressesDefault` — and moving them would have retuned five
+        /// kits to fix one constant. An unanswered stun is still its full length, so the caster's
+        /// cooldown buys exactly what it did before against anybody who does not fight it.
+        ///
+        /// ⚠ AND IT IS STILL ABOVE `Balance.MashCooldown` BY SIX TIMES, so the floor can never be
+        /// reached by a single lucky press inside one frame's window.
+        ///
+        /// ⚠ THE MICRO-STAGGERS ARE STILL UNMASHABLE AND ALWAYS WERE. `ApplyStagger(0.2f)`
+        /// through `ApplyStagger(0.4f)` are under this floor, so `StunMashPerPress` returns 0 and
+        /// `MashOutOfStun` refuses immediately. They are a quarter of a second and nobody mashes
+        /// them; if that ever needs answering the fix is `StunElement.None` on them, not a lower
+        /// floor.</summary>
+        public const float MinStunDown = 0.60f;
+    }
+}

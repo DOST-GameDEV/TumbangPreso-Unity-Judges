@@ -1,0 +1,1006 @@
+using System.Collections.Generic;
+using NUnit.Framework;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using TumbangPreso.UI;
+using UnityEngine;
+using System.Linq;
+
+namespace TumbangPreso.Tests
+{
+    /// <summary>
+    /// The Hero Strike presentation layer: its palette, its copy, its telegraphs and its deck
+    /// arithmetic.
+    ///
+    /// ⚠️⚠️ EVERY TEST IN HERE IS A REGRESSION TEST FOR SOMETHING THAT SHIPPED. The hero UI
+    /// named seventeen colours inline and drifted into a hue family the rest of the game does
+    /// not use; two hero accents sat on top of the two role colours the art direction reserves;
+    /// the ground telegraph invented its own radii and nine of twelve disagreed with the ability
+    /// they were drawn for; and four of fifteen ability descriptions were silently cut off
+    /// mid-word on the screen a player uses to choose a hero. None of the four is visible in a
+    /// code review of the file that contains it.
+    ///
+    /// `docs/Hero_Strike_UI.md` is the design these assert.
+    /// </summary>
+    public sealed class HeroPresentationTests
+    {
+        [TestCase("dante", GeoRules.EarthquakeCost)]
+        [TestCase("cheska", CryoRules.AbsoluteZeroCost)]
+        [TestCase("sean", SeanRules.UltimateCost)]
+        [TestCase("zack", ZackRules.OverclockCost)]
+        [TestCase("nemu", 15.0f)]
+        [TestCase("phaister", VoodooRules.DollCost)]
+        [TestCase("rafi", RafiRules.BahaCost)]
+        [TestCase("paete", PaeteRules.SentryCost)]
+        [TestCase("amihan", AmihanRules.StormSurgeCost)]
+        public void UltimateNeedsThreeMoreObjectivePoints(string hero, float previousCost)
+        {
+            var kit = HeroAbilitySystem.CreateKitFor(hero);
+            Assert.AreEqual(previousCost + 3, kit.UltimateCost);
+            kit.AddUltimateCharge(previousCost);
+            Assert.IsFalse(kit.IsUltimateReady, "The old price must no longer activate " + hero);
+            kit.AddUltimateCharge(2);
+            Assert.IsFalse(kit.IsUltimateReady);
+            kit.AddUltimateCharge(1);
+            Assert.IsTrue(kit.IsUltimateReady, "Exactly three more points must activate " + hero);
+        }
+
+        private static readonly string[] Heroes = Roster.HeroPeople.Select(person => person.Id).ToArray();
+
+        // ------------------------------------------------------------------ the colour law
+
+        /// <summary>
+        /// ⚠️⚠️ `Art_Direction.md` § 1: ORANGE `#f87020` MEANS OFFENSE, BLUE `#0080e8` MEANS
+        /// DEFENCE, AND NOTHING ELSE IN THE FRAME MAY SIT NEAR THOSE TWO HUES. They track the
+        /// role, which rotates every round, so they are the only two colours a player has to
+        /// READ rather than merely see.
+        ///
+        /// Two accents were breaking it. Dante was `#ff6d00`, hue 26, FOUR degrees off Offense:
+        /// a saturated orange fill sitting beside other saturated orange fills that mean "this
+        /// player is an attacker". Cheska was `#00e5ff`, hue 187, twenty off Defence.
+        ///
+        /// ⚠️ 25 DEGREES IS THE FLOOR AND IT IS DELIBERATELY NOT GENEROUS. Anything wider than
+        /// about 30 makes the warm half of the wheel unusable for three heroes whose elements
+        /// are fire, magma and lightning. The tightest the shipping set gets is Sean at 27.
+        /// </summary>
+
+
+        [Test]
+        public void InspectDanteMesh()
+        {
+            var book = Resources.Load<RosterBook>("RosterBook");
+            var dante = book.People.Find(p => p.Id == "dante");
+            Assert.IsNotNull(dante, "Dante missing");
+            var model = dante.Model;
+            var renderers = model.GetComponentsInChildren<Renderer>(true);
+            foreach (var r in renderers)
+            {
+                Debug.Log($"[DANTE_RENDERER] name={r.name} type={r.GetType().Name} mats={r.sharedMaterials.Length}");
+                if (r is SkinnedMeshRenderer smr)
+                {
+                    Debug.Log($"  Mesh submeshes={smr.sharedMesh.subMeshCount} verts={smr.sharedMesh.vertexCount}");
+                }
+            }
+        }
+
+        [Test]
+        public void NoHeroAccentSitsOnARoleColour()
+        {
+            float offense = Hue(UiTheme.Offense);
+            float defense = Hue(UiTheme.Defense);
+
+            foreach (string hero in Heroes)
+            {
+                var accent = UiTheme.ColorForHero(hero);
+                float hue = Hue(accent);
+
+                Assert.GreaterOrEqual(HueDistance(hue, offense), 25.0f,
+                    $"{hero}'s accent is {HueDistance(hue, offense):0.#} degrees from Offense " +
+                    "orange, so it can be read as 'this player is an attacker'");
+
+                Assert.GreaterOrEqual(HueDistance(hue, defense), 25.0f,
+                    $"{hero}'s accent is {HueDistance(hue, defense):0.#} degrees from Defence " +
+                    "blue, so it can be read as 'this player is the taya'");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ FIVE HEROES ON A 60 PX TILE RIM NEED REAL SEPARATION. Two accents 15 degrees apart
+        /// are one colour at that size, and the rim is the entire "is this mine and is it up"
+        /// signal. The tightest pair that ships is Dante's jade against Cheska's mint at 34.
+        /// </summary>
+        [Test]
+        public void TheFiveHeroAccentsAreTellableApart()
+        {
+            for (int i = 0; i < Heroes.Length; i++)
+            {
+                for (int j = i + 1; j < Heroes.Length; j++)
+                {
+                    float a = Hue(UiTheme.ColorForHero(Heroes[i]));
+                    float b = Hue(UiTheme.ColorForHero(Heroes[j]));
+
+                    // ⚠️ AMENDED 2026-09-25 FOR PAETE (see `UiTheme.HeroGrove`): 30 degrees of hue OR
+                    // 0.15 of OKLab distance, so a dark moss can sit beside a mid jade. The role
+                    // colours keep their hue rule above.
+                    float seen = OkLabDistance(UiTheme.ColorForHero(Heroes[i]), UiTheme.ColorForHero(Heroes[j]));
+                    Assert.IsTrue(HueDistance(a, b) >= 30.0f || seen >= 0.15f,
+                        $"{Heroes[i]} and {Heroes[j]} are only {HueDistance(a, b):0.#} degrees " +
+                        $"and {seen:0.000} OKLab apart, which is one colour on a deck tile");
+                }
+            }
+        }
+
+        /// <summary>OKLab distance between two sRGB colours (Björn Ottosson's transform).</summary>
+        private static float OkLabDistance(Color x, Color y)
+        {
+            Vector3 a = OkLab(x), b = OkLab(y);
+            return Vector3.Distance(a, b);
+        }
+
+        private static Vector3 OkLab(Color c)
+        {
+            float Lin(float v) => v <= 0.04045f ? v / 12.92f : Mathf.Pow((v + 0.055f) / 1.055f, 2.4f);
+            float r = Lin(c.r), g = Lin(c.g), bl = Lin(c.b);
+            float l = Mathf.Pow(0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * bl, 1f / 3f);
+            float m = Mathf.Pow(0.2119034982f * r + 0.6806995451f * g + 0.1073969566f * bl, 1f / 3f);
+            float s = Mathf.Pow(0.0883024619f * r + 0.2817188376f * g + 0.6299787005f * bl, 1f / 3f);
+            return new Vector3(0.2104542553f * l + 0.7936177850f * m - 0.0040720468f * s,
+                               1.9779984951f * l - 2.4285922050f * m + 0.4505937099f * s,
+                               0.0259040371f * l + 0.7827717662f * m - 0.8086757660f * s);
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE HERO CHROME IS THE WOOD SET AT ALPHA, AND IT HAS TO STAY THAT WAY. The first
+        /// pass invented a slate-blue glass palette, 🧑: *"i lowk dont get why we use light blue
+        /// and shit in some parts of ui, it doesnt really look good with brown"*. Asserting the
+        /// RGB rather than eyeballing it is what stops the next restyle drifting back off the
+        /// brand one plate at a time.
+        /// </summary>
+        [Test]
+        public void TheHeroChromeCarriesNoHueOfItsOwn()
+        {
+            // The plates are near-black and see-through, so the court reads through them. What
+            // must never come back is a plate with a HUE, which is what the imported slate blue
+            // was: `rgba(16, 22, 34)` is a desaturated navy, and three of them across the bottom
+            // of the frame is a second palette competing with the game's own.
+            AssertNeutral(UiTheme.HeroPlate, "HeroPlate");
+            AssertNeutral(UiTheme.HeroPlateRaised, "HeroPlateRaised");
+            AssertNeutral(UiTheme.HeroPlateSunk, "HeroPlateSunk");
+
+            Assert.Less(UiTheme.HeroPlate.a, 0.85f,
+                "the tray plate is nearly opaque, which makes it furniture rather than a window");
+            Assert.Less(UiTheme.HeroPlateRaised.a, 0.75f,
+                "an ability tile has to let the court through or it is a hole cut in the game");
+
+            // Rim, glyph and number all come off Cream, so the deck cannot introduce a colour.
+            AssertSameRgb(UiTheme.HeroRim, UiTheme.Cream, "HeroRim");
+            AssertSameRgb(UiTheme.HeroRimLit, UiTheme.Cream, "HeroRimLit");
+            AssertSameRgb(UiTheme.HeroGlyphOn, UiTheme.Cream, "HeroGlyphOn");
+            AssertSameRgb(UiTheme.HeroGlyphOff, UiTheme.Cream, "HeroGlyphOff");
+            AssertSameRgb(UiTheme.HeroNumber, UiTheme.Cream, "HeroNumber");
+
+            Assert.Less(UiTheme.HeroGlyphOff.a, UiTheme.HeroGlyphOn.a,
+                "an unavailable glyph must be the SAME colour at lower alpha, never a second " +
+                "hue arriving through the back door on the state players look at most");
+
+            Assert.Less(UiTheme.HeroRim.a, UiTheme.HeroRimLit.a,
+                "a resting rim must be dimmer than a lit one, or 'ready' says nothing");
+        }
+
+        /// <summary>
+        /// ⚠️ NEAR-BLACK OR NEAR-GREY, MEASURED AS SATURATION RATHER THAN EYEBALLED. A plate can
+        /// be warm (the wood family) or cold (the imported slate) at the same lightness and the
+        /// difference is invisible in a hex code and obvious on screen. Saturation is the number
+        /// that separates them: the slate blue plate sat at 0.53.
+        /// </summary>
+        private static void AssertNeutral(Color c, string name)
+        {
+            Color.RGBToHSV(c, out _, out float saturation, out float value);
+
+            Assert.Less(value, 0.20f, $"{name} is too light to sit under a glyph");
+            Assert.Less(saturation, 0.35f,
+                $"{name} has a hue of its own, which is how the hero UI drifted off the brand " +
+                "the first time");
+        }
+
+        // ------------------------------------------------------------------ the copy
+
+        /// <summary>
+        /// ⚠️⚠️ FOUR OF FIFTEEN DESCRIPTIONS USED TO STOP MID-WORD ON CHARACTER SELECT. That card
+        /// draws into a 46 px box at 14 pt, which is three lines, with
+        /// `VerticalWrapMode.Truncate`, and truncation is silent. `Summary` exists so the short
+        /// box gets a line written to fit it and the tray keeps the full sentence.
+        ///
+        /// ⚠️ 62 CHARACTERS IS MEASURED, NOT CHOSEN. The details card is about 360 px wide at
+        /// 14 pt, which is roughly 45 characters a line, and the box holds three.
+        /// </summary>
+        [Test]
+        public void EverySummaryFitsTheCardItIsDrawnIn()
+        {
+            foreach (string hero in Heroes)
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    Assert.IsNotNull(ability, $"{hero} is missing an ability");
+
+                    Assert.IsNotEmpty(ability.Summary,
+                        $"{hero}: {ability.Name} has no summary, so character select draws a " +
+                        "blank line where the tactical readout goes");
+
+                    Assert.LessOrEqual(ability.Summary.Length, 62,
+                        $"{hero}: {ability.Name}'s summary is {ability.Summary.Length} " +
+                        "characters and the card holds about 62 before it truncates silently");
+
+                    Assert.IsNotEmpty(ability.Description,
+                        $"{hero}: {ability.Name} has no description for the inspect tray");
+
+                    // ⚠️⚠️ THE DESCRIPTION HAS A CEILING TOO, AND THE TRAY IS THE ONE PLACE IN
+                    // THE GAME THAT DOES NOT TRUNCATE. `AbilityInspectPanel` sets the body to
+                    // `HorizontalWrapMode.Wrap` with `VerticalWrapMode.Overflow` and a
+                    // `minHeight` of 120, deliberately: it exists to hold the sentences the deck
+                    // refuses to carry, so cutting them off here would leave the full text
+                    // nowhere at all. **The consequence is that a long description does not get
+                    // clipped, it draws over the card underneath**, which is the fault that
+                    // file's own note warns about in those words.
+                    //
+                    // ⚠️ 125 IS MEASURED, NOT CHOSEN. The body is about 640 px wide at 20 pt,
+                    // which is roughly 32 characters a line, and `minHeight` 120 is four lines at
+                    // that size. The longest description that shipped before 2026-09-02 was
+                    // SUPERNOVA at 120. The hold-to-aim pass on that date pushed MAGNET to 177
+                    // and HEX to 142 before this bound existed, which is a fifth line and a half
+                    // drawn through the card below them.
+                    //
+                    // 175 since 2026-11-05: the owner asked for VALORANT-style lines written from what
+                    // each ability actually does, with the player's own key icons ("PRESS {KEY} to ...",
+                    // drawn by `UI.InlinePromptText`), allowed past 125 and a taller reference that grows
+                    // to fit; the longest is 170 with its marks.
+                    Assert.LessOrEqual(ability.Description.Length, 175,
+                        $"{hero}: {ability.Name}'s description is {ability.Description.Length} " +
+                        "characters. The inspect tray body wraps and OVERFLOWS rather than " +
+                        "truncating, so anything over about four lines draws over the card " +
+                        "under it. Move the detail into the summary or cut a clause.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ THE NAME HAS TO FIT THE HEADER ROW BESIDE THE COOLDOWN CHIP. "GLACIAL BLIZZARD
+        /// NOVA" and "THUNDERSTRIKE OVERDRIVE" both pushed the `[AREA BURST] · 9s CD` meta off
+        /// the end of the row, which is the half of that line carrying the numbers.
+        /// </summary>
+        [Test]
+        public void EveryAbilityNameFitsItsHeaderRow()
+        {
+            foreach (string hero in Heroes)
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    Assert.IsNotEmpty(ability.Name, $"{hero}: an ability has no name");
+                    Assert.LessOrEqual(ability.Name.Length, 18,
+                        $"{hero}: '{ability.Name}' is {ability.Name.Length} characters and " +
+                        "pushes the cooldown meta off the end of the header row");
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ the telegraphs
+
+        /// <summary>
+        /// The radius and forward offset every ground-placed power draws, checked against what
+        /// its `OnActivate` actually spawns.
+        ///
+        /// ⚠️⚠️ THE HUD USED TO INVENT THESE AND NINE OF THE TWELVE WERE WRONG.
+        /// `HeroAbilitySystem.UpdateReticle` drew 7.5 m for ANY ultimate, 5.0 m for ANY first
+        /// skill and 3.5 m for ANY second, and pushed the ring forward only when the kit happened
+        /// to be Cheska's. Dante's 2.4 m stomp drew a 5.0 m ring. Nemu's 3.2 m void drew 7.5 m,
+        /// centred on Nemu, when it lands 3.5 m in front of them.
+        ///
+        /// ⚠️ THIS TABLE IS THE SECOND COPY OF EACH NUMBER AND THAT IS THE POINT, exactly as
+        /// `Design.md` is the second copy of every balance number: a value written twice in two
+        /// places that must agree is a value a test can catch drifting. Change a spawn radius in
+        /// a kit and this row goes red.
+        /// </summary>
+        [Test]
+        public void TelegraphsMatchWhatTheAbilityPlaces()
+        {
+            AssertTelegraph("cheska", 1, 2.3f, 5.0f);   // Cold Feet places an aimed 2.3 m ice sheet.
+            AssertTelegraph("cheska", 2, 0.0f, 0.0f);   // Frostbite loads her own slipper; no ground target.
+            AssertTelegraph("cheska", 3, 0.0f, 0.0f);   // Absolute Zero affects every other player, map-wide.
+            AssertRoleTelegraph("cheska", 2.1f, 4.0f); // Glacial Wall's 4.2 m arc, aimed up to 4 m.
+            Assert.IsFalse(HeroAbilitySystem.CreateKitFor("cheska").AttackingSkill.HasTelegraph,
+                "Frostbite must not draw the retired Ice Barricade ring over a self-buffed slipper");
+
+            AssertTelegraph("dante", 1, 0.0f, 0.0f);    // Shield is self armour.
+            AssertTelegraph("dante", 2, 0.7f, 9.0f);    // Boulder aims a 0.7 m hit body up to 9 m.
+            AssertTelegraph("dante", 3, 0.0f, 0.0f);    // Earthquake is map-wide.
+            AssertRoleTelegraph("dante", 0.0f, 0.0f);  // Barrier follows Dante; it is not ground-placed.
+
+            AssertTelegraph("nemu", 1, 2.2f, 7.0f);     // Terrify leaves Kuro at an aimed haunt spot.
+            AssertTelegraph("nemu", 2, 0.0f, 0.0f);     // Kuro Fetch tracks a loose slipper.
+            AssertTelegraph("nemu", 3, 4.0f, 3.5f);     // Live KuroUnbound radius; range is the petless fallback.
+            AssertRoleTelegraph("nemu", 0.0f, 0.0f);   // Kuro Guard moves with the can.
+
+            AssertTelegraph("sean", 1, 0.0f, 0.0f);     // dash
+            AssertTelegraph("sean", 2, 0.0f, 0.0f);     // throw empower
+            AssertTelegraph("sean", 3, 5.4f, 0.0f);     // Live blast and crater share the 5.4 m footprint.
+
+            AssertTelegraph("zack", 1, 0.0f, 0.0f);     // BACKTRACK goes to his own path, nothing aimed.
+            AssertTelegraph("zack", 2, 0.0f, 0.0f);     // FULL THROTTLE is on him.
+            AssertTelegraph("zack", 3, 0.0f, 0.0f);     // OVERCLOCK is on him.
+            AssertRoleTelegraph("zack", .35f, ZackRules.LiveWireMaxLength); // LIVE WIRE: post B's spot, up to 6 m.
+
+            AssertTelegraph("phaister", 1, 1.15f, 5.5f); // TELEPORT's arrival mark and max reach.
+
+            AssertTelegraph("phaister", 2, 0.0f, 0.0f);  // CURSE: DRAIN reaches a player; nothing on the ground.
+            AssertTelegraph("phaister", 3, 0.0f, 0.0f); // VOODOO DOLL wakes beside her; nothing is aimed or placed.
+            AssertRoleTelegraph("phaister", 0.0f, 0.0f); // CURSE: HEX reaches a player too.
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE BOTS ARE THE CANARY FOR WHETHER A HUMAN CAN READ THE FLOOR, AND THIS MAKES
+        /// THE CANARY AUTOMATIC. `docs/VISION.md` § 2 states it directly, and
+        /// `AiTuning.HazardAvoidMaxRadius` is the cap that exists because of it: there is no way
+        /// around a disc that covers half the arena, so a bot that tries walks the perimeter
+        /// until the round ends. Measured, when avoidance was first switched on with no cap:
+        /// `BotBehaviourProbe`'s Hero Strike run fell from 78 to 97 throws in four rounds to
+        /// **17**, while Classic, which has no hazards, did not move.
+        ///
+        /// As of the 2026-08-25 footprint pass every registered hazard is under the cap, so the
+        /// cap binds nothing and avoidance applies to all of them. **That is a property worth
+        /// keeping and it is not visible in the file that would break it**: a new ability
+        /// registering a 4 m zone compiles, runs, looks fine in the editor, and strands every
+        /// bot on the perimeter of every map it is cast on.
+        ///
+        /// ⚠️ IT ASSERTS THE TELEGRAPH RADIUS RATHER THAN THE `HazardVolume`, because the volume
+        /// only exists at runtime and `TelegraphsMatchWhatTheAbilityPlaces` above already pins
+        /// the telegraph to what the ability actually spawns. The two tests together cover the
+        /// spawn without needing a live scene.
+        /// </summary>
+        [Test]
+        public void EveryRegisteredHazardStaysUnderTheBotAvoidanceCap()
+        {
+            foreach (string hero in Heroes)
+            {
+                var kit = Abilities.HeroAbilitySystem.CreateKitFor(hero);
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    if (ability == null || !ability.HasTelegraph) continue;
+
+                    // ⚠️ ULTIMATES ARE EXEMPT AND THAT IS `docs/VISION.md` § 2 RULE 2: *"An
+                    // ultimate may be big. One at a time."* Supernova, Thunderstrike, Glacial
+                    // Nova and Titan Fissure are all over the cap by design and none of them
+                    // registers a persistent `HazardVolume`: they are instantaneous blasts, so
+                    // there is no ground for a bot to path around after the frame they fire.
+                    // Seance Void is the one ultimate that DOES persist, and it is checked.
+                    if (ability == kit.Ultimate && ability.Id != "nemu_ultimate") continue;
+
+                    Assert.LessOrEqual(ability.TelegraphRadius, AiTuning.HazardAvoidMaxRadius,
+                        $"{hero}/{ability.Id} leaves a {ability.TelegraphRadius} m hazard, over "
+                        + $"the {AiTuning.HazardAvoidMaxRadius} m cap. The bots will walk "
+                        + "straight through it: see AiTuning.HazardAvoidMaxRadius for what that "
+                        + "measured last time, and docs/Hero_Strike_Balance.md § 3.3.");
+                }
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ A RANGE WITHOUT A RADIUS IS A RING NOBODY CAN SEE. `HasTelegraph` is keyed on the
+        /// radius alone, so an ability given an offset and no size would silently draw nothing
+        /// while looking correctly filled in from the constructor call.
+        /// </summary>
+        [Test]
+        public void NoAbilityCarriesAnOffsetWithoutASize()
+        {
+            foreach (string hero in Heroes)
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    if (ability.TelegraphRange <= 0.0f) continue;
+
+                    Assert.IsTrue(ability.HasTelegraph,
+                        $"{hero}: {ability.Name} is placed {ability.TelegraphRange} m forward " +
+                        "but has no radius, so its telegraph draws nothing at all");
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------ the deck
+
+        /// <summary>
+        /// ⚠️⚠️ A `HorizontalLayoutGroup` OVERFLOWS ITS RECT SILENTLY. Three cards that no longer
+        /// fit are laid out past the edge of the plate, and the overflow lands under the
+        /// first-person hands where it is least visible and most annoying. The identity below is
+        /// the whole reason those numbers are named constants rather than literals.
+        /// </summary>
+        [Test]
+        public void TheHeroDeckWidthMatchesItsChildren()
+        {
+            float children = Hud.DeckPadding * 2.0f
+                             + Hud.DeckSpacing * (Hud.DeckCardCount - 1)
+                             + Hud.SkillCardWidth * 2.0f
+                             + Hud.UltimateCardWidth;
+
+            Assert.AreEqual(Hud.DeckWidth, children, 0.001f,
+                $"the deck plate is {Hud.DeckWidth} wide but its children need {children}; " +
+                "the cards will be laid out past the edge of it");
+        }
+
+        /// <summary>
+        /// ⚠️ THE DECK HAS TO CLEAR THE VIEWMODEL. It is a badge, not a bar: it was 592 x 122 at
+        /// `y = 24`, which is over half a 1080p screen's width of chrome sitting on the hands.
+        /// </summary>
+        [Test]
+        public void TheHeroDeckStaysASlimBadge()
+        {
+            Assert.LessOrEqual(Hud.DeckWidth, 280.0f, "the deck has grown back into a bar");
+            Assert.LessOrEqual(Hud.DeckHeight, 80.0f, "the deck is tall enough to cover the hands");
+        }
+
+        [Test]
+        public void CooldownReadoutIsPreciseOnlyWhenItMatters()
+        {
+            Assert.AreEqual("9", AbilityDeckHud.CooldownLabel(8.01f));
+            Assert.AreEqual("3", AbilityDeckHud.CooldownLabel(3.0f));
+            Assert.AreEqual("2.9", AbilityDeckHud.CooldownLabel(2.94f));
+            Assert.AreEqual("0.1", AbilityDeckHud.CooldownLabel(0.06f));
+            Assert.AreEqual(string.Empty, AbilityDeckHud.CooldownLabel(0.0f));
+            Assert.AreEqual(0.5f, AbilityDeckHud.CooldownSweep(4.0f, 8.0f), 0.001f);
+            Assert.AreEqual(0.0f, AbilityDeckHud.CooldownSweep(2.0f, 0.0f), 0.001f);
+        }
+
+        // ------------------------------------------------------------------ cast outcomes
+
+        /// <summary>
+        /// ⚠️⚠️ "ON COOLDOWN" AND "CANNOT ACT RIGHT NOW" ARE DIFFERENT ANSWERS AND THE WHOLE
+        /// ANTI-CLUNK FIX RESTS ON THEM BEING TOLD APART. One is a refusal the UI answers with a
+        /// red tick and clears; the other is buffered and retried for 0.30 s. They used to come
+        /// back as the same `false`, so a skill pressed during a five second stun was eaten with
+        /// no feedback anywhere, which reads to a player as the game dropping their input.
+        /// </summary>
+        [Test]
+        public void ACoolingAbilityAnswersDifferentlyFromAnEmptyMeter()
+        {
+            var kit = new ProbeKit();
+
+            Assert.AreEqual(HeroKit.CastOutcome.NoCharge, kit.CastUltimate(null),
+                "an empty meter has to say so, not fall through to a generic refusal");
+
+            kit.AddUltimateCharge(HeroKit.UltimateMax);
+            Assert.AreEqual(HeroKit.CastOutcome.Cast, kit.CastUltimate(null),
+                "a full meter was refused");
+
+            Assert.AreEqual(HeroKit.CastOutcome.NoCharge, kit.CastUltimate(null),
+                "the meter was spent, so the next press is a charge refusal");
+        }
+
+        /// <summary>
+        /// ⚠️ A SKILL ON COOLDOWN SAYS `Cooling`, AND THAT IS WHAT THE RED TICK HANGS OFF. It is
+        /// also the outcome that must NOT be buffered: holding it would fire the skill the
+        /// instant it came back, seconds after the press, which is the same complaint wearing a
+        /// helpful face.
+        /// </summary>
+        [Test]
+        public void ASkillOnCooldownSaysSo()
+        {
+            var kit = new ProbeKit();
+
+            Assert.AreEqual(HeroKit.CastOutcome.Cast, kit.CastSkill1(null),
+                "a ready skill was refused");
+
+            Assert.AreEqual(HeroKit.CastOutcome.Cooling, kit.CastSkill1(null),
+                "a skill still on cooldown has to say cooling, not a generic refusal");
+
+            Assert.AreEqual(HeroKit.CastOutcome.Missing, kit.CastSkill2(null),
+                "a hero without a second power must draw nothing rather than a refusal");
+        }
+
+        /// <summary>
+        /// A stand-in kit, because the real ones need a live `CharacterMotor` to cast and this
+        /// file is EditMode. Same shape as the probe in `InputMapAndAbilityTests`.
+        /// </summary>
+        private sealed class ProbeAbility : HeroAbility
+        {
+            public override AbilityNetworkMode NetworkMode => AbilityNetworkMode.Predicted;
+            public ProbeAbility(float cooldown)
+                : base("probe", "PROBE", "A stand-in.", cooldown, 0.0f, AbilityGlyph.Burst)
+            {
+            }
+
+            // ⚠️ IT SKIPS THE MOTOR CHECK, WHICH IS THE ONLY REASON THIS CAN RUN IN EditMode.
+            // The base refuses a null context outright, and a null context is exactly what a
+            // test without a scene has.
+            public override bool CanActivate(AbilityContext ctx) => IsReady;
+        }
+
+        private sealed class ProbeKit : HeroKit
+        {
+            public ProbeKit() : base("probe", "PROBE")
+            {
+                Skill1 = new ProbeAbility(5.0f);
+                Skill2 = null;
+                Ultimate = new ProbeAbility(0.0f);
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ THE BUFFER WINDOW IS BOUNDED AT BOTH ENDS. Long enough to cover a stagger, which
+        /// the shove and the hazard pulses apply for 0.20 to 0.35 s; short enough that a press
+        /// made a second ago cannot come out on its own later, at a moment the player did not
+        /// choose. That second failure is the one buffering usually introduces.
+        /// </summary>
+        [Test]
+        public void TheInputBufferIsShortEnoughToBeAnAid()
+        {
+            Assert.GreaterOrEqual(HeroAbilitySystem.InputBufferWindow, 0.20f,
+                "shorter than a stagger, so it cannot do the job it exists for");
+            Assert.LessOrEqual(HeroAbilitySystem.InputBufferWindow, 0.40f,
+                "long enough that a stale press fires at a moment nobody asked for");
+        }
+
+        /// <summary>
+        /// ⚠️ EVERY HERO ABILITY HAS A BESPOKE 3RD-PERSON BODY ACTION AND 1ST-PERSON VIEWMODEL ACTION.
+        /// Names alone are insufficient: each live action must be registered, serialized
+        /// on its own shipping roster, and bound to real model paths.
+        /// </summary>
+        [TestCaseSource(nameof(Heroes))]
+        public void EveryHeroAbilityHasBespokeCastAndViewModelActions(string hero)
+        {
+            var go = new GameObject("Hero action dispatcher probe");
+            go.SetActive(false); // Dispatch coverage needs no arm geometry or scene ownership.
+            try
+            {
+                var vm = go.AddComponent<CameraSystem.ViewmodelArms>();
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+                var art = Resources.Load<RosterEntryAsset>("Roster/person_" + hero);
+                Assert.IsNotNull(art, $"{hero}: missing shipping roster entry");
+                Assert.IsNotNull(art.Model, $"{hero}: missing shipping model");
+                Assert.IsNotNull(art.Clips, $"{hero}: missing serialized clip list");
+                var rigRoot = art.Model.GetComponentInChildren<Animator>(true)?.transform ?? art.Model.transform;
+
+                foreach (var ability in kit.AllAbilities)
+                {
+                    Assert.IsNotNull(ability, $"{hero} is missing an ability");
+                    // ⚠️ The COMING SOON defending slot (`PlaceholderRoleAbility`, ABILITY-2) casts and does nothing,
+                    // so it has no cast or first-person action on purpose; see `RosterArmGeometryTests`.
+                    if (ability is PlaceholderRoleAbility) continue;
+                    Assert.IsFalse(string.IsNullOrEmpty(ability.CastAction),
+                        $"{hero}: {ability.Name} is missing a CastAction");
+                    Assert.IsFalse(string.IsNullOrEmpty(ability.ViewmodelAction),
+                        $"{hero}: {ability.Name} is missing a ViewmodelAction");
+
+                    Assert.IsTrue(ability.CastAction.StartsWith("hero-"),
+                        $"{hero}: {ability.Name} still uses a generic body action '{ability.CastAction}'");
+                    Assert.IsTrue(Visual.CharacterAnimator.ActionChains.TryGetValue(ability.CastAction, out var chain),
+                        $"{hero}: {ability.Name} requests an unregistered body action '{ability.CastAction}'");
+                    Assert.AreEqual(ability.CastAction, chain[0],
+                        $"{hero}: {ability.Name} must try its own action before any fallback");
+                    var clip = art.Clips.FirstOrDefault(c => c != null && c.name == ability.CastAction);
+                    Assert.IsNotNull(clip,
+                        $"{hero}: {ability.Name} has no serialized own clip; Editor-generated or generic fallbacks can mask this");
+                    Assert.Greater(clip.length, 0, $"{hero}: {clip.name} has no duration");
+                    var bindings = UnityEditor.AnimationUtility.GetCurveBindings(clip);
+                    Assert.IsNotEmpty(bindings, $"{hero}: {clip.name} has no authored curves");
+                    foreach (var binding in bindings)
+                        if (!string.IsNullOrEmpty(binding.path))
+                            Assert.IsNotNull(rigRoot.Find(binding.path),
+                                $"{hero}: {clip.name} binds a missing model path '{binding.path}'");
+
+                    Assert.IsTrue(vm.PlayAction(ability.ViewmodelAction),
+                        $"{hero}: {ability.Name} ViewmodelAction '{ability.ViewmodelAction}' is not supported by ViewmodelArms");
+                }
+            }
+            finally { Object.DestroyImmediate(go); }
+        }
+
+        /// <summary>
+        /// ⚠️ VIEWMODEL ARMS MUST STYLE BESPOKE SKIN TONES, SLEEVES, MARKINGS, AND ACCESSORIES
+        /// FOR EVERY HERO AND EVERY CLASSIC CHARACTER MATCHING THEIR TPP MODEL.
+        /// </summary>
+        [Test]
+        public void ViewmodelArms_StylesUniqueSkinToneAndAccessories_ForEveryCharacter()
+        {
+            var vm = new GameObject("TestVM_CharacterArms").AddComponent<CameraSystem.ViewmodelArms>();
+
+            string[] allCharacters =
+            {
+                // Heroes
+                "sean", "zack", "dante", "cheska", "nemu", "phaister", "rafi",
+                // Classic Roster
+                "bayan", "maring", "totoy", "inday", "kuya_boy", "ate_girlie",
+                "tikboy", "bebang", "jun_jun", "lola_pacing", "mang_kanor", "aling_nena",
+                "classic"
+            };
+
+            foreach (string charId in allCharacters)
+            {
+                vm.SetCharacter(charId);
+
+                string norm = CameraSystem.ViewmodelArms.NormalizeCharacterId(charId);
+                Assert.AreEqual(norm, vm.CurrentHeroId, $"ViewmodelArms failed to normalize character {charId}");
+                Assert.AreEqual(CameraSystem.ViewmodelArms.SkinColorForCharacter(charId), vm.CurrentSkinColor,
+                    $"ViewmodelArms applied wrong skin tone for {charId}");
+
+                var renderers = vm.GetComponentsInChildren<MeshRenderer>(true);
+                int accessoryCount = 0;
+
+                foreach (var r in renderers)
+                {
+                    Assert.IsNotNull(r.sharedMaterial, $"{charId}: Renderer on {r.gameObject.name} has null material");
+                    Assert.IsNotNull(r.sharedMaterial.shader, $"{charId}: Renderer on {r.gameObject.name} has null shader");
+                    if (r.gameObject.name.StartsWith("~HeroAccessory_")) accessoryCount++;
+                }
+
+                var baked = Resources.Load<Mesh>(norm == "inday" ? "Models/FppDetails/inday_right_arm" : "Models/RosterArms/" + norm + "_right");
+                if (norm == "rafi" || norm == "inday")
+                {
+                    Assert.IsNotNull(baked, charId + " source arm was not baked");
+                    Assert.AreSame(baked,vm.transform.Find("RightPivot/Arm").GetComponent<MeshFilter>().sharedMesh,
+                        charId + " is not using its actual authored sleeve and hand");
+                }
+                else
+                {
+                    // Retained cast uses the approved solid hand frame plus authored sleeves.
+                    Assert.AreSame(Resources.Load<Mesh>("Models/viewmodel_arm"),
+                        vm.transform.Find("RightPivot/Arm").GetComponent<MeshFilter>().sharedMesh);
+                    Assert.Greater(accessoryCount, 0, $"{charId} viewmodel has no clothing");
+                }
+            }
+
+            Object.DestroyImmediate(vm.gameObject);
+        }
+
+        /// <summary>
+        /// ⚠️ THE HELD SLIPPER MUST REMAIN PARENTED UNDER RightPivot/Arm ACROSS CHARACTER SWAPS AND PLAYING ACTIONS.
+        /// </summary>
+        [Test]
+        public void ViewmodelArms_PreservesHeldSlipperAndActions_AcrossCharacterSwaps()
+        {
+            var vm = new GameObject("TestVM_Slipper").AddComponent<CameraSystem.ViewmodelArms>();
+            vm.EnsureBuilt();
+
+            var rightArm = vm.transform.Find("RightPivot/Arm");
+            Assert.IsNotNull(rightArm, "RightPivot/Arm transform missing from ViewmodelArms");
+
+            var heldSlipper = rightArm.Find("HeldSlipper");
+            Assert.IsNotNull(heldSlipper, "HeldSlipper missing or not parented to RightPivot/Arm");
+
+            string[] testRoster =
+            {
+                "sean", "zack", "dante", "cheska", "nemu",
+                "bayan", "maring", "totoy", "inday", "kuya_boy", "ate_girlie",
+                "tikboy", "bebang", "jun_jun", "lola_pacing", "mang_kanor", "aling_nena"
+            };
+
+            foreach (string charId in testRoster)
+            {
+                vm.SetCharacter(charId);
+
+                // HeldSlipper must survive accessory clearing
+                heldSlipper = rightArm.Find("HeldSlipper");
+                Assert.IsNotNull(heldSlipper, $"{charId}: HeldSlipper was destroyed during SetCharacter");
+
+                vm.SetHolding(true);
+                Assert.IsTrue(heldSlipper.gameObject.activeSelf, $"{charId}: SetHolding(true) failed");
+
+                vm.SetHolding(false);
+                Assert.IsFalse(heldSlipper.gameObject.activeSelf, $"{charId}: SetHolding(false) failed");
+
+                // If hero, check ability actions; otherwise check throw / grab
+                if (System.Array.IndexOf(Heroes, charId) >= 0)
+                {
+                    var kit = HeroAbilitySystem.CreateKitFor(charId);
+                    foreach (var ability in kit.AllAbilities)
+                    {
+                        // The COMING SOON defending slot has no hands on purpose (`PlaceholderRoleAbility`).
+                        if (ability is PlaceholderRoleAbility) continue;
+                        Assert.IsTrue(vm.PlayAction(ability.ViewmodelAction),
+                            $"{charId}: PlayAction failed for {ability.ViewmodelAction}");
+                    }
+                }
+                else
+                {
+                    Assert.IsTrue(vm.PlayAction("throw"));
+                    Assert.IsTrue(vm.PlayAction("slam"));
+                }
+            }
+
+            Object.DestroyImmediate(vm.gameObject);
+        }
+
+        // ------------------------------------------------------------------ helpers
+
+        private static void AssertTelegraph(string hero, int slot, float radius, float range)
+        {
+            var kit = HeroAbilitySystem.CreateKitFor(hero);
+            var ability = slot == 1 ? kit.Skill1 : slot == 2 ? kit.Skill2 : kit.Ultimate;
+
+            Assert.IsNotNull(ability, $"{hero} slot {slot} is missing");
+
+            Assert.AreEqual(radius, ability.TelegraphRadius, 0.001f,
+                $"{hero}: {ability.Name} draws a {ability.TelegraphRadius} m ring but places " +
+                $"a {radius} m effect");
+
+            Assert.AreEqual(range, ability.TelegraphRange, 0.001f,
+                $"{hero}: {ability.Name} draws its ring {ability.TelegraphRange} m ahead but " +
+                $"places the effect {range} m ahead");
+        }
+
+        private static void AssertRoleTelegraph(string hero, float radius, float range)
+        {
+            var ability = HeroAbilitySystem.CreateKitFor(hero).DefendingSkill;
+            Assert.IsNotNull(ability, $"{hero} has no defending role power");
+            Assert.AreEqual(radius, ability.TelegraphRadius, 0.001f, $"{hero}: defending radius differs from its effect");
+            Assert.AreEqual(range, ability.TelegraphRange, 0.001f, $"{hero}: defending reach differs from its effect");
+        }
+
+        [Test]
+        public void EveryAbilityAcrossAllHeroesHasAUniqueBespokeGlyph()
+        {
+            var seenGlyphs = new HashSet<AbilityGlyph>();
+            int totalAbilities = 0;
+            var placeholderHeroes = new List<string>();
+
+            foreach (string hero in Heroes)
+            {
+                var kit = HeroAbilitySystem.CreateKitFor(hero);
+                foreach (var slot in kit.ScreenSlots)
+                {
+                    var ability = slot.Ability;
+                    if (ability is PlaceholderRoleAbility)
+                    {
+                        placeholderHeroes.Add(hero);
+                        Assert.AreEqual("DEFENDING", slot.Label, hero);
+                        Assert.AreEqual("COMING SOON", ability.EffectiveName, hero);
+                        Assert.That(ability.Summary, Does.Contain("Does nothing yet"), hero);
+                        Assert.AreEqual(AbilityGlyph.ComingSoon, ability.Glyph, hero);
+                        Assert.AreEqual("COMING SOON", AbilityIcons.LabelFor(ability.Glyph), hero);
+                        Assert.IsNotNull(AbilityIcons.For(ability.Glyph), hero);
+                        continue;
+                    }
+                    totalAbilities++;
+                    Assert.AreNotEqual(AbilityGlyph.ComingSoon, ability.Glyph, hero + " has an implemented power with a placeholder icon");
+                    Assert.IsTrue(System.Enum.IsDefined(typeof(AbilityGlyph), ability.Glyph),
+                        $"{hero} {ability.Name} has an undefined glyph value: {ability.Glyph}");
+
+                    Assert.IsFalse(seenGlyphs.Contains(ability.Glyph),
+                        $"Duplicate glyph detected! {hero}'s ability '{ability.Name}' reuses glyph {ability.Glyph}, which is already used by another ability.");
+
+                    seenGlyphs.Add(ability.Glyph);
+
+                    // Ensure Sprite generation works and has a non-empty label
+                    var sprite = AbilityIcons.For(ability.Glyph);
+                    Assert.IsNotNull(sprite, $"AbilityIcons.For returned null for glyph {ability.Glyph}");
+
+                    string label = AbilityIcons.LabelFor(ability.Glyph);
+                    Assert.IsNotEmpty(label, $"AbilityIcons.LabelFor returned empty for glyph {ability.Glyph}");
+                }
+            }
+
+            Assert.IsEmpty(placeholderHeroes, "Every current hero has an implemented defending power.");
+            Assert.AreEqual(36, totalAbilities, "Expected 36 implemented powers among the 36 displayed slots");
+            Assert.AreEqual(36, seenGlyphs.Count, "Every implemented power needs its own glyph");
+        }
+
+        private static void AssertSameRgb(Color actual, Color expected, string name)
+        {
+            Assert.AreEqual(expected.r, actual.r, 0.001f, $"{name} red channel left the wood set");
+            Assert.AreEqual(expected.g, actual.g, 0.001f, $"{name} green channel left the wood set");
+            Assert.AreEqual(expected.b, actual.b, 0.001f, $"{name} blue channel left the wood set");
+        }
+
+        /// <summary>Hue in degrees, 0 to 360. Unity's own conversion, so it cannot disagree.</summary>
+        private static float Hue(Color c)
+        {
+            Color.RGBToHSV(c, out float h, out _, out _);
+            return h * 360.0f;
+        }
+
+        /// <summary>The short way round a 360 degree wheel.</summary>
+        /// <summary>
+        /// Nemu's viewmodel arms build the draped hoodie sleeve, the inner shadow cavity, the
+        /// glowing cuff rim and the tucked spirit hand, and NOTHING deforms any of them.
+        ///
+        /// ⚠️⚠️ THE CLOTH SOLVER THIS TEST USED TO REQUIRE IS DELETED, AND THE ASSERTION IS
+        /// INVERTED RATHER THAN REMOVED. 🧑 2026-08-27, in first person: *"her sleeves are phasing
+        /// and looks weird ... maybe js remove the physics on her sleeves bcz it looks so ugly, js
+        /// show me cute blocky sleeves"*. `ViewmodelClothPhysics` instanced the SLEEVE mesh and
+        /// moved its vertices while the lining and the cuff rim, which share that volume, stayed
+        /// put, so the outer shell walked through both on every step and every look. No damping
+        /// value fixes that: the surfaces are not solved together.
+        ///
+        /// ⚠️ SO THE TEST NOW ASSERTS THE ABSENCE. A deleted requirement that leaves no assertion
+        /// behind is a requirement that quietly comes back the next time somebody thinks secondary
+        /// motion would be nice, and the four pieces of geometry are still worth pinning.
+        /// </summary>
+        [Test]
+        public void Nemu_ViewmodelArms_CreatesBespokeDrapedHoodieSleevesWithNoClothSolver()
+        {
+            var vm = new GameObject("TestVM_NemuCloth").AddComponent<CameraSystem.ViewmodelArms>();
+            vm.EnsureBuilt();
+            vm.SetCharacter("nemu");
+
+            var rightArm = vm.transform.Find("RightPivot/Arm");
+            var leftArm = vm.transform.Find("LeftPivot/Arm");
+            Assert.IsNotNull(rightArm, "RightPivot/Arm missing");
+            Assert.IsNotNull(leftArm, "LeftPivot/Arm missing");
+
+            var mf = rightArm.GetComponent<MeshFilter>();
+            Assert.AreSame(Resources.Load<Mesh>("Models/viewmodel_arm"), mf.sharedMesh);
+            Assert.AreSame(mf.sharedMesh, leftArm.GetComponent<MeshFilter>().sharedMesh);
+            foreach (var arm in new[] { rightArm, leftArm })
+                foreach (string part in new[] { "HoodieSleeve", "HoodieCuff", "HoodieHem", "HoodieMouth", "LavenderCuffTrim", "SpiritHand" })
+                    Assert.IsNotNull(arm.Find("~HeroAccessory_" + part), part);
+            Assert.IsFalse(vm.GetComponentsInChildren<Component>(true)
+                .Any(component => component != null && component.GetType().Name == "ViewmodelClothPhysics"));
+            Assert.IsFalse(mf.sharedMesh.name.Contains("Deformed"),
+                "The sleeve must remain the shared authored geometry, without a per-instance cloth solver.");
+
+            // A throw still plays, and stepping the arms is still stable with no solver in them.
+            vm.StepVisuals(0.016f);
+            Assert.IsTrue(vm.PlayAction("throw"));
+            for (int i = 0; i < 60; i++) vm.StepVisuals(0.016f);
+
+            Assert.IsFalse(float.IsNaN(rightArm.localPosition.x), "Arm pose produced NaN");
+
+            Object.DestroyImmediate(vm.gameObject);
+        }
+
+        private static float HueDistance(float a, float b)
+        {
+            float d = Mathf.Abs(a - b) % 360.0f;
+            return d > 180.0f ? 360.0f - d : d;
+        }
+
+        // -------------------------------------------------------------------
+        // § WHAT A CAST ACTUALLY LOOKS LIKE
+        // -------------------------------------------------------------------
+
+        /// <summary>Every hero action, in the order `HeroAbility.CastAction` names them.</summary>
+        private static readonly string[] Ultimates =
+        {
+            "hero-sean-supernova", "hero-zack-overclock", "hero-dante-fissure",
+            "hero-cheska-nova", "hero-nemu-seance", "hero-phaister-eclipse",
+        };
+
+        private static readonly string[][] Kits =
+        {
+            new[] { "hero-sean-dash", "hero-sean-ignite", "hero-sean-supernova" },
+            new[] { "hero-zack-backtrack", "hero-zack-throttle", "hero-zack-wire", "hero-zack-overclock" },
+            new[] { "hero-dante-stomp", "hero-dante-roar", "hero-dante-fissure" },
+            new[] { "hero-cheska-frostwave", "hero-cheska-raise", "hero-cheska-nova" },
+            new[] { "hero-nemu-ghoststep", "hero-nemu-project", "hero-nemu-seance" },
+            new[] { "hero-phaister-hex", "hero-phaister-blink", "hero-phaister-eclipse" },
+        };
+
+        /// <summary>
+        /// Every clip name the CC0 rig this project ships actually carries, read off
+        /// `Art/characters/persons/*.glb`.
+        ///
+        /// ⚠️⚠️ IT IS WRITTEN DOWN HERE BECAUSE THE GAP BETWEEN THIS LIST AND THE ACTION TABLE IS
+        /// THE BUG. Entry zero of every hero chain is a `hero-*` clip, and not one of them is in
+        /// this list: `Play` falls through, so the table READS as eighteen distinct casts and
+        /// PLAYS whatever the first name in this set is. Asserting on entry zero would pass
+        /// forever and prove nothing about what a player sees.
+        ///
+        /// ⚠️ WHEN THE TEAM'S OWN ANIMATIONS LAND, ADD THEIR NAMES HERE. These tests then start
+        /// measuring the real casts instead of the fallbacks, with no other change, which is the
+        /// point of the chains. `CLAUDE.md` § 6 has the queue.
+        /// </summary>
+        private static readonly HashSet<string> RigClips = new HashSet<string>
+        {
+            "attack-kick-left", "attack-kick-right", "attack-melee-left", "attack-melee-right",
+            "crouch", "die", "drive", "emote-no", "emote-yes", "fall",
+            "holding-both", "holding-both-shoot", "holding-left", "holding-left-shoot",
+            "holding-right", "holding-right-shoot", "idle", "interact-left", "interact-right",
+            "jump", "pick-up", "sit", "sprint", "static", "walk",
+        };
+
+        /// <summary>
+        /// The clip an action REALLY plays today: the first name in its chain the rig has.
+        ///
+        /// ⚠️ THE BASE VERBS AND THE HERO CASTS RESOLVE AT DIFFERENT DEPTHS, which is why this
+        /// cannot just read entry one. `shove` names a real clip at entry zero and a hero cast
+        /// never does, so a test that assumed one depth for both reported the shove as playing
+        /// its own fallback.
+        /// </summary>
+        private static string Shipped(string action)
+        {
+            foreach (string clip in Visual.CharacterAnimator.ActionChains[action])
+                if (RigClips.Contains(clip)) return clip;
+
+            Assert.Fail($"'{action}' names no clip this rig carries, so it animates nothing");
+            return null;
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ ALL SIX ULTIMATES PLAYED `emote-yes` UNTIL 2026-08-29. 🧑: *"dont js spam the same
+        /// animation"*. Supernova, Thunderstrike, Titan Fissure, Glacial Nova, Devouring Seance
+        /// and Grand Coven were one nod of the head between them, and nothing could see it
+        /// because entry zero of each chain named a distinct clip that does not exist.
+        /// </summary>
+        [Test]
+        public void NoTwoUltimatesPlayTheSameAnimation()
+        {
+            var seen = new Dictionary<string, string>();
+
+            foreach (string ult in Ultimates)
+            {
+                string clip = Shipped(ult);
+
+                Assert.IsFalse(seen.ContainsKey(clip),
+                    $"{ult} and {(seen.ContainsKey(clip) ? seen[clip] : "")} both play '{clip}'. "
+                    + "An ultimate is the most memorable thing a hero does; two of them sharing "
+                    + "one gesture is the whole of the report this test was written for.");
+
+                seen[clip] = ult;
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ A HERO MAY NOT REPEAT ITSELF INSIDE ITS OWN KIT. Sharing a gesture with ANOTHER
+        /// hero is arithmetic: thirteen usable clips against eighteen casts. Sharing one between
+        /// your own Q and your own F means you cannot tell your own two powers apart, which is
+        /// the version of this that costs a player something.
+        /// </summary>
+        [Test]
+        public void NoHeroPlaysOneAnimationForTwoOfItsOwnPowers()
+        {
+            foreach (var kit in Kits)
+            {
+                var seen = new HashSet<string>();
+
+                foreach (string action in kit)
+                {
+                    string clip = Shipped(action);
+                    Assert.IsTrue(seen.Add(clip),
+                        $"{action} reuses '{clip}' inside its own kit");
+                }
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ THE SHOVE AND THE PUNCH ARE DIFFERENT COMMITMENTS AND USED TO BE ONE GESTURE. Both
+        /// played `attack-melee-right`, so an opponent could not read which was coming, and
+        /// reading it is the counterplay. 🧑 named *"pushing"* and *"tayaing"* separately for
+        /// exactly this reason.
+        /// </summary>
+        [Test]
+        public void ThePushAndTheTagAreToldApart()
+        {
+            Assert.AreNotEqual(Shipped("shove"), Shipped("punch"));
+            Assert.AreNotEqual(Shipped("shove"), Shipped("lunge"));
+        }
+
+        /// <summary>
+        /// A serialized own hero clip can be a single-entry chain. An aspirational
+        /// name with no shipping asset still needs the original fallback protection.
+        /// </summary>
+        [Test]
+        public void EveryActionChainHasAShippedOwnClipOrFallback()
+        {
+            var shippedHeroClips = new HashSet<string>(Heroes
+                .Select(hero => Resources.Load<RosterEntryAsset>("Roster/person_" + hero))
+                .Where(art => art != null && art.Clips != null)
+                .SelectMany(art => art.Clips).Where(clip => clip != null && clip.length > 0)
+                .Select(clip => clip.name));
+            foreach (var pair in Visual.CharacterAnimator.ActionChains)
+            {
+                Assert.IsNotEmpty(pair.Value, $"'{pair.Key}' has no action candidates");
+                Assert.IsTrue(pair.Value.Length >= 2 ||
+                    (pair.Key.StartsWith("hero-") && shippedHeroClips.Contains(pair.Value[0])),
+                    $"'{pair.Key}' has neither a serialized own hero clip nor a fallback");
+
+                foreach (string clip in pair.Value)
+                    Assert.IsFalse(string.IsNullOrWhiteSpace(clip), $"'{pair.Key}' has a blank entry");
+            }
+        }
+
+    }
+}

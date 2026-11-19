@@ -1,0 +1,262 @@
+using System.Collections.Generic;
+using TumbangPreso.Abilities;
+using TumbangPreso.Core;
+using UnityEngine;
+
+namespace TumbangPreso
+{
+    /// <summary>One live effect the HUD draws, with its own countdown.</summary>
+    public struct StatusRow
+    {
+        public string Label;
+        public float Remaining;
+
+        /// <summary>
+        /// What the row started at, so the bar can draw a RATIO rather than a raw number.
+        ///
+        /// ⚠️ IT IS THE EFFECT'S OWN FULL DURATION, NOT A SHARED MAXIMUM. A 1.25 s shove stun
+        /// and a 5 s tag penalty drawn against one scale makes the shove a stub that never
+        /// visibly empties, which is the opposite of what the bar is for.
+        /// </summary>
+        public float Total;
+
+        /// <summary>
+        /// ⚠️ VULNERABLE HAS NO COUNTDOWN AND THAT IS CORRECT. It lasts exactly as long as you
+        /// choose to stand in the box holding a slipper, so it draws as a solid bar with no
+        /// timer. Printing "VULNERABLE 0.0s" would read as an effect that had already expired,
+        /// at the exact moment the player is in the most danger in the game.
+        /// </summary>
+        public bool Timed;
+
+        /// <summary>Keep this named effect visible beside a first-person reticle.</summary>
+        public bool ShowWithReticle;
+    }
+
+    /// <summary>
+    /// What the HUD shows about a unit's current state.
+    ///
+    /// ⚠️⚠️ A STUN THE PLAYER CANNOT TIME IS A STUN THEY CANNOT PLAY AROUND. Every row here
+    /// exists so the player can see how long a thing lasts, which is the difference between a
+    /// penalty and a mystery.
+    ///
+    /// ⚠️ THIS ASKS THE SAME FUNCTIONS THE RULES ASK, and that is a rule rather than a
+    /// coincidence: the VULNERABLE row reads <see cref="RoundDirector.CanBeTaggedNow"/>, which is
+    /// the same call the tag itself makes (it read `IsTaggable` alone until 2026-10-23, and so
+    /// said VULNERABLE while the can was down and no tag could land). The warning a player sees and the check that
+    /// catches them must be one function, or the HUD can promise safety the tag then ignores.
+    ///
+    /// ⚠️ AND A SHORT STUN INSIDE A LONGER ONE IS INVISIBLE HERE. That is a known, ACCEPTED
+    /// cost of stuns overlapping by Max() rather than stacking: a 1.25 s shove stun inside the
+    /// 5 s tag penalty reads as nothing happening. It is accepted because Max() is the entire
+    /// bound on a stun chain in a 1-vs-3 game, and because both events announce themselves
+    /// through channels that are not this stack, the shove with its own knockback and hit
+    /// flash, the tag with its own toast. Only the ROW is merged; nothing is silent.
+    /// </summary>
+    public static class StatusStack
+    {
+        public static void Collect(CharacterMotor m, Carrier carrier, CombatVerbs verbs,
+                                   List<StatusRow> into)
+        {
+            into.Clear();
+            if (m == null) return;
+
+            // ⚠️⚠️ THE STUN REPORTED NO TIME AT ALL, WHICH IS THE ONE THING THIS STACK EXISTS
+            // FOR. 🧑 on the Godot build: *"add visible UI timers for all stun durations and
+            // status effects so players clearly know when they can move or act again"*, and
+            // most of what "the defender feels overpowered" actually was. A stun you cannot
+            // time is a stun you cannot play around. It was hard-coded to 0.0 here, so the row
+            // appeared with no countdown and drew a full bar for its whole duration.
+            // ⚠️⚠️ AN ELEMENT STUN HAS NO COUNTDOWN ROW, AND THAT IS A DELIBERATE EXCEPTION TO
+            // THE NOTE ABOVE RATHER THAN A REVERSAL OF IT. 🧑 2026-08-26, asking for the mash:
+            // *"maybe with this change u have to make sure the countdown for their stun is gone
+            // as well as the ui for the countdown"*.
+            //
+            // ⚠️ THE REASON IS THE SAME REASON THE TRIP HAS NO ROW EITHER, and it is the lesson
+            // `Balance.TripAutoRecoverSeconds` records at length: once a status is ended by
+            // PRESSES, a countdown beside it is a second, contradictory account of when it ends.
+            // He reported exactly that against the fall: *"u randomly get up after set amt of
+            // time, i dont have to actually mash it"*. A bar that drains on a clock next to a
+            // meter that fills on presses teaches the player to watch the clock and stop
+            // pressing. `Hud.BuildStunBreakCard` is the one readout for a mashable stun.
+            //
+            // ⚠️⚠️ THE TAG KEEPS ITS COUNTDOWN, WHICH IS WHY THIS IS GATED ON THE ELEMENT AND
+            // NOT ON `IsStunned`. `StunElement.None` cannot be mashed out of, so time really is
+            // the only thing that ends it, and the original request this row was built for still
+            // stands for that case: *"add visible UI timers for all stun durations and status
+            // effects so players clearly know when they can move or act again"*.
+            if (m.StunLeft > 0 && m.StunElement == StunElement.None)
+                into.Add(new StatusRow
+                {
+                    // The owner's status table names the tag's hold TAGGED (2026-09-25).
+                    Label = m.IsTagged ? "TAGGED" : "STUNNED",
+                    Remaining = m.StunLeft,
+                    Total = m.StunTotal,
+                    Timed = true,
+                });
+
+            // The two statuses that are not stuns (owner's status table, 2026-09-25). The HUD also
+            // draws them as icon chips with the owner's tooltip (`TumpMatchReadout.Statuses`).
+            if (m.IsWhirled)
+                into.Add(new StatusRow { Label = "WHIRLED", Remaining = m.WhirledLeft, Total = StatusRules.WhirledSeconds, Timed = true });
+            if (m.IsChilled)
+                into.Add(new StatusRow { Label = "CHILLED", Remaining = m.ChilledLeft, Total = StatusRules.ChilledSeconds, Timed = true });
+            // Paete's roots: the row counts the sentry's time down; the break-free ring is drawn
+            // by the readout from `BreakFreeProgress`.
+            if (m.IsRooted)
+                into.Add(new StatusRow { Label = "ROOTED", Remaining = m.RootedLeft, Total = StatusRules.RootedSeconds, Timed = true });
+
+            if (m.Stamina.IsFatigued)
+                into.Add(new StatusRow
+                {
+                    Label = "FATIGUED",
+                    Remaining = m.Stamina.FatigueLeft,
+                    Total = Balance.FatigueTime,
+                    Timed = true,
+                });
+
+            // No countdown: it lasts as long as you choose to stand there.
+            if (RoundDirector.TaggableNow(m))
+                into.Add(new StatusRow { Label = "VULNERABLE", Timed = false });
+
+            // ⚠️ THE THROW LOCK IS A COOLDOWN THE PLAYER MEETS EVERY SINGLE RETRIEVAL and it
+            // was missing from this list entirely. It is the beat between HAVING the slipper and
+            // being able to throw it, and without a row the player presses fire, nothing
+            // happens, and there is no reason on screen for it.
+            if (!m.IsDefender && carrier != null && carrier.ThrowLocked)
+                into.Add(new StatusRow
+                {
+                    Label = "THROW CD",
+                    Remaining = carrier.ThrowLockLeft,
+                    Total = Balance.ThrowLockTime,
+                    Timed = true,
+                });
+
+            if (verbs != null)
+            {
+                // Timers keep running across role changes; the HUD only names actions
+                // available to the current role. Do not reset gameplay state to hide a row.
+                if (!m.IsDefender && verbs.ShoveCooldownLeft > 0.0f)
+                    into.Add(new StatusRow
+                    {
+                        Label = "SHOVE CD",
+                        Remaining = verbs.ShoveCooldownLeft,
+                        Total = verbs.ShoveCooldownDuration,
+                        Timed = true,
+                    });
+
+                if (m.IsDefender && verbs.LungeCooldownLeft > 0.0f)
+                    into.Add(new StatusRow
+                    {
+                        Label = "LUNGE CD",
+                        Remaining = verbs.LungeCooldownLeft,
+                        Total = Balance.LungeCooldown,
+                        Timed = true,
+                    });
+
+                if (m.IsDefender && verbs.PunchCooldownLeft > 0.0f)
+                    into.Add(new StatusRow
+                    {
+                        // To the player this is the taya's short-range tag, not a generic
+                        // fighting-game punch. The implementation and animation remain a jab;
+                        // the cooldown label names the game action the role is trying to land.
+                        Label = "TAG CD",
+                        Remaining = verbs.PunchCooldownLeft,
+                        Total = verbs.PunchCooldownDuration,
+                        Timed = true,
+                    });
+            }
+
+            var abilitySystem = m.AbilitySystem;
+            if (abilitySystem != null && abilitySystem.Kit != null)
+            {
+                var kit = abilitySystem.Kit;
+
+                // ⚠️⚠️ `EffectiveName`, NOT `Name`, AND THE DIFFERENCE IS WHETHER A BUILD EXISTS
+                // ONCE THE MATCH STARTS. `HeroAbility.VariantName` carries the argument: a player
+                // who equipped ARC LINE saw BOLT SPRINT in every status row, so the one place the
+                // HUD names their power named somebody else's. On a default build the two strings
+                // are identical and nothing moves.
+
+                // Active Buffs
+                if (kit.Skill1 != null && kit.Skill1.IsActive)
+                    into.Add(new StatusRow
+                    {
+                        Label = kit.Skill1.EffectiveName,
+                        Remaining = kit.Skill1.DurationRemaining,
+                        Total = kit.Skill1.Duration,
+                        Timed = true,
+                        // The wearer's FPP camera hides the stone ward itself.
+                        ShowWithReticle = kit is DanteHeroKit,
+                    });
+
+                if (kit.Skill2 != null && kit.Skill2.IsActive)
+                    into.Add(new StatusRow
+                    {
+                        Label = kit.Skill2.EffectiveName,
+                        Remaining = kit.Skill2.DurationRemaining,
+                        Total = kit.Skill2.Duration,
+                        Timed = true,
+                    });
+
+                if (kit.Ultimate != null && kit.Ultimate.IsActive)
+                    into.Add(new StatusRow
+                    {
+                        Label = kit.Ultimate.EffectiveName,
+                        Remaining = kit.Ultimate.DurationRemaining,
+                        Total = kit.Ultimate.Duration,
+                        Timed = true,
+                    });
+
+                // Specific kit states
+                if (kit is ZackHeroKit zack && zack.IsOverclocked)
+                    into.Add(new StatusRow { Label = "OVERCLOCKED", Remaining = zack.OverclockLeft,
+                        Total = Core.ZackRules.OverclockSeconds, Timed = true });
+
+                if (kit is SeanHeroKit sean && sean.IsIgnitionCannonActive)
+                    into.Add(new StatusRow { Label = "IGNITION", Timed = false });
+
+                if (kit is PhaisterHeroKit phaister && phaister.IsWitchfireInfused)
+                    into.Add(new StatusRow { Label = "WITCHFIRE", Timed = false });
+
+                // Ability Cooldowns (suffixed with " CD" to route to right-hand stack)
+                if (kit.Skill1 != null && kit.Skill1.CooldownRemaining > 0.0f)
+                    into.Add(new StatusRow
+                    {
+                        Label = $"{kit.Skill1.EffectiveName} CD",
+                        Remaining = kit.Skill1.CooldownRemaining,
+                        Total = kit.Skill1.Cooldown,
+                        Timed = true,
+                    });
+
+                if (kit.Skill2 != null && kit.Skill2.CooldownRemaining > 0.0f)
+                    into.Add(new StatusRow
+                    {
+                        Label = $"{kit.Skill2.EffectiveName} CD",
+                        Remaining = kit.Skill2.CooldownRemaining,
+                        Total = kit.Skill2.Cooldown,
+                        Timed = true,
+                    });
+            }
+        }
+
+        /// <summary>
+        /// The stamina bar, 0 to 1.
+        ///
+        /// ⚠️ IT IS A POINT POOL, NOT A TIMER, and the bar has to read as one. The pool is
+        /// dimensioned to roughly one crossing of the danger zone, which is the retrieval the
+        /// whole game is about, so what the player needs from this bar is "can I get back out
+        /// from here", not "how many seconds of running is left".
+        /// </summary>
+        public static float StaminaRatio(CharacterMotor m) =>
+            m == null ? 0.0f : Mathf.Clamp01(m.Stamina.Ratio);
+
+        /// <summary>
+        /// ⚠️ THE CROSSHAIR ASKS CanThrow, so it greys out for exactly the reasons the throw
+        /// refuses. A second opinion about legality is a crosshair that promises a throw the
+        /// rules then refuse, which is the most confusing possible failure: the player sees no
+        /// reason for nothing to happen.
+        /// </summary>
+        public static bool ShowCrosshair(CharacterMotor m) =>
+            GameServices.Round != null && GameServices.Round.CanThrow(m);
+    }
+}

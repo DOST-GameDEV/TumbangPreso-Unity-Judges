@@ -1,0 +1,1387 @@
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using NUnit.Framework;
+using TumbangPreso.Core;
+using UnityEngine;
+
+namespace TumbangPreso.Tests
+{
+    /// <summary>
+    /// The two things about the career layer that no runtime test can see: that the Cloud Code
+    /// request exists in exactly one place, and that the server script still agrees with the core
+    /// about the numbers it had to be told twice.
+    ///
+    /// ⚠️⚠️ THESE READ THE SOURCE AS TEXT ON PURPOSE, like `SceneScriptCheck` and the three
+    /// `tools/` audits. Both faults below are invisible to every other test in the repository:
+    /// the first because a second copy of a working request still works until it drifts, and the
+    /// second because the JavaScript is never compiled by anything on this machine.
+    /// </summary>
+    public class CareerAndCloudCodeTests
+    {
+        [TestCase("{}")]
+        [TestCase("null")]
+        [TestCase("{\"profile\":\"\",\"applied\":false}")]
+        [TestCase("{\"verdict\":\"\"}")]
+        [TestCase("{\"verdict\":\"unknown-server-error\"}")]
+        public void UnacknowledgedSubmissionKeepsRecordAndWitness(string output)
+            => CheckSubmissionCompletion(output, false);
+
+        [TestCase("pending")]
+        [TestCase("witnessed")]
+        [TestCase("disputed")]
+        [TestCase("impossible")]
+        [TestCase("offline")]
+        public void TerminalSubmissionVerdictRemovesOnlyAcknowledgedRecord(string verdict)
+            => CheckSubmissionCompletion("{\"verdict\":\"" + verdict + "\",\"applied\":false}", true);
+
+        private static void CheckSubmissionCompletion(string output, bool acknowledged)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"), "Career checks need an isolated profile.");
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career acknowledgement check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cache = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags).GetValue(career);
+                var queue = (System.Collections.Generic.List<MatchRecord>)cache.GetType().GetField("Queue").GetValue(cache);
+                var witnesses = (System.Collections.Generic.List<string>)cache.GetType().GetField("QueueWitness").GetValue(cache);
+                queue.Clear(); witnesses.Clear();
+                var first = new MatchRecord { MatchId = "first-ack-check" };
+                var second = new MatchRecord { MatchId = "second-ack-check" };
+                queue.Add(first); queue.Add(second); witnesses.Add("first-witness"); witnesses.Add("second-witness");
+                System.Exception failure = null;
+                try { typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteSubmission", flags).Invoke(career, new object[] { cache, first, output }); }
+                catch (System.Reflection.TargetInvocationException error) { failure = error.InnerException; }
+                if (acknowledged)
+                {
+                    Assert.IsNull(failure); Assert.AreEqual(1, queue.Count); Assert.AreSame(second, queue[0]);
+                    CollectionAssert.AreEqual(new[] { "second-witness" }, witnesses);
+                }
+                else
+                {
+                    Assert.AreEqual(2, queue.Count, "Missing/unknown acknowledgement discarded a queued result.");
+                    Assert.AreSame(first, queue[0]); Assert.AreSame(second, queue[1]);
+                    CollectionAssert.AreEqual(new[] { "first-witness", "second-witness" }, witnesses);
+                    Assert.IsInstanceOf<InvalidDataException>(failure, "Invalid acknowledgement must reach the existing deferred-upload path.");
+                }
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase("{}")]
+        [TestCase("null")]
+        [TestCase("{\"other\":{}}")]
+        [TestCase("{\"output\":null}")]
+        public void MissingCloudOutputCannotReportSuccessfulDelivery(string response)
+        {
+            var read = typeof(TumbangPreso.Net.CloudCode).GetMethod("ReadOutput", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            System.Exception failure = null;
+            try { read.Invoke(null, new object[] { response }); }
+            catch (System.Reflection.TargetInvocationException error) { failure = error.InnerException; }
+            Assert.IsInstanceOf<System.InvalidOperationException>(failure, "An absent service output was accepted as successful delivery.");
+        }
+
+        [TestCase("{\"output\":{\"ok\":true}}", "{\"ok\":true}")]
+        [TestCase("{\"output\":[1,2]}", "[1,2]")]
+        [TestCase("{\"output\":false}", "false")]
+        [TestCase("{\"output\":0}", "0")]
+        public void CloudOutputKeepsCallerOwnedPayloadShape(string response, string expected)
+        {
+            var read = typeof(TumbangPreso.Net.CloudCode).GetMethod("ReadOutput", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            Assert.AreEqual(expected, read.Invoke(null, new object[] { response }));
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void LateSubmissionAcknowledgementCannotRemoveAnotherRecord(bool replaceAccountCache)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career pending identity check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cacheField = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags);
+                var submittedCache = cacheField.GetValue(career);
+                var queue = (System.Collections.Generic.List<MatchRecord>)submittedCache.GetType().GetField("Queue").GetValue(submittedCache);
+                var witnesses = (System.Collections.Generic.List<string>)submittedCache.GetType().GetField("QueueWitness").GetValue(submittedCache);
+                queue.Clear(); witnesses.Clear();
+                var submitted = new MatchRecord { MatchId = "submitted-old" };
+                var remaining = new MatchRecord { MatchId = "not-submitted" };
+                queue.Add(submitted); queue.Add(remaining); witnesses.Add("old-witness"); witnesses.Add("remaining-witness");
+                if (replaceAccountCache)
+                {
+                    var nextCache = System.Activator.CreateInstance(submittedCache.GetType(), true);
+                    cacheField.SetValue(career, nextCache);
+                    queue = (System.Collections.Generic.List<MatchRecord>)nextCache.GetType().GetField("Queue").GetValue(nextCache);
+                    witnesses = (System.Collections.Generic.List<string>)nextCache.GetType().GetField("QueueWitness").GetValue(nextCache);
+                    queue.Add(remaining); witnesses.Add("remaining-witness");
+                }
+                else
+                {
+                    // Record's bounded queue can evict its oldest entry while upload awaits.
+                    queue.RemoveAt(0); witnesses.RemoveAt(0);
+                }
+                var accepted = (bool)typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteSubmission", flags)
+                    .Invoke(career, new object[] { submittedCache, submitted, "{\"verdict\":\"pending\",\"applied\":true}" });
+                Assert.AreEqual(1, queue.Count, "The late response removed a different queued result.");
+                Assert.AreSame(remaining, queue[0]); CollectionAssert.AreEqual(new[] { "remaining-witness" }, witnesses);
+                Assert.AreEqual(!replaceAccountCache, accepted, "An obsolete account upload must stop its old flush.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void CareerRefreshResponseCannotReplaceAnotherAccountCache(bool replaceAccountCache)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career refresh ownership check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cacheField = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags);
+                var requestedCache = cacheField.GetValue(career);
+                if (replaceAccountCache) cacheField.SetValue(career, System.Activator.CreateInstance(requestedCache.GetType(), true));
+                career.Profile.Xp = 77;
+                var profile = new PlayerProfile { Xp = 420 };
+                // Build the endpoint's string-valued profile envelope without an extra JSON dependency.
+                string response = "{\"profile\":\"" + JsonUtility.ToJson(profile).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}";
+                var accepted = (bool)typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteRefresh", flags)
+                    .Invoke(career, new object[] { requestedCache, response });
+                Assert.AreEqual(replaceAccountCache ? 77 : 420, career.Profile.Xp, "An older account response overwrote the active career.");
+                Assert.AreEqual(!replaceAccountCache, accepted);
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false, false)]
+        [TestCase(false, true)]
+        [TestCase(true, false)]
+        [TestCase(true, true)]
+        public void RemainingCareerResponsesRespectAccountOwnership(bool historyResponse, bool replaceAccountCache)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career response ownership check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cacheField = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags);
+                var requestedCache = cacheField.GetValue(career);
+                if (replaceAccountCache) cacheField.SetValue(career, System.Activator.CreateInstance(requestedCache.GetType(), true));
+                career.Profile.Xp = 77;
+                if (historyResponse)
+                {
+                    var remote = new MatchRecord { MatchId = "old-account-result" };
+                    string array = "[" + JsonUtility.ToJson(remote) + "]";
+                    string response = "{\"history\":\"" + array.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}";
+                    System.Exception failure = null;
+                    System.Collections.Generic.List<MatchRecord> page = null;
+                    try { page = (System.Collections.Generic.List<MatchRecord>)typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteHistory", flags)
+                        .Invoke(career, new object[] { requestedCache, response, 0, 20 }); }
+                    catch (System.Reflection.TargetInvocationException error) { failure = error.InnerException; }
+                    if (replaceAccountCache)
+                        Assert.IsInstanceOf<System.OperationCanceledException>(failure, "An old account history request must cancel instead of displaying its results.");
+                    else
+                    {
+                        Assert.IsNull(failure); Assert.AreEqual(1, page.Count);
+                        Assert.AreEqual(remote.MatchId, page[0].MatchId);
+                    }
+                }
+                else
+                {
+                    var profile = new PlayerProfile { Xp = 420 };
+                    string response = "{\"profile\":\"" + JsonUtility.ToJson(profile).Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}";
+                    typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteAbandon", flags)
+                        .Invoke(career, new object[] { requestedCache, response });
+                    Assert.AreEqual(replaceAccountCache ? 77 : 420, career.Profile.Xp,
+                        "An old abandon response replaced the active account career.");
+                }
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void RefusedQueuedRecordsKeepRemainingWitnessesAligned(bool legacyMissingWitnesses)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career refusal witness check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cache = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags).GetValue(career);
+                var queue = (System.Collections.Generic.List<MatchRecord>)cache.GetType().GetField("Queue").GetValue(cache);
+                var witnessField = cache.GetType().GetField("QueueWitness");
+                queue.Clear();
+                var remaining = new MatchRecord { MatchId = "valid-result", Players = new[] {
+                    new PlayerMatchStats { PlayerId = TumbangPreso.Net.CareerStore.LocalPlayerId, IsBot = false } } };
+                queue.Add(new MatchRecord { MatchId = "" }); queue.Add(remaining);
+                queue.Add(new MatchRecord { MatchId = "wrong-player", Players = new[] {
+                    new PlayerMatchStats { PlayerId = "another-player", IsBot = false } } });
+                witnessField.SetValue(cache, legacyMissingWitnesses ? null : new System.Collections.Generic.List<string> {
+                    "refused-first", "remaining-witness", "refused-last" });
+                int dropped = (int)typeof(TumbangPreso.Net.CareerStore).GetMethod("DropUnsubmittable", flags).Invoke(career, null);
+                Assert.AreEqual(2, dropped); Assert.AreEqual(1, queue.Count); Assert.AreSame(remaining, queue[0]);
+                var witnesses = (System.Collections.Generic.List<string>)witnessField.GetValue(cache);
+                Assert.IsNotNull(witnesses, "Legacy careers need an empty witness for their remaining record.");
+                CollectionAssert.AreEqual(new[] { legacyMissingWitnesses ? "" : "remaining-witness" }, witnesses,
+                    "The remaining result retained a different match's witness.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async System.Threading.Tasks.Task AccountSyncWaitsForThePreviousAccountOperation(bool pendingFlush)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsFalse(TumbangPreso.GameServices.Account?.IsSignedIn ?? false, "This scheduling check must stay offline.");
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career account sync scheduling check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var busyField = typeof(TumbangPreso.Net.CareerStore).GetField(pendingFlush ? "_flushing" : "_refreshing", flags);
+            System.Threading.Tasks.Task sync = null;
+            try
+            {
+                var cache = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags).GetValue(career);
+                busyField.SetValue(career, true);
+                sync = (System.Threading.Tasks.Task)typeof(TumbangPreso.Net.CareerStore).GetMethod("SyncAfterPendingWorkAsync", flags)
+                    .Invoke(career, new object[] { cache });
+                await System.Threading.Tasks.Task.Delay(20);
+                Assert.IsFalse(sync.IsCompleted, "The newly selected account sync was skipped while the previous request was busy.");
+                busyField.SetValue(career, false);
+                Assert.AreSame(sync, await System.Threading.Tasks.Task.WhenAny(sync, System.Threading.Tasks.Task.Delay(1000)),
+                    "The current account sync did not resume after the previous request finished.");
+                await sync;
+                Assert.AreEqual("Local career", career.Status, "The resumed current-account sync did not reach its offline refresh path.");
+            }
+            finally
+            {
+                busyField.SetValue(career, false);
+                if (sync != null) await System.Threading.Tasks.Task.WhenAny(sync, System.Threading.Tasks.Task.Delay(1000));
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public async System.Threading.Tasks.Task AccountSyncCoalescesItsOwnerAndDropsObsoleteWaiters(bool replaceAccountCache)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsFalse(TumbangPreso.GameServices.Account?.IsSignedIn ?? false);
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career account waiter ownership check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var type = typeof(TumbangPreso.Net.CareerStore);
+            var busy = type.GetField("_refreshing", flags);
+            var cacheField = type.GetField("_cache", flags);
+            var syncMethod = type.GetMethod("SyncAfterPendingWorkAsync", flags);
+            System.Threading.Tasks.Task first = null, next = null;
+            try
+            {
+                var cache = cacheField.GetValue(career); busy.SetValue(career, true);
+                first = (System.Threading.Tasks.Task)syncMethod.Invoke(career, new object[] { cache });
+                if (replaceAccountCache)
+                {
+                    var replacement = System.Activator.CreateInstance(cache.GetType(), true);
+                    cacheField.SetValue(career, replacement);
+                    next = (System.Threading.Tasks.Task)syncMethod.Invoke(career, new object[] { replacement });
+                    Assert.AreSame(first, await System.Threading.Tasks.Task.WhenAny(first, System.Threading.Tasks.Task.Delay(1000)));
+                    Assert.IsFalse(next.IsCompleted, "The new account waiter must survive the old waiter's cleanup.");
+                    Assert.AreSame(replacement, type.GetField("_accountSyncOwner", flags).GetValue(career));
+                }
+                else
+                {
+                    next = (System.Threading.Tasks.Task)syncMethod.Invoke(career, new object[] { cache });
+                    Assert.IsTrue(next.IsCompleted, "Repeated notifications must coalesce behind one pending sync.");
+                    Assert.IsFalse(first.IsCompleted);
+                }
+                busy.SetValue(career, false);
+                var pending = replaceAccountCache ? next : first;
+                Assert.AreSame(pending, await System.Threading.Tasks.Task.WhenAny(pending, System.Threading.Tasks.Task.Delay(1000)));
+                await pending;
+                Assert.IsNull(type.GetField("_accountSyncOwner", flags).GetValue(career));
+            }
+            finally
+            {
+                busy.SetValue(career, false);
+                if (first != null) await System.Threading.Tasks.Task.WhenAny(first, System.Threading.Tasks.Task.Delay(1000));
+                if (next != null) await System.Threading.Tasks.Task.WhenAny(next, System.Threading.Tasks.Task.Delay(1000));
+                Object.DestroyImmediate(owner);
+                type.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void ResultDisputeCopyOnlyDescribesTheDisplayedMatch(bool sameMatch)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("Career verdict identity check");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, career);
+            var boardOwner = new GameObject("Result verdict identity check"); boardOwner.SetActive(false);
+            var board = boardOwner.AddComponent<TumbangPreso.UI.MatchResult>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var cache = typeof(TumbangPreso.Net.CareerStore).GetField("_cache", flags).GetValue(career);
+                var submitted = new MatchRecord { MatchId = "older-queued-result" };
+                var queue = (System.Collections.Generic.List<MatchRecord>)cache.GetType().GetField("Queue").GetValue(cache);
+                var witnesses = (System.Collections.Generic.List<string>)cache.GetType().GetField("QueueWitness").GetValue(cache);
+                queue.Clear(); witnesses.Clear(); queue.Add(submitted); witnesses.Add("");
+                typeof(TumbangPreso.Net.CareerStore).GetMethod("CompleteSubmission", flags)
+                    .Invoke(career, new object[] { cache, submitted, "{\"verdict\":\"disputed\"}" });
+                typeof(TumbangPreso.UI.MatchResult).GetField("_lastRecord", flags)
+                    .SetValue(board, sameMatch ? submitted : new MatchRecord { MatchId = "current-result" });
+                string line = (string)typeof(TumbangPreso.UI.MatchResult).GetMethod("RankLine", flags)
+                    .Invoke(board, new object[] { null });
+                Assert.AreEqual(sameMatch, line.Contains("THIS RESULT DID NOT MATCH"),
+                    "An older queued result's dispute was displayed as the current match's verdict.");
+            }
+            finally
+            {
+                Object.DestroyImmediate(boardOwner); Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void WalletResponseCannotBecomeAnotherAccountsBalance(bool changeOwner)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId), "This completion check uses isolated offline identity.");
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null);
+            var previousWallet = TumbangPreso.Net.WalletStore.Instance;
+            var owner = new GameObject("Wallet response ownership check");
+            var wallet = owner.AddComponent<TumbangPreso.Net.WalletStore>();
+            try
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting("wallet-request-owner");
+                string requested = TumbangPreso.Net.CareerStore.LocalPlayerId;
+                if (changeOwner) TumbangPreso.Net.NetIdentity.OverrideForTesting("wallet-current-owner");
+                var cache = typeof(TumbangPreso.Net.WalletStore).GetField("_cache", flags).GetValue(wallet);
+                cache.GetType().GetField("Wallet").SetValue(cache, new Wallet { Balance = 77 });
+                cache.GetType().GetField("Known").SetValue(cache, true);
+                cache.GetType().GetField("OwnerId").SetValue(cache, TumbangPreso.Net.CareerStore.LocalPlayerId);
+                string body = JsonUtility.ToJson(new Wallet { Balance = 420 });
+                string response = "{\"wallet\":\"" + body.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\",\"result\":\"bought\",\"paid\":25}";
+                typeof(TumbangPreso.Net.WalletStore).GetMethod("CompleteResponse", flags).Invoke(wallet, new object[] { requested, response });
+                Assert.AreEqual(changeOwner ? 77 : 420, wallet.Balance, "An older account wallet answer replaced the current account's balance.");
+                Assert.AreEqual(changeOwner ? 0 : 25, wallet.LastPaid, "An older account's payout was adopted by the current account.");
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken);
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, previousWallet);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void WalletAccountNotificationRetiresOnlyAnotherOwnersCache(bool changeOwner)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId));
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null);
+            var prior = TumbangPreso.Net.WalletStore.Instance;
+            var owner = new GameObject("Wallet account cache check"); var wallet = owner.AddComponent<TumbangPreso.Net.WalletStore>();
+            try
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting("wallet-owner-a");
+                var cache = typeof(TumbangPreso.Net.WalletStore).GetField("_cache", flags).GetValue(wallet);
+                cache.GetType().GetField("OwnerId").SetValue(cache, TumbangPreso.Net.CareerStore.LocalPlayerId);
+                cache.GetType().GetField("Known").SetValue(cache, true);
+                cache.GetType().GetField("Wallet").SetValue(cache, new Wallet { Balance = 77 });
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("LastPaid").SetValue(wallet, 25);
+                if (changeOwner) TumbangPreso.Net.NetIdentity.OverrideForTesting("wallet-owner-b");
+                typeof(TumbangPreso.Net.WalletStore).GetMethod("OnAccountChanged", flags).Invoke(wallet, null);
+                Assert.AreEqual(!changeOwner, wallet.Known, "The account kept another owner's known wallet.");
+                Assert.AreEqual(changeOwner ? -1 : 77, wallet.Balance);
+                Assert.AreEqual(changeOwner ? 0 : 25, wallet.LastPaid);
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken); Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [Test]
+        public void WalletScheduledRefreshWaitsForThePendingRequest()
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsFalse(TumbangPreso.Net.WalletStore.CanTransact, "The scheduling check must stay offline.");
+            var prior = TumbangPreso.Net.WalletStore.Instance;
+            var owner = new GameObject("Wallet deferred refresh check"); var wallet = owner.AddComponent<TumbangPreso.Net.WalletStore>();
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            try
+            {
+                var refresh = typeof(TumbangPreso.Net.WalletStore).GetField("_refreshAfter", flags);
+                refresh.SetValue(wallet, Time.unscaledTime);
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("Busy").SetValue(wallet, true);
+                typeof(TumbangPreso.Net.WalletStore).GetMethod("Update", flags).Invoke(wallet, null);
+                Assert.GreaterOrEqual((float)refresh.GetValue(wallet), 0, "A busy wallet consumed its pending refresh.");
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("Busy").SetValue(wallet, false);
+                typeof(TumbangPreso.Net.WalletStore).GetMethod("Update", flags).Invoke(wallet, null);
+                Assert.Less((float)refresh.GetValue(wallet), 0);
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.WalletStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, prior);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void SocialResponseCannotReplaceAnotherAccountsFriends(bool changeOwner)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId));
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null); var previous = TumbangPreso.Net.SocialStore.Instance;
+            var owner = new GameObject("Social response ownership check"); var social = owner.AddComponent<TumbangPreso.Net.SocialStore>();
+            try
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting("social-owner-a");
+                string requested = TumbangPreso.Net.CareerStore.LocalPlayerId;
+                if (changeOwner) TumbangPreso.Net.NetIdentity.OverrideForTesting("social-owner-b");
+                social.List.Friends.Clear(); social.List.Friends.Add(new FriendRef { PlayerId = "current-friend", Handle = "CURRENT#4417" });
+                social.List.Blocked.Clear(); social.List.Blocked.Add("current-block");
+                var remote = new SocialList(); remote.Friends.Add(new FriendRef { PlayerId = "previous-friend", Handle = "PREVIOUS#4427" });
+                remote.Blocked.Add("previous-block"); string body = JsonUtility.ToJson(remote);
+                string response = "{\"list\":\"" + body.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}";
+                typeof(TumbangPreso.Net.SocialStore).GetMethod("Adopt", flags).Invoke(social, new object[] { requested, response });
+                Assert.AreEqual(changeOwner ? "current-friend" : "previous-friend", social.List.Friends.Single().PlayerId,
+                    "An old account reply replaced the current friends.");
+                Assert.AreEqual(changeOwner ? "current-block" : "previous-block", social.List.Blocked.Single(),
+                    "An old account reply changed who the current account blocks.");
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken); Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.SocialStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, previous);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void SocialHandleLookupCannotOverwriteAnotherAccountsSearch(bool changeOwner)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId));
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null); var previous = TumbangPreso.Net.SocialStore.Instance;
+            var owner = new GameObject("Social handle lookup ownership check"); var social = owner.AddComponent<TumbangPreso.Net.SocialStore>();
+            try
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting("social-lookup-owner-a");
+                string requested = TumbangPreso.Net.CareerStore.LocalPlayerId;
+                if (changeOwner) TumbangPreso.Net.NetIdentity.OverrideForTesting("social-lookup-owner-b");
+                typeof(TumbangPreso.Net.SocialStore).GetProperty("SearchStatus").SetValue(social, "CURRENT ACCOUNT SEARCH");
+                // Empty resolution cannot dispatch a friend request or reach an endpoint.
+                typeof(TumbangPreso.Net.SocialStore).GetMethod("CompleteHandleLookup", flags).Invoke(social, new object[] { requested, "{}" });
+                Assert.AreEqual(changeOwner ? "CURRENT ACCOUNT SEARCH" : "NO ACCOUNT HAS THAT EXACT NAME AND TAG.", social.SearchStatus);
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken); Object.DestroyImmediate(owner);
+                typeof(TumbangPreso.Net.SocialStore).GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, previous);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void SocialCacheReadsRetireOnlyAnotherOwnersFriendsAndBlocks(bool changeOwner)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId));
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var type = typeof(TumbangPreso.Net.SocialStore);
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null); var previous = TumbangPreso.Net.SocialStore.Instance;
+            TumbangPreso.Net.NetIdentity.OverrideForTesting("social-cache-owner-a");
+            var owner = new GameObject("Social cache account switch check"); var social = owner.AddComponent<TumbangPreso.Net.SocialStore>();
+            try
+            {
+                var cache = type.GetField("_cache", flags).GetValue(social);
+                cache.GetType().GetField("OwnerId").SetValue(cache, TumbangPreso.Net.CareerStore.LocalPlayerId);
+                var list = new SocialList(); list.Friends.Add(new FriendRef { PlayerId = "old-friend", Handle = "OLD#4417" }); list.Blocked.Add("old-block");
+                cache.GetType().GetField("List").SetValue(cache, list);
+                type.GetProperty("SearchStatus").SetValue(social, "OLD ACCOUNT SEARCH");
+                int notifications = 0; social.Changed += () => notifications++;
+                if (changeOwner) TumbangPreso.Net.NetIdentity.OverrideForTesting("social-cache-owner-b");
+                var visible = social.List;
+                Assert.AreEqual(changeOwner ? 0 : 1, visible.Friends.Count, "The friends rail exposed another account's cached friend.");
+                Assert.AreEqual(changeOwner ? 0 : 1, visible.Blocked.Count, "Lobby admission inherited another account's blocks.");
+                Assert.AreEqual(changeOwner ? "" : "OLD ACCOUNT SEARCH", social.SearchStatus);
+                Assert.AreEqual(changeOwner ? 1 : 0, notifications, "An ownership change should redraw once; ordinary reads should not notify.");
+                Assert.AreSame(visible, social.List, "Repeated reads discarded the current owner's list.");
+                Assert.AreEqual(changeOwner ? 1 : 0, notifications);
+                if (!changeOwner) Assert.AreSame(list, visible, "A same-account notification discarded its offline list.");
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken); Object.DestroyImmediate(owner);
+                type.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, previous);
+            }
+        }
+
+        [TestCase("_loading")]
+        [TestCase("_writing")]
+        public void SocialAccountRefreshSurvivesThePreviousOwnersPendingOperation(string pendingOperation)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsTrue(string.IsNullOrWhiteSpace(TumbangPreso.GameServices.Account?.PlayerId));
+            Assert.IsFalse(TumbangPreso.Net.NetIdentity.IsOnline, "The scheduling check must stay offline.");
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var type = typeof(TumbangPreso.Net.SocialStore);
+            var tokenField = typeof(TumbangPreso.Net.NetIdentity).GetField("_overrideTokenForTesting", System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            string previousToken = (string)tokenField.GetValue(null); var previous = TumbangPreso.Net.SocialStore.Instance;
+            TumbangPreso.Net.NetIdentity.OverrideForTesting("social-pending-owner-a");
+            var owner = new GameObject("Social deferred account refresh check"); var social = owner.AddComponent<TumbangPreso.Net.SocialStore>();
+            try
+            {
+                var cache = type.GetField("_cache", flags).GetValue(social);
+                cache.GetType().GetField("OwnerId").SetValue(cache, TumbangPreso.Net.CareerStore.LocalPlayerId);
+                type.GetField("_nextPresence", flags).SetValue(social, float.PositiveInfinity);
+                type.GetField("_nextPresenceChange", flags).SetValue(social, float.PositiveInfinity);
+                var busy = type.GetField(pendingOperation, flags); busy.SetValue(social, true);
+                TumbangPreso.Net.NetIdentity.OverrideForTesting("social-pending-owner-b");
+                social.Refresh();
+                var refresh = type.GetField("_refreshPending", flags);
+                Assert.IsNotNull(refresh, "The new account's refresh needs to survive the previous account's pending operation.");
+                Assert.IsTrue((bool)refresh.GetValue(social));
+                type.GetMethod("Update", flags).Invoke(social, null);
+                Assert.IsTrue((bool)refresh.GetValue(social), "A busy request consumed the new account's refresh.");
+                busy.SetValue(social, false);
+                // An offline new owner keeps the request until its own sign-in notification.
+                type.GetMethod("Update", flags).Invoke(social, null);
+                Assert.IsTrue((bool)refresh.GetValue(social), "An offline account consumed the refresh before it could use its own session.");
+                Assert.IsFalse((bool)type.GetField("_loading", flags).GetValue(social));
+            }
+            finally
+            {
+                TumbangPreso.Net.NetIdentity.OverrideForTesting(previousToken); Object.DestroyImmediate(owner);
+                type.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, previous);
+            }
+        }
+
+        [TestCase(false, false)]
+        [TestCase(true, false)]
+        [TestCase(true, true)]
+        public async System.Threading.Tasks.Task SocialOfflineAndGuestAccountsNeverUseThePrimaryServiceSession(bool guest, bool reportedSignedIn)
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+            Assert.IsFalse(TumbangPreso.Net.NetIdentity.IsOnline);
+            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            var accountProperty = typeof(TumbangPreso.GameServices).GetProperty("Account");
+            var priorAccount = TumbangPreso.GameServices.Account; var priorSocial = TumbangPreso.Net.SocialStore.Instance;
+            var accountOwner = new GameObject("Inactive offline social account"); accountOwner.SetActive(false);
+            var account = accountOwner.AddComponent<TumbangPreso.Net.PlayerAccount>();
+            // Keep Awake dormant: this fixture has no authentication initialization or credential access.
+            typeof(TumbangPreso.Net.PlayerAccount).GetField("_profile", flags).SetValue(account, new AccountProfile { PlayerId = guest ? "guest-social-test" : "offline-social-test" });
+            typeof(TumbangPreso.Net.PlayerAccount).GetProperty("IsGuest").SetValue(account, guest);
+            typeof(TumbangPreso.Net.PlayerAccount).GetProperty("IsSignedIn").SetValue(account, reportedSignedIn);
+            accountProperty.SetValue(null, account);
+            var owner = new GameObject("Social offline service guard check"); var social = owner.AddComponent<TumbangPreso.Net.SocialStore>();
+            var type = typeof(TumbangPreso.Net.SocialStore);
+            try
+            {
+                // Ordinary EditMode components do not receive runtime lifecycle callbacks.
+                // Drive the enable hook explicitly while keeping PlayerAccount.Awake dormant.
+                type.GetMethod("OnEnable", flags)?.Invoke(social, null);
+                social.Refresh();
+                Assert.IsFalse((bool)type.GetField("_loading", flags).GetValue(social));
+                social.RequestHandle("MARIA#4417");
+                Assert.AreEqual("SIGN IN TO ADD FRIENDS.", social.SearchStatus, "The offline/guest lookup attempted to use a primary-account credential.");
+                await (System.Threading.Tasks.Task)type.GetMethod("Post", flags).Invoke(social, new object[] { new { action = "block", playerId = "someone-else" } });
+                Assert.AreEqual("SIGN IN TO MANAGE FRIENDS.", social.SearchStatus);
+                Assert.IsFalse((bool)type.GetField("_writing", flags).GetValue(social));
+                type.GetMethod("Update", flags).Invoke(social, null);
+                Assert.IsNull(type.GetField("_lastPresenceFault", flags).GetValue(social), "Offline/guest presence reached the service helper.");
+                social.List.Friends.Add(new FriendRef { PlayerId = "prior-account-friend" });
+                typeof(TumbangPreso.Net.PlayerAccount).GetField("_profile", flags).SetValue(account, new AccountProfile { PlayerId = "guest-next-social-test" });
+                var changed = typeof(TumbangPreso.Net.PlayerAccount).GetField("Changed", flags | System.Reflection.BindingFlags.Public).GetValue(account) as System.Action;
+                changed?.Invoke();
+                var cache = type.GetField("_cache", flags).GetValue(social);
+                var notifiedList = (SocialList)cache.GetType().GetField("List").GetValue(cache);
+                Assert.IsEmpty(notifiedList.Friends, "The account notification left the previous rail visible until a later read.");
+                Assert.AreEqual("", social.SearchStatus);
+            }
+            finally
+            {
+                type.GetMethod("OnDisable", flags)?.Invoke(social, null);
+                Object.DestroyImmediate(owner); Object.DestroyImmediate(accountOwner);
+                accountProperty.SetValue(null, priorAccount);
+                type.GetProperty("Instance", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static).SetValue(null, priorSocial);
+            }
+        }
+
+        private sealed class SocialAckFixture : System.IDisposable
+        {
+            internal const System.Reflection.BindingFlags Hidden = System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+            internal readonly TumbangPreso.Net.SocialStore Store;
+            private readonly GameObject _accountRoot, _socialRoot;
+            private readonly TumbangPreso.Net.PlayerAccount _account;
+            private readonly TumbangPreso.Net.PlayerAccount _previousAccount = TumbangPreso.GameServices.Account;
+            private readonly TumbangPreso.Net.SocialStore _previousSocial = TumbangPreso.Net.SocialStore.Instance;
+
+            internal SocialAckFixture(bool signedIn = false, bool guest = false)
+            {
+                Assert.IsTrue(System.Environment.GetCommandLineArgs().Contains("-tp-profile"));
+                Assert.IsFalse(TumbangPreso.Net.NetIdentity.IsOnline, "Acknowledgement fixtures never initialize a service session.");
+                _accountRoot = new GameObject("Dormant social acknowledgement account"); _accountRoot.SetActive(false);
+                _account = _accountRoot.AddComponent<TumbangPreso.Net.PlayerAccount>();
+                SetOwner("ack-owner-a");
+                typeof(TumbangPreso.Net.PlayerAccount).GetProperty("IsSignedIn").SetValue(_account, signedIn);
+                typeof(TumbangPreso.Net.PlayerAccount).GetProperty("IsGuest").SetValue(_account, guest);
+                typeof(TumbangPreso.GameServices).GetProperty("Account").SetValue(null, _account);
+                _socialRoot = new GameObject("Dormant social acknowledgement store"); _socialRoot.SetActive(false);
+                Store = _socialRoot.AddComponent<TumbangPreso.Net.SocialStore>();
+                _ = Store.List; // Stamp the current local owner without calling an endpoint.
+            }
+
+            internal void SetOwner(string id) => typeof(TumbangPreso.Net.PlayerAccount).GetField("_profile", Hidden)
+                .SetValue(_account, new AccountProfile { PlayerId = id });
+
+            internal object Invoke(string name, params object[] arguments)
+            {
+                var method = typeof(TumbangPreso.Net.SocialStore).GetMethod(name, Hidden);
+                Assert.IsNotNull(method, "SocialStore must expose its current-owner request acknowledgement path.");
+                return method.Invoke(Store, arguments);
+            }
+
+            public void Dispose()
+            {
+                Object.DestroyImmediate(_socialRoot); Object.DestroyImmediate(_accountRoot);
+                typeof(TumbangPreso.GameServices).GetProperty("Account").SetValue(null, _previousAccount);
+                typeof(TumbangPreso.Net.SocialStore).GetProperty("Instance").SetValue(null, _previousSocial);
+            }
+        }
+
+        [TestCase("outgoing")]
+        [TestCase("friend")]
+        [TestCase("missing")]
+        public void SocialRequestAcknowledgementNeedsItsTargetInAnAcceptedReply(string outcome)
+        {
+            using (var fixture = new SocialAckFixture())
+            {
+                var list = new SocialList();
+                if (outcome == "outgoing") list.Outgoing.Add(new FriendRef { PlayerId = "ack-target" });
+                if (outcome == "friend") list.Friends.Add(new FriendRef { PlayerId = "ack-target" });
+                string body = JsonUtility.ToJson(list);
+                string reply = "{\"list\":\"" + body.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\"}";
+                object adoption = fixture.Invoke("Adopt", "ack-owner-a", reply);
+                Assert.IsInstanceOf<bool>(adoption, "List adoption must report whether this response was accepted.");
+                bool confirmed = (bool)fixture.Invoke("CompleteRequest", "ack-owner-a", "ack-target", "TARGET#4417", (bool)adoption);
+                Assert.AreEqual(outcome != "missing", confirmed);
+                Assert.AreEqual(outcome != "missing" ? "REQUEST SENT TO TARGET#4417." : "REQUEST COULD NOT BE CONFIRMED. TRY AGAIN WHEN ONLINE.", fixture.Store.SearchStatus);
+            }
+        }
+
+        [TestCase(false, false)]
+        [TestCase(true, true)]
+        public void SocialRequestAcknowledgementCannotUseACachedRowOrAnotherOwnersReply(bool changeOwner, bool acceptedReply)
+        {
+            using (var fixture = new SocialAckFixture())
+            {
+                if (changeOwner) fixture.SetOwner("ack-owner-b");
+                fixture.Store.List.Outgoing.Add(new FriendRef { PlayerId = "ack-target" });
+                typeof(TumbangPreso.Net.SocialStore).GetProperty("SearchStatus").SetValue(fixture.Store, "CURRENT OWNER SEARCH");
+                bool confirmed = (bool)fixture.Invoke("CompleteRequest", "ack-owner-a", "ack-target", "TARGET#4417", acceptedReply);
+                Assert.IsFalse(confirmed, "A cached row or stale owner's answer was treated as this attempt's acknowledgement.");
+                Assert.AreEqual(changeOwner ? "CURRENT OWNER SEARCH" : "REQUEST COULD NOT BE CONFIRMED. TRY AGAIN WHEN ONLINE.", fixture.Store.SearchStatus);
+            }
+        }
+
+        [TestCase("offline")]
+        [TestCase("guest")]
+        [TestCase("self")]
+        [TestCase("blocked")]
+        [TestCase("busy")]
+        public async System.Threading.Tasks.Task SocialRequestAsyncRefusesOfflineLocalAndBusyActionsWithoutDispatch(string refusal)
+        {
+            using (var fixture = new SocialAckFixture(signedIn: refusal != "offline", guest: refusal == "guest"))
+            {
+                string target = refusal == "self" ? "ack-owner-a" : "ack-target";
+                if (refusal == "blocked") fixture.Store.List.Blocked.Add(target);
+                if (refusal == "busy") typeof(TumbangPreso.Net.SocialStore).GetField("_writing", SocialAckFixture.Hidden).SetValue(fixture.Store, true);
+                var method = typeof(TumbangPreso.Net.SocialStore).GetMethod("RequestAsync");
+                Assert.IsNotNull(method, "Callers need an awaitable acknowledgement rather than async void dispatch.");
+                bool confirmed = await (System.Threading.Tasks.Task<bool>)method.Invoke(fixture.Store, new object[] { target, "TARGET#4417" });
+                Assert.IsFalse(confirmed);
+                string expected = refusal == "self" ? "THAT IS YOU."
+                    : refusal == "blocked" ? "UNBLOCK THEM FIRST."
+                    : refusal == "busy" ? "A FRIEND UPDATE IS STILL IN PROGRESS. TRY AGAIN."
+                    : "SIGN IN TO ADD FRIENDS.";
+                Assert.AreEqual(expected, fixture.Store.SearchStatus);
+                Assert.IsFalse((bool)typeof(TumbangPreso.Net.SocialStore).GetField("_loading", SocialAckFixture.Hidden).GetValue(fixture.Store));
+                Assert.AreEqual(refusal == "busy", (bool)typeof(TumbangPreso.Net.SocialStore).GetField("_writing", SocialAckFixture.Hidden).GetValue(fixture.Store));
+            }
+        }
+
+        [TestCase(null)]
+        [TestCase("{}")]
+        [TestCase("{\"list\":\"null\"}")]
+        public void SocialRequestInvalidReplyCannotEraseOrConfirmTheExistingCache(string reply)
+        {
+            using (var fixture = new SocialAckFixture())
+            {
+                fixture.Store.List.Outgoing.Add(new FriendRef { PlayerId = "ack-target" });
+                object adoption = fixture.Invoke("Adopt", "ack-owner-a", reply);
+                Assert.IsInstanceOf<bool>(adoption);
+                Assert.IsFalse((bool)adoption);
+                Assert.AreEqual("ack-target", fixture.Store.List.Outgoing.Single().PlayerId, "An invalid reply erased the known social cache.");
+                Assert.IsFalse((bool)fixture.Invoke("CompleteRequest", "ack-owner-a", "ack-target", "TARGET#4417", (bool)adoption));
+            }
+        }
+
+        private const string AssetsRoot = "Assets/TumbangPreso";
+        private const string CloudCodeRoot = "ugs/cloud-code";
+
+        [Test]
+        public void OfflinePracticeResultDoesNotEnterTheLocalCareerOrUploadQueue()
+        {
+            Assert.IsTrue(System.Environment.GetCommandLineArgs().Any(arg =>
+                string.Equals(arg, "-tp-profile", System.StringComparison.OrdinalIgnoreCase)),
+                "this career test requires an isolated -tp-profile");
+
+            var prior = TumbangPreso.Net.CareerStore.Instance;
+            var owner = new GameObject("PracticeCareerEligibility");
+            var career = owner.AddComponent<TumbangPreso.Net.CareerStore>();
+            try
+            {
+                string playerId = TumbangPreso.Net.CareerStore.LocalPlayerId;
+                int history = career.History.Count;
+                int queued = career.QueuedCount;
+                int xp = career.Profile.Xp;
+                int applied = career.Profile.AppliedMatchIds.Count;
+                var record = new MatchRecord
+                {
+                    MatchId = System.Guid.NewGuid().ToString("N"),
+                    Mode = GameMode.Classic.ToString(), Online = false,
+                    PlayedUtc = System.DateTime.UtcNow.ToString("O"), Rounds = 8,
+                    Players = new[] { new PlayerMatchStats
+                    {
+                        Slot = 0, PlayerId = playerId, IsBot = false,
+                        Placement = 1, ActiveRounds = 8,
+                    } },
+                };
+                Assert.AreEqual(MatchRecordRules.SubmitVerdict.Ok,
+                    MatchRecordRules.Submittable(record, playerId), "the fixture has no payable human line");
+
+                typeof(TumbangPreso.Net.CareerStore).GetProperty("LastAward")
+                    .SetValue(career, new XpAward());
+                career.Record(record);
+
+                Assert.AreEqual(history, career.History.Count);
+                Assert.AreEqual(queued, career.QueuedCount);
+                Assert.AreEqual(xp, career.Profile.Xp);
+                Assert.AreEqual(applied, career.Profile.AppliedMatchIds.Count);
+                Assert.IsNull(career.LastAward);
+            }
+            finally
+            {
+                Object.DestroyImmediate(owner);
+                if (prior != null)
+                    typeof(TumbangPreso.Net.CareerStore)
+                        .GetProperty("Instance", System.Reflection.BindingFlags.Public |
+                                                 System.Reflection.BindingFlags.Static)
+                        .SetValue(null, prior);
+            }
+        }
+        /// <summary>
+        /// ⚠️⚠️ SPLIT ACROSS THE `+` ON PURPOSE, AND DO NOT "TIDY" IT BACK INTO ONE STRING.
+        /// The test below searches every `.cs` file under `Assets` for this host name, and
+        /// this file is one of them: written as a single literal, the audit reports itself as
+        /// the offender on every run. The alternative is a skip list keyed on this file name,
+        /// which would also hide a real second request if one were ever added HERE. The
+        /// compiler folds these two halves into the same constant.
+        /// </summary>
+        private const string Endpoint = "cloud-code" + ".services.api.unity.com";
+
+        /// <summary>
+        /// ⚠️⚠️ THIS IS `docs/TODO.md` § 89.5 AS A GATE, AND § 88.4 IS THE SESSION THAT PAID FOR
+        /// IT. That entry kept a hand-written duplicate of `PlayerAccount.CallCloudAsync` inside
+        /// `UgsServicesProbe` and wrote down what it would cost: *"if the call shape drifts, the
+        /// probe passes while the game fails, which is the worst outcome available."* Phase 2
+        /// needed a third copy, so the request moved into `Net.CloudCode` and everything calls
+        /// that. A comment asking the next person not to write a fourth is what § 88.4 already
+        /// tried; this fails instead.
+        /// </summary>
+        [Test]
+        public void EveryCloudCodeRequestGoesThroughTheOneHelper()
+        {
+            var offenders = new System.Collections.Generic.List<string>();
+
+            foreach (string path in Directory.GetFiles(AssetsRoot, "*.cs", SearchOption.AllDirectories))
+            {
+                if (Path.GetFileName(path) == "CloudCode.cs") continue;
+                if (!File.ReadAllText(path).Contains(Endpoint)) continue;
+                offenders.Add(path.Replace('\\', '/'));
+            }
+
+            Assert.IsEmpty(offenders,
+                "a second Cloud Code request has been written by hand. Call `Net.CloudCode.CallAsync` " +
+                "instead: docs/TODO.md § 89.5 records what the last duplicate cost. Offenders: " +
+                string.Join(", ", offenders));
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ `ugs/cloud-code/match-record.js` IS `ProfileRules` WRITTEN AGAIN AND THE SERVER IS
+        /// THE AUTHORITY, so a constant that drifts there is a career that silently changes the
+        /// moment a player comes back online. `docs/TODO.md` § 89.6. This cannot check the whole
+        /// file, but the numbers are the part most likely to be edited on one side only.
+        /// </summary>
+        [Test]
+        public void TheCareerScriptStillAgreesWithTheCoreAboutItsNumbers()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "match-record.js"));
+
+            Assert.AreEqual(Balance.PlayerCount, ConstantIn(js, "PLAYER_COUNT"),
+                "PLAYER_COUNT in match-record.js no longer matches Balance.PlayerCount");
+            Assert.AreEqual(ProfileRules.HistoryLimit, ConstantIn(js, "HISTORY_LIMIT"),
+                "HISTORY_LIMIT in match-record.js no longer matches ProfileRules.HistoryLimit");
+            Assert.AreEqual(ProfileRules.AppliedIdMemory, ConstantIn(js, "APPLIED_ID_MEMORY"),
+                "APPLIED_ID_MEMORY in match-record.js no longer matches ProfileRules.AppliedIdMemory. " +
+                "It has to stay larger than HISTORY_LIMIT or a record just rolled into the totals " +
+                "becomes resubmittable.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THIS IS § 88.1a, WHICH WAS ONLY A COMMENT UNTIL NOW. The name limit read 16 in the
+        /// validator while `Balance.PlayerNameMax` read 14, and the server is the authority: it
+        /// would have stored a 15-character name that every client then silently clipped, so the
+        /// profile and the scoreboard stopped being the same string. The C# half of that has had
+        /// `TheAccountNameLimitIsTheOneTheWireAndTheHudUse` since; the JavaScript half had a
+        /// paragraph asking somebody to remember.
+        /// </summary>
+        [Test]
+        public void TheAccountScriptStillAgreesWithTheCoreAboutTheNameLimit()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "player-account.js"));
+
+            Assert.AreEqual(AccountRules.DisplayNameMax, ConstantIn(js, "DISPLAY_NAME_MAX"),
+                "DISPLAY_NAME_MAX in player-account.js no longer matches AccountRules.DisplayNameMax, " +
+                "which is Balance.PlayerNameMax. docs/TODO.md § 88.1a is what that cost last time.");
+            Assert.AreEqual(AccountRules.DisplayNameMin, ConstantIn(js, "DISPLAY_NAME_MIN"),
+                "DISPLAY_NAME_MIN in player-account.js no longer matches AccountRules.DisplayNameMin");
+
+            Assert.AreEqual(AccountRules.HandleProofMinutes, ConstantIn(js, "PROOF_MINUTES"),
+                "PROOF_MINUTES in player-account.js no longer matches AccountRules.HandleProofMinutes. " +
+                "The client re-mints with a minute to spare against this number; if the server's " +
+                "is shorter, every honest peer arrives with an expired proof and is demoted.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE IMPERSONATION GUARD RESTS ENTIRELY ON THE TWO COPIES OF FNV-1a AGREEING, AND
+        /// NOTHING ELSE HERE CAN SEE THAT THEY DO. `docs/TODO.md` § 88.1c and § 90.1: the tag is
+        /// derived from the player id in `AccountRules.DerivedTag` and again in the script's
+        /// `derivedTag`, and the server is the authority. If they split, the endpoint vouches for
+        /// a handle no client will ever compute and every online lobby demotes everybody.
+        ///
+        /// ⚠️ THE NUMERIC AGREEMENT IS ASSERTED IN `Core.Tests`
+        /// (`TheDerivedTagMatchesTheServerScriptsCopyOfTheSameHash`), against vectors produced by
+        /// running the JavaScript. This checks the cheaper half: that the script still contains
+        /// the hash at all rather than having quietly gone back to trusting the caller.
+        /// </summary>
+        [Test]
+        public void TheAccountScriptStillDerivesTheTagRatherThanTrustingTheClaim()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "player-account.js"));
+
+            StringAssert.Contains("2166136261", js, "the FNV-1a offset basis is gone from player-account.js");
+            StringAssert.Contains("16777619", js, "the FNV-1a prime is gone from player-account.js");
+            StringAssert.Contains("Discriminator: derivedTag(playerId)", js,
+                "player-account.js is storing a discriminator that did not come from the player " +
+                "id. A client that can write its own tag can write somebody else's, attest to " +
+                "it, and the whole guard proves a lie for them. docs/TODO.md § 88.1c.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ A RENAMED EVENT IS A BROKEN HISTORY, `FUTURE.md` § 19.3, AND THIS IS THE ONLY
+        /// THING THAT CAN CATCH ONE. The server refuses a name it does not know, so a name added
+        /// on one side and not the other is not an error anywhere: it is an event the client
+        /// counts, sends, and has silently discarded, forever, with a `refused` number nobody is
+        /// reading. `docs/TODO.md` § 90.3 is the contract in prose.
+        /// </summary>
+        [Test]
+        public void TheTelemetryScriptKnowsExactlyTheEventsTheCoreCanSend()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "telemetry.js"));
+
+            var funnel = StringArrayIn(js, "FUNNEL");
+            CollectionAssert.AreEqual(TelemetryEvents.Funnel, funnel,
+                "FUNNEL in telemetry.js no longer matches TelemetryEvents.Funnel, in content or " +
+                "in ORDER. The order is the meaning: a funnel position is an index, so reordering " +
+                "rewrites what every stored profile is claiming.");
+
+            var known = new System.Collections.Generic.List<string>(funnel);
+            known.AddRange(StringArrayIn(js, "EVENTS", concatenated: true));
+
+            CollectionAssert.AreEquivalent(TelemetryEvents.All, known,
+                "telemetry.js and TelemetryEvents.All disagree about which events exist. The " +
+                "server refuses a name it does not know, so the client would count and send an " +
+                "event that is thrown away with no error on either side.");
+        }
+
+        [Test]
+        public void TheTelemetryScriptStillAgreesWithTheCoreAboutItsLimits()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "telemetry.js"));
+
+            Assert.AreEqual(TelemetryRules.MaxEventsPerBatch, ConstantIn(js, "MAX_EVENTS_PER_BATCH"));
+            Assert.AreEqual(TelemetryRules.MaxParametersPerEvent, ConstantIn(js, "MAX_PARAMETERS_PER_EVENT"));
+            Assert.AreEqual(TelemetryRules.MaxParameterLength, ConstantIn(js, "MAX_PARAMETER_LENGTH"));
+        }
+
+        /// <summary>
+        /// ⚠️ `ugs deploy` PUBLISHES A FOLDER, so a script written anywhere else is a script that
+        /// is never deployed, and `CareerStore` is built to keep a local career quietly when the
+        /// endpoint is unreachable. That combination looks exactly like a career nobody has played
+        /// yet. `UgsServicesProbe.TheCareerEndpointAnswersALoad` is what proves the deploy landed;
+        /// this is what proves there is something for it to deploy.
+        /// </summary>
+        [Test]
+        public void EveryCloudCodeScriptSitsInTheFolderTheCliDeploys()
+        {
+            Assert.IsTrue(File.Exists(Path.Combine(CloudCodeRoot, "player-account.js")));
+            Assert.IsTrue(File.Exists(Path.Combine(CloudCodeRoot, "match-record.js")));
+            Assert.IsTrue(File.Exists(Path.Combine(CloudCodeRoot, "telemetry.js")));
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE RECORD IS BIGGER THAN A PACKET, AND THIS IS THE MEASUREMENT RATHER THAN THE
+        /// ASSUMPTION. Every other named message in `MatchRpc` is tens of bytes and takes the
+        /// default `ReliableSequenced`, which cannot split a message: an oversized one is
+        /// refused by the transport, the host logs a line nobody reads, and every client
+        /// silently gets no end-of-match summary and no career entry. That is the exact failure
+        /// the protocol bump for this message exists to make impossible, so the delivery is
+        /// asserted here as well as chosen there.
+        ///
+        /// ⚠️ THE FLOOR IS 1300 BYTES, WHICH IS UNDER A PLAIN ETHERNET MTU ON PURPOSE.
+        /// `MatchRpc.PoseDelivery`'s note records that they play over Hamachi, a VPN with a
+        /// smaller MTU and real loss, and that the relay path *"was not better designed, it was
+        /// luckier"*. Sizing anything against 1500 is that mistake one layer up.
+        /// </summary>
+        [Test]
+        public void AFullMatchRecordNeedsMoreThanOnePacketAndIsSentFragmented()
+        {
+            var players = new PlayerMatchStats[Balance.PlayerCount];
+            for (int i = 0; i < players.Length; i++)
+                players[i] = new PlayerMatchStats
+                {
+                    Slot = i,
+                    PlayerId = new string('p', 32),
+                    Handle = new string('W', AccountRules.HandleMax),
+                    CharacterId = "phaister",
+                    SlipperId = "alpombra",
+                };
+
+            var record = new MatchRecord
+            {
+                MatchId = System.Guid.NewGuid().ToString("N"),
+                Mode = GameMode.HeroStrike.ToString(),
+                MapId = "ilalim_ng_tulay",
+                Rounds = Balance.HeroStrikeRounds,
+                PlayedUtc = System.DateTime.UtcNow.ToString("O"),
+                DefenderByRound = new int[Balance.HeroStrikeRounds],
+                Players = players,
+            };
+
+            int bytes = System.Text.Encoding.UTF8.GetByteCount(JsonUtility.ToJson(record));
+            Debug.Log($"[CareerAudit] a full four-player MatchRecord serialises to {bytes} bytes");
+
+            Assert.Greater(bytes, 1300,
+                "a record now fits in one packet, so the fragmented delivery may no longer be " +
+                "needed. Re-measure before simplifying it: this test is the reason it is there.");
+
+            string rpc = File.ReadAllText(Path.Combine(AssetsRoot, "Runtime", "Net", "MatchRpc.cs"));
+            StringAssert.Contains("NetworkDelivery.ReliableFragmentedSequenced", rpc,
+                "the match record is larger than one packet and must not go out on a delivery " +
+                "that cannot split it. docs/TODO.md § 89.5.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ CLOUD CODE STRIPS EVERY PARAMETER A SCRIPT DOES NOT DECLARE, AND THE FAILURE IS
+        /// SILENT AND LOOKS EXACTLY LIKE A WORKING ENDPOINT. Measured live on 2026-08-30: the
+        /// telemetry endpoint was called with `{"action":"report"}` and answered with the SUBMIT
+        /// branch's payload, which is what an ABSENT action falls through to. Every script here
+        /// dispatches on `params.action || "<default>"`, so a stripped action does not throw, does
+        /// not log, and returns a well-formed answer from the wrong branch.
+        ///
+        /// **`docs/TODO.md` § 90.5 is what that had already cost**: `player-account`'s save and
+        /// delete and `match-record`'s submit had never once run against the live project, and the
+        /// probes passed the whole time because they only ask whether the endpoint answered.
+        ///
+        /// ⚠️ THIS READS THE SOURCE AS TEXT for the same reason the tests above it do: nothing on
+        /// this machine compiles the JavaScript, and the live symptom is an answer rather than an
+        /// error.
+        /// </summary>
+        [Test]
+        public void EveryParameterACloudCodeScriptReadsIsDeclaredSoItIsNotStripped()
+        {
+            foreach (string script in new[] { "player-account.js", "match-record.js", "telemetry.js" })
+            {
+                string js = File.ReadAllText(Path.Combine(CloudCodeRoot, script));
+
+                var block = Regex.Match(js, @"module\.exports\.params\s*=\s*\{(.*?)\n\};",
+                                        RegexOptions.Singleline);
+                Assert.IsTrue(block.Success,
+                    $"{script} declares no `module.exports.params`, so Cloud Code strips every " +
+                    "parameter it is sent and every call lands on the default branch.");
+
+                var declared = new System.Collections.Generic.HashSet<string>();
+                foreach (Match entry in Regex.Matches(block.Groups[1].Value, @"^\s*(\w+)\s*:", RegexOptions.Multiline))
+                    declared.Add(entry.Groups[1].Value);
+
+                var used = new System.Collections.Generic.HashSet<string>();
+                foreach (Match entry in Regex.Matches(js, @"params\.(\w+)"))
+                    used.Add(entry.Groups[1].Value);
+
+                used.ExceptWith(declared);
+                Assert.IsEmpty(used,
+                    $"{script} reads parameters it does not declare, so Cloud Code delivers them " +
+                    $"as undefined: {string.Join(", ", used)}");
+
+                // ⚠️⚠️ AND THE DECLARATION IS DROPPED BY A TOP-LEVEL FUNCTION CALLED
+                // `parameters`, WHICH COST AN AFTERNOON TO FIND. `docs/TODO.md` § 90.5: with one
+                // in the file, `ugs deploy` uploaded the code and then reported `params: []` for
+                // the WHOLE script, so `action` went missing and every request landed on the
+                // default branch. Nothing failed and nothing warned. It was bisected one function
+                // at a time against the live service; renaming it was the entire fix.
+                Assert.IsFalse(Regex.IsMatch(js, @"^\s*(async\s+)?function\s+parameters\s*\(",
+                                             RegexOptions.Multiline),
+                    $"{script} declares a top-level `function parameters`, which makes the deploy " +
+                    "silently drop every declared parameter. docs/TODO.md § 90.5.");
+            }
+        }
+
+        /// <summary>
+        /// ⚠️ THE TELEMETRY BATCH TRAVELS AS A `String`, NOT AS `JSON`. Declaring it `JSON` made
+        /// the service drop the whole parameter block, and `TelemetrySink` serialises it to match.
+        /// `docs/TODO.md` § 90.5. Two halves of one wire shape, in two languages, so this pins them.
+        /// </summary>
+        [Test]
+        public void TheTelemetryBatchIsSentAndDeclaredAsAString()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "telemetry.js"));
+            StringAssert.Contains("events: \"String\"", js,
+                "telemetry.js no longer declares `events` as a String. docs/TODO.md § 90.5.");
+
+            string sink = File.ReadAllText(
+                Path.Combine(AssetsRoot, "Runtime", "Net", "TelemetrySink.cs"));
+            StringAssert.Contains("JsonConvert.SerializeObject(events)", sink,
+                "TelemetrySink is no longer serialising the batch before sending it, so the " +
+                "endpoint receives something its `parseBatch` cannot read. docs/TODO.md § 90.5.");
+        }
+
+        /// <summary>
+        /// Reads a `const NAME = [ "a", "b" ];` list out of a script, and optionally the
+        /// `const NAME = OTHER.concat([ ... ]);` form the event list uses.
+        ///
+        /// ⚠️ IT PARSES RATHER THAN SEARCHING FOR SUBSTRINGS, because a `Contains` check passes
+        /// on a script that has the right names AND an extra one, which is exactly the drift that
+        /// makes a client event silently disappear.
+        /// </summary>
+        private static string[] StringArrayIn(string js, string name, bool concatenated = false)
+        {
+            string pattern = concatenated
+                ? @"const\s+" + Regex.Escape(name) + @"\s*=\s*\w+\.concat\(\[(.*?)\]\)"
+                : @"const\s+" + Regex.Escape(name) + @"\s*=\s*\[(.*?)\]";
+
+            var match = Regex.Match(js, pattern, RegexOptions.Singleline);
+            Assert.IsTrue(match.Success, $"no `const {name} = [...]` in the script");
+
+            var values = new System.Collections.Generic.List<string>();
+            foreach (Match entry in Regex.Matches(match.Groups[1].Value, "\"([^\"]+)\""))
+                values.Add(entry.Groups[1].Value);
+
+            return values.ToArray();
+        }
+
+        /// <summary>
+        /// Every number `ProgressionRules` and `match-record.js` both hold, compared as text.
+        ///
+        /// ⚠️⚠️ THE LIVE PROBE AND THIS TEST ASK DIFFERENT QUESTIONS AND NEITHER REPLACES THE
+        /// OTHER. `CloudEndpointActionProbe.ARealSubmissionPaysExactlyWhatProgressionRulesSays`
+        /// submits a real record and asserts the XP the DEPLOYED script paid, which is the only
+        /// thing that can catch a service running an older file. It is `[Category("Ugs")]`, so it
+        /// needs a network, spends free-tier quota and does not run in a default sweep. **This
+        /// asks whether the two copies in the REPOSITORY agree, in about a millisecond, on every
+        /// run**, and it is the one that fails in the pull request rather than in production.
+        /// `docs/TODO.md` § 90.9 makes the identical argument for telemetry.
+        ///
+        /// ⚠️ THE PLACEMENT TABLE IS COMPARED ELEMENT BY ELEMENT, NOT AS A LENGTH. A four-entry
+        /// array that agrees on its first and last value and not its middle two is exactly the
+        /// edit somebody makes tuning second place, and a count would wave it through.
+        ///
+        /// ⚠️ AND THE AFK CONSTANTS ARE IN HERE FOR THE REASON § 91.1 GIVES. They decide whether
+        /// a match pays at all, so a drift there is not a small XP difference: it is the whole
+        /// award, on one side only, with the server winning.
+        /// </summary>
+        [Test]
+        public void TheCareerScriptStillAgreesWithTheCoreAboutEveryXpNumber()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "match-record.js"));
+
+            Assert.AreEqual(ProgressionRules.CompletionXp, ConstantIn(js, "COMPLETION_XP"),
+                "COMPLETION_XP drifted. It is the largest single term, so this is the one that " +
+                "makes a player's level disagree with the bar they just watched fill.");
+            Assert.AreEqual(ProgressionRules.ObjectiveKnockdownXp,
+                ConstantIn(js, "OBJECTIVE_KNOCKDOWN_XP"), "OBJECTIVE_KNOCKDOWN_XP drifted");
+            Assert.AreEqual(ProgressionRules.ObjectivePressureRetrievalXp,
+                ConstantIn(js, "OBJECTIVE_PRESSURE_RETRIEVAL_XP"),
+                "OBJECTIVE_PRESSURE_RETRIEVAL_XP drifted");
+            Assert.AreEqual(ProgressionRules.ObjectiveTagXp,
+                ConstantIn(js, "OBJECTIVE_TAG_XP"), "OBJECTIVE_TAG_XP drifted");
+            Assert.AreEqual(ProgressionRules.ObjectiveSabotageXp,
+                ConstantIn(js, "OBJECTIVE_SABOTAGE_XP"), "OBJECTIVE_SABOTAGE_XP drifted");
+            Assert.AreEqual(ProgressionRules.ObjectiveCleanXp,
+                ConstantIn(js, "OBJECTIVE_CLEAN_XP"), "OBJECTIVE_CLEAN_XP drifted");
+
+            Assert.AreEqual(ProgressionRules.XpPerLevel, ConstantIn(js, "XP_PER_LEVEL"),
+                "XP_PER_LEVEL drifted, so the server's level and the client's are different " +
+                "views of the same XP");
+            Assert.AreEqual(ProgressionRules.MasteryXpPerLevel,
+                ConstantIn(js, "MASTERY_XP_PER_LEVEL"), "MASTERY_XP_PER_LEVEL drifted");
+
+            Assert.AreEqual(ProgressionRules.AfkStrikesBeforePenalty,
+                ConstantIn(js, "AFK_STRIKES_BEFORE_PENALTY"),
+                "AFK_STRIKES_BEFORE_PENALTY drifted. docs/TODO.md § 91.1.");
+            Assert.AreEqual(ProgressionRules.AfkPenaltyMatches,
+                ConstantIn(js, "AFK_PENALTY_MATCHES"), "AFK_PENALTY_MATCHES drifted");
+
+            var placement = Regex.Match(js, @"const\s+PLACEMENT_XP\s*=\s*\[([^\]]*)\]\s*;");
+            Assert.IsTrue(placement.Success, "no `const PLACEMENT_XP = [...];` in match-record.js");
+
+            var written = placement.Groups[1].Value
+                .Split(',')
+                .Select(s => s.Trim())
+                .Where(s => s.Length > 0)
+                .Select(int.Parse)
+                .ToArray();
+
+            Assert.AreEqual(ProgressionRules.PlacementXp.Length, written.Length,
+                "PLACEMENT_XP has a different number of places than ProgressionRules.PlacementXp");
+
+            for (int i = 0; i < written.Length; i++)
+                Assert.AreEqual(ProgressionRules.PlacementXp[i], written[i],
+                    $"PLACEMENT_XP[{i}] is {written[i]} in match-record.js and " +
+                    $"{ProgressionRules.PlacementXp[i]} in ProgressionRules. The C# is the " +
+                    "specification, so the script is the bug.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ `ugs/cloud-code/social.js` IS `SocialRules` WRITTEN AGAIN, AND THE SERVER IS THE
+        /// AUTHORITY OVER A DOCUMENT THAT LIVES IN SOMEBODY ELSE'S ACCOUNT. `docs/TODO.md` § 102.
+        /// A cap that drifts is not a cosmetic difference: the client refuses a 21st pending
+        /// request and the server accepts it, so the row exists, is stored, and is silently
+        /// trimmed by `SocialRules.Normalise` the moment anybody loads it. **A friend request that
+        /// arrives and then disappears is the worst failure this feature has**, because both
+        /// people believe the other one ignored them.
+        /// </summary>
+        [Test]
+        public void TheSocialScriptStillAgreesWithTheCoreAboutItsCaps()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "social.js"));
+
+            Assert.AreEqual(SocialRules.MaxFriends, ConstantIn(js, "MAX_FRIENDS"),
+                "MAX_FRIENDS in social.js no longer matches SocialRules.MaxFriends");
+            Assert.AreEqual(SocialRules.MaxBlocked, ConstantIn(js, "MAX_BLOCKED"),
+                "MAX_BLOCKED in social.js no longer matches SocialRules.MaxBlocked");
+            Assert.AreEqual(SocialRules.MaxPending, ConstantIn(js, "MAX_PENDING"),
+                "MAX_PENDING in social.js no longer matches SocialRules.MaxPending. This is the " +
+                "anti-spam cap on a list a stranger can write into, and the server is the only " +
+                "side that can enforce it.");
+            Assert.AreEqual(SocialRules.PresenceStaleSeconds,
+                            ConstantIn(js, "PRESENCE_STALE_SECONDS"),
+                "PRESENCE_STALE_SECONDS in social.js no longer matches " +
+                "SocialRules.PresenceStaleSeconds. Both ends apply the staleness rule, and a " +
+                "server that believes a longer one hands out lit rows for players who have quit.");
+
+            Assert.AreEqual(AccountRules.HandleMax, ConstantIn(js, "HANDLE_MAX"),
+                "HANDLE_MAX in social.js no longer matches AccountRules.HandleMax, so a handle " +
+                "stored in somebody else's friends list would be clipped differently from the " +
+                "one on the scoreboard.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ EVERY PARAMETER A CLOUD CODE SCRIPT READS MUST BE DECLARED OR THE SERVICE STRIPS
+        /// IT, AND THE FAILURE IS SILENT AND LOOKS LIKE A WORKING ENDPOINT. `docs/TODO.md` § 90.5:
+        /// three scripts declared none, so every call fell through to the default branch, answered
+        /// normally, and **no career had ever reached the server**. Every probe was green
+        /// throughout, because they all probed with the default branch.
+        ///
+        /// ⚠️ THIS IS THE CHEAP HALF AND IT READS THE FILE. The expensive half is
+        /// `UgsServicesProbe`, which asks the deployed service, and § 94.2b records what happens
+        /// when a script is committed and not deployed: the endpoint runs the old one and pays 0.
+        /// </summary>
+        [Test]
+        public void TheSocialScriptDeclaresEveryParameterItReads()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "social.js"));
+
+            int split = js.IndexOf("module.exports.params");
+            Assert.Greater(split, 0, "social.js declares no params block at all, so Cloud Code " +
+                                     "strips every parameter and every call runs the load branch.");
+
+            string body = js.Substring(0, split);
+            string declared = js.Substring(split);
+
+            foreach (string name in new[] { "action", "playerId", "handle", "theirHandle",
+                                            "state", "joinCode" })
+            {
+                StringAssert.Contains("params." + name, body,
+                    $"social.js declares `{name}` and never reads it.");
+                StringAssert.Contains(name + ":", declared,
+                    $"social.js reads `params.{name}` and does not declare it. Cloud Code will " +
+                    "strip it and the branch will run with it undefined. docs/TODO.md § 90.5.");
+            }
+
+            // ⚠️ A TOP-LEVEL `function parameters()` SILENTLY DROPS THE WHOLE DECLARATION AND
+            // PRINTS `params: []`. It cost a bisect against the live service once; renaming it
+            // was the entire fix.
+            Assert.IsFalse(Regex.IsMatch(js, @"^\s*function\s+parameters\s*\("
+                                             , RegexOptions.Multiline),
+                "social.js has a top-level `function parameters()`, which makes Cloud Code drop " +
+                "the whole params declaration without saying so.");
+        }
+
+        /// <summary>
+        /// ⚠️⚠️ THE HANDLE INDEX IS A ROUTE AND MUST NEVER BE THE AUTHORITY, AND THAT IS THE
+        /// ONLY REASON `docs/TODO.md` § 102.2 COULD BE CLOSED. Friends by NAME#TAG was declined
+        /// for a whole phase because there is no way to search Cloud Save: a player id is the
+        /// only address the social endpoint takes, and nothing maps a readable handle onto one.
+        /// What the index adds is a sharded custom document (`handle-index-XX`, keyed by a
+        /// stable FNV-1a hash of the normalised handle) that answers "which player id last
+        /// claimed this handle".
+        ///
+        /// ⚠️⚠️ AND THE ANSWER IS NOT TRUSTED. Two writes cannot be made atomic here: a rename
+        /// writes the new row and then deletes the old one, and a crash between them leaves a
+        /// row pointing at a player who no longer answers to that handle. If `resolve` returned
+        /// that id, a friend request would silently go to the WRONG ACCOUNT, which is worse than
+        /// the feature not existing. So `resolve` re-reads the target's own protected profile
+        /// with the service token and requires the exact current handle before answering.
+        ///
+        /// ⚠️ THE WRITE HALF IS BEST-EFFORT ON PURPOSE and this asserts that too. § 94.1: a
+        /// `save` that throws is a career document that never lands, and `CareerStore.FlushAsync`
+        /// wedges its whole queue behind the first refusal. A missing index row costs one failed
+        /// search; a failed save costs the account.
+        ///
+        /// ⚠️ THIS READS THE FILE, WHICH IS THE CHEAP HALF. The expensive half is deploying it
+        /// and asking the service; `docs/TODO.md` § 94.2b is the receipt for why a green run of
+        /// this test is not a shipped feature.
+        /// </summary>
+        [Test]
+        public void TheHandleIndexIsShardedHashedAndRevalidatedAgainstTheLiveProfile()
+        {
+            string js = File.ReadAllText(Path.Combine(CloudCodeRoot, "player-account.js"));
+
+            StringAssert.Contains("handle-index-", js,
+                "player-account.js no longer shards the handle index. One document for every " +
+                "account in the game is a single row every rename rewrites.");
+
+            StringAssert.Contains("params.handle", js,
+                "player-account.js does not read a handle, so `resolve` has nothing to look up.");
+
+            var declared = Regex.Match(js, @"module\.exports\.params\s*=\s*\{(.*?)\n\};",
+                                       RegexOptions.Singleline);
+            Assert.IsTrue(declared.Success && declared.Groups[1].Value.Contains("handle:"),
+                "player-account.js reads `params.handle` and does not declare it, so Cloud Code " +
+                "strips it and every search resolves an empty string. docs/TODO.md § 90.5.");
+
+            // The route is a hash of the handle, using the same FNV-1a constants the tag is
+            // derived with, so an index key is reproducible from the handle alone.
+            var index = Regex.Match(js, @"function\s+indexKey\s*\((.*?)\n\}", RegexOptions.Singleline);
+            Assert.IsTrue(index.Success, "player-account.js has no `indexKey`, so the index is " +
+                                         "keyed by something else and this test is stale.");
+            StringAssert.Contains("2166136261", index.Groups[1].Value,
+                "indexKey no longer hashes with FNV-1a, so a key written by one build cannot be " +
+                "found by another.");
+            StringAssert.Contains("normalHandle", index.Groups[1].Value,
+                "indexKey hashes the raw handle rather than the normalised one, so MARIA#4417 " +
+                "and Maria#4417 land in two different rows and only one of them is findable.");
+
+            // ⚠️ THE ASSERTION THAT MATTERS: the resolve branch re-reads the SUBJECT's profile
+            // and compares handles before it hands back an id.
+            var resolve = Regex.Match(js, @"if \(action === ""resolve""\)(.*?)\n    \}",
+                                      RegexOptions.Singleline);
+            Assert.IsTrue(resolve.Success, "player-account.js has no `resolve` branch, so " +
+                                           "SocialStore.RequestHandle calls an action that " +
+                                           "falls through to `load`.");
+
+            string body = resolve.Groups[1].Value;
+            StringAssert.Contains("getProtectedItems", body,
+                "`resolve` answers straight out of the index without re-reading the target's " +
+                "profile. A row left behind by a rename would then address the wrong account, " +
+                "and the request would go to a stranger with no error anywhere.");
+            StringAssert.Contains("normalHandle(current) !== normalHandle(wanted)", body,
+                "`resolve` does not compare the target's CURRENT handle against the one asked " +
+                "for, so a stale index row is believed.");
+
+            // ⚠️ AND THE WRITE HALF NEVER FAILS THE SAVE.
+            foreach (string branch in new[] { "\"save\"", "\"delete\"" })
+            {
+                var arm = Regex.Match(js, @"if \(action === " + Regex.Escape(branch) + @"\)(.*?)\n    \}",
+                                      RegexOptions.Singleline);
+                Assert.IsTrue(arm.Success, $"player-account.js has no {branch} branch.");
+                StringAssert.Contains("tryIndex", arm.Groups[1].Value,
+                    $"the {branch} branch maintains the handle index outside `tryIndex`, so a " +
+                    "service-token failure throws out of an account write. docs/TODO.md § 94.1: " +
+                    "one refused record wedged every match a player had ever finished.");
+            }
+        }
+
+        private static int ConstantIn(string js, string name)
+        {
+            var match = Regex.Match(js, @"const\s+" + Regex.Escape(name) + @"\s*=\s*(\d+)\s*;");
+            Assert.IsTrue(match.Success, $"no `const {name} = <number>;` in the script");
+            return int.Parse(match.Groups[1].Value);
+        }
+    }
+}

@@ -1,0 +1,126 @@
+using System.Collections;
+using TumbangPreso.InputLayer;
+using UnityEngine;
+using UnityEngine.UI;
+
+namespace TumbangPreso.UI
+{
+    /// <summary>
+    /// The one line on the title screen: what to press, and a breath so the
+    /// street does not read as a still image.
+    ///
+    /// ⚠️⚠️ THE WORDS FOLLOW THE DEVICE, WHICH IS `CLAUDE.md` § 4a APPLIED TO THE
+    /// ONE INSTRUCTION EVERY PLAYER READS FIRST. She wrote "Click anywhere to
+    /// continue." and that is exactly right on a mouse and exactly wrong on a
+    /// phone, where there is nothing to click, and on a pad, where anywhere is
+    /// not a place you can point at. `LastInputDevice` already drives every other
+    /// prompt in the game off the last device touched rather than off a setting
+    /// (`docs/FUTURE.md` § 14), so this is that rule and not a new one.
+    ///
+    /// ⚠️ THE BREATH IS OPACITY, NOT SCALE OR POSITION. 🧑 2026-09-18: *"make sure
+    /// all main menu effects are subtle"*. A caption that slides or pulses in size
+    /// pulls the eye off the graffiti, which is the thing on this screen; a five
+    /// per cent swing in alpha over four seconds reads as alive and never as
+    /// movement. It also costs nothing under reduced motion, where it simply
+    /// holds at full.
+    /// </summary>
+    [RequireComponent(typeof(Text))]
+    public sealed class OwnerMenuPrompt : MonoBehaviour
+    {
+        public Button Press;
+        private Text _text;
+        private int _revision = -1;
+        private InputDeviceKind _kind = (InputDeviceKind)(-1);
+        private float _born;
+        private bool _leaving;
+
+        private void Awake()
+        {
+            _text = GetComponent<Text>();
+            _born = Time.unscaledTime;
+        }
+
+        private void OnEnable() => _born = Time.unscaledTime;
+
+        public void ContinueToHome()
+        {
+            if (_leaving || !isActiveAndEnabled) return;
+            _leaving = true;
+            if (Press != null) Press.interactable = false;
+            MenuSfx.Start();
+            StartCoroutine(LeaveAfterSubmit());
+        }
+
+        private IEnumerator LeaveAfterSubmit()
+        {
+            // Home selects PLAY on entry. A held title Submit can be performed again
+            // when its new UI action map enables, so keep that press on this screen.
+            // Ordinary non-Submit keys and pointer clicks need only the frame boundary.
+            while (MenuNav.SubmitHeld) yield return null;
+            yield return null;
+            if(!Settings.SettingsStore.Current.ReducedUiMotion)
+            {
+                var canvas=GetComponentInParent<Canvas>();
+                if(canvas!=null)
+                {
+                    var group=canvas.GetComponent<CanvasGroup>();
+                    if(group==null)group=canvas.gameObject.AddComponent<CanvasGroup>();
+                    for(float t=0;t<.18f;t+=Time.unscaledDeltaTime)
+                    {group.alpha=1-Mathf.SmoothStep(0,1,t/.18f);yield return null;}
+                }
+            }
+            SceneFlow.GoHome();
+        }
+
+        private void Update()
+        {
+            if (_kind != LastInputDevice.Current || _revision != LastInputDevice.Revision)
+            {
+                _kind = LastInputDevice.Current;
+                _revision = LastInputDevice.Revision;
+                _text.text = Words(_kind);
+            }
+
+            // ⚠️ THE SENTENCE IS ALSO THE IMPLEMENTATION. "Press any button" is
+            // only honest if any button works, so the pad half of that promise is
+            // read here through `MenuNav`, the one place allowed to read a pad.
+            // The mouse and the thumb are served by the full-screen press target
+            // itself, which is why neither has a branch in this method.
+            //
+            // ⚠️ AND ANY KEYBOARD KEY BUT ESCAPE, owner 2026-09-26: "should also continue when
+            // pressing any key". The words stay hers ("Click anywhere to continue."); a key is a
+            // shortcut to the same press, not a new instruction.
+            // ⚠️ NOT IN THE FIRST QUARTER SECOND. The Enter or Space that finished the screen before
+            // this one (a sign-in form, the splash) can still read as pressed on this screen's first
+            // frame, and would skip a title the player never saw. The caption itself only starts
+            // arriving at 0.45 s, so the guard is invisible.
+            float age = Time.unscaledTime - _born;
+            if (Press != null && Press.isActiveAndEnabled && Press.IsInteractable() && age > .25f
+                && ((LastInputDevice.Current == InputDeviceKind.Gamepad && MenuNav.PadAnyPressed)
+                    || MenuNav.KeyboardAnyPressed))
+                Press.onClick.Invoke();
+
+            bool reduced = Settings.SettingsStore.Current.ReducedUiMotion;
+            // The caption arrives a beat after the street, so the first thing seen
+            // is her painting and the instruction settles onto it.
+            float entry = reduced ? 1 : Mathf.SmoothStep(0, 1, Mathf.Clamp01((age - .45f) / .7f));
+            float breath = reduced ? 1 : .93f + .07f * Mathf.Sin(age * Mathf.PI * 2 / 3.9f);
+            var colour = _text.color;
+            colour.a = entry * breath;
+            _text.color = colour;
+        }
+
+        /// <summary>
+        /// ⚠️ "ANYWHERE" SURVIVES ON TOUCH AND HAS TO GO ON A PAD. A thumb really
+        /// can press anywhere; a pad player has no pointer, so the truthful
+        /// instruction names the button. The press target is the same full-screen
+        /// control in all three cases, which is what `ScreenFocus` submits to.
+        /// </summary>
+        private static string Words(InputDeviceKind kind) => kind switch
+        {
+            InputDeviceKind.Touch => "Tap to continue.",
+            InputDeviceKind.Gamepad => "Press a button to continue.",
+            _ => "Click to continue.",
+        };
+    }
+}
