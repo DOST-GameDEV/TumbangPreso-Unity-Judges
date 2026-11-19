@@ -1,0 +1,67 @@
+{
+  "stories": [
+    {
+      "id": "sean",
+      "origin": "Albay, now San Fernando",
+      "homeCourt": "Eskinita",
+      "shortLine": "Waits for one opening. Makes it count.",
+      "introduction": "Rago was born at the foot of Mayon and played his first games on the slopes in the mountain's shadow. His family moved to San Fernando when he was a kid, and the lane between the houses became his court, where a match could hold up the walk home for hours. He plays the way the mountain behaves: quiet for a long time, then all at once. Zack calls him slow. Rago keeps the score."
+    },
+    {
+      "id": "zack",
+      "origin": "Pasig, Metro Manila",
+      "homeCourt": "BGC",
+      "shortLine": "Finds the angle before you see the opening.",
+      "introduction": "Zack grew up in Pasig and learned his game across the river, on a marked court by a park in BGC. The light changed, the traffic moved and the shadows of the towers crossed the court, so he got good at finding an angle before anyone else settled in. Now he makes difficult plays look casual and casual plays unnecessarily difficult. Rago is usually the first to call him on it. Zack wants a national title, partly for himself and partly so the regulars can say they used to beat him at the crossing."
+    },
+    {
+      "id": "dante",
+      "origin": "Montalban, Rizal",
+      "homeCourt": "Bayan Plaza",
+      "shortLine": "Holds the difficult space. Refuses to be rushed.",
+      "introduction": "In Montalban, Dante was the player trusted to keep a crowded game fair: settle the argument, straighten the can, give the youngest player another try. He still arrives early to mark out the plaza court. That patience becomes stubbornness when a rival tries to move him. His stone armour and shaking faults make the mountain stories he grew up hearing feel close enough to touch. Yasmin admires his discipline. She also knows exactly how long he will defend a bad position."
+    },
+    {
+      "id": "cheska",
+      "origin": "La Trinidad, Benguet",
+      "homeCourt": "La Trinidad neighbourhood court",
+      "shortLine": "Reads the space. Leaves you the harder route.",
+      "introduction": "Yasmin grew up in La Trinidad and prefers the court before it gets noisy. She walks its edges, tests the footing and remembers where everyone likes to run. Friends mistake her quietness for caution until their easiest route freezes shut. Away from competition she is the practical one who remembered the water and checked the ride home. Losing bothers her more than she admits, especially when an untidy play works. Dante can make her wait; Zack can make her improvise. She is learning to enjoy both problems."
+    },
+    {
+      "id": "nemu",
+      "origin": "Dumaguete, Negros Oriental",
+      "homeCourt": "Dumaguete neighbourhood court",
+      "shortLine": "Looks distracted. Already knows your next move.",
+      "introduction": "Nemu grew up in Dumaguete, taking the long way home along the waterfront and stopping whenever a game had one place left. She seems to miss half the conversation, then remembers the detail everyone else forgot. Kuro has always been part of that routine: a curious little shadow at her shoulder, an alarming presence when a match turns serious. She refuses to explain him the same way twice. Phaister keeps trying to catch her by surprise. Nemu quietly saves those attempts for the walk home."
+    },
+    {
+      "id": "phaister",
+      "origin": "Capul, Northern Samar",
+      "homeCourt": "Ilalim ng Tulay, Quezon City",
+      "shortLine": "Sets the stage. Lets you discover the trick.",
+      "introduction": "Phaister grew up on Capul listening to stories about a moon that could disappear into a serpent's mouth. When she moved to Quezon City, she found a regular game beneath the rail line and an audience that was difficult to impress. That only made her more ambitious. She treats a match like a carefully timed reveal: invite a chase, leave a false opening, close the circle. The trouble is that she occasionally enjoys the setup more than winning. Nemu notices. Phaister wishes she would at least look surprised."
+    },
+    {
+      "id": "rafi",
+      "origin": "Tawi-Tawi",
+      "homeCourt": "Sama Dilaut Lagoon",
+      "shortLine": "Fixes your slipper. Makes you guess his next throw.",
+      "introduction": "Ilyas is an inventive boat-repairer and athlete from a fictional Sama Dilaut community in Tawi-Tawi. He notices the loose board, the awkward stair and the predictable opponent, then immediately has an idea. He repairs his own gear and keeps a small buoy token made from a useful offcut. He will help fix a rival's slipper strap, then bet that rival cannot read his next throw. His weakness is overplaying a clever idea when a simple shot would do. Rago's directness frustrates his elaborate feints; Yasmin spots more of them than he likes. Tournament play is teaching him to make the useful choice, not merely the funny one. His water magic is his own."
+    },
+    {
+      "id": "amihan",
+      "origin": "Vigan, Ilocos Sur",
+      "homeCourt": "Calle Hangin, Vigan",
+      "shortLine": "Reads the wind. Gets there first.",
+      "introduction": "Amihan grew up in the rooms behind her family's loom in Vigan, where the cobbled street outside became a court whenever the kalesas stopped running. Cobbles send a slipper anywhere but straight, so she learned to throw with the wind, reading it off the abel hung out to air. She is bright, proud of her town and cannot stand a stalled game; when a match slows, she is the one pulling it back into motion. Sometimes she commits before the play is ready. Rago's patience drives her up the wall, and she tells Ilyas his current goes nowhere without her wind."
+    },
+    {
+      "id": "paete",
+      "origin": "Mount Makiling, Laguna",
+      "homeCourt": "Paanan, Los Baños",
+      "shortLine": "Never hurries. Always arrives.",
+      "introduction": "Paete grew up as part of the forest on Mount Makiling, older than the trail markers and younger than the narra around him. The mountain has a keeper, Mariang Makiling, and hikers still keep her rule: eat what the forest gives you, never carry it home. One wet season a woodcarver from Paete, across the lake, lost the trail in her mist, and the tree walked him down to the road. The carver had nothing to give but his chisel, so he cut it a face: two deep eyes and a mouth that never quite decided to smile. Makiling liked the gift. She woke the tree, let it keep the carver's town for a name, and made it the guardian of her mountain: keeper of the trails, and the one who brings back what is taken. At the forest's edge he found students playing tumbang preso after class, and stood so still watching that they used him as the lata twice before he moved. Now he plays, unhurried and a little amused by everyone else's panic. He lets you take a run at anything. He just does not let you leave with it. And when one tree is not enough, he opens his hand, and she puts a seed in it."
+    }
+  ]
+}

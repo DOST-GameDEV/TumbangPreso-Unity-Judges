@@ -1,0 +1,74 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: dd6025c7ab6554d458e7834add491ac2, type: 3}
+  m_Name: person_kuya_boy
+  m_EditorClassIdentifier: TumbangPreso.Runtime::TumbangPreso.RosterEntryAsset
+  Id: kuya_boy
+  Model: {fileID: 2950755510488387145, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  ArmModel: {fileID: 0}
+  PetModel: {fileID: 0}
+  Material: {fileID: 0}
+  Tint: {r: 1, g: 1, b: 1, a: 1}
+  Clips:
+  - {fileID: 6907475494324315746, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 2203924018909043761, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -2058715007142741576, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 6422398547263628574, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 7394211616443434314, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -5788828422494046478, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -5656197328620225132, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 8444169216349218833, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -6693012064394926207, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 5638027722608592375, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 6316504600807357666, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 3916641520164824235, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -877892688320884640, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -3534582695741538158, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -6901733776427281509, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -1129283163419233802, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -2474113961476506421, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 3136869955099575062, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 6224930689648127318, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 2652845254095363116, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -4718476750892910589, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 6316130324300929012, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -4776023958905061225, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -2344400992752741691, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 6669351404405404641, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -4832708865683171987, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 3450422557711352013, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -3868565323850264498, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: 4889764192148153732, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -1602694845487291149, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -6296422904094572024, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -9152534441998152959, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  - {fileID: -4813772699318269175, guid: a01167f4825b402e95e2f445b01a319e, type: 3}
+  Palette:
+  - {r: 0.992157, g: 0.894118, b: 0.780392, a: 1}
+  - {r: 0.380392, g: 0.796078, b: 0.545098, a: 1}
+  - {r: 1, g: 0.752941, b: 0.266667, a: 1}
+  - {r: 1, g: 0.494118, b: 0.266667, a: 1}
+  - {r: 0.164706, g: 0.290196, b: 0.478431, a: 1}
+  - {r: 0.847059, g: 0.690196, b: 0.290196, a: 1}
+  - {r: 0.815686, g: 0.909804, b: 1, a: 1}
+  - {r: 0.658824, g: 0.470588, b: 0.909804, a: 1}
+  - {r: 0.192157, g: 0.141176, b: 0.113725, a: 1}
+  - {r: 0.52549, g: 0.545098, b: 0.631373, a: 1}
+  - {r: 0.309804, g: 0.321569, b: 0.376471, a: 1}
+  - {r: 0.168627, g: 0.184314, b: 0.219608, a: 1}
+  - {r: 1, g: 1, b: 1, a: 1}
+  - {r: 0.541176, g: 0.309804, b: 0.196078, a: 1}
+  - {r: 0.258824, g: 0.14902, b: 0.101961, a: 1}
+  - {r: 0.690196, g: 0.443137, b: 0.290196, a: 1}
+  Tagline: Heavyweight champion of the barangay courts. Armed with blistering fists,
+    maximum throwing power, and a fiery mohawk that blazes whenever the match heats
+    up.
