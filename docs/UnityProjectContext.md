@@ -1,6 +1,6 @@
 # Unity project context
 
-This judging snapshot is based on development revision `e284e5c71d0d99e50456988304787288820733e7`. The snapshot includes the project assets, source code, and tests. The original production service linkage is cleared.
+This judging snapshot is based on development revision [`d0e45d2`](https://github.com/DOST-GameDEV/TumbangPreso-Unity/commit/d0e45d2f08992c46c81d0e868b17c4c96a467e2e). The snapshot includes the project assets, source code, and tests. The original production service linkage is cleared.
 
 ## Source map
 
@@ -20,6 +20,8 @@ The entry point is [SplashScreen.unity](../Assets/TumbangPreso/Scenes/Ui/SplashS
 ## Validation and tests
 
 Unity 6000.5.8f1 compiled the gameplay and test assemblies on a fresh checkout. The asset importer reported an error on the inherited [duskline model](../Assets/TumbangPreso/Resources/Models/UltimateProps/duskline.glb).
+
+The focused [throw-guide PlayMode test](../Assets/TumbangPreso/Tests/PlayMode/LandingCircleTests.cs) passed on this revision. It checks the guide near the held slipper, dash spacing, and the landing preview during a charge.
 
 Run the engine-free suite with the .NET 9 SDK from the repository root.
 
